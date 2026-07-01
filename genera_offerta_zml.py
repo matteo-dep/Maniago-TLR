@@ -13,7 +13,7 @@ P_PICCO_MW = PORTATA_M3H * 1000 * CP_ACQUA * DELTA_T_MAX
 
 # Generazione range orario 8760h
 hours = pd.date_range(
-    start=f"{ANNO}-01-01 00:00:00", end=f"{ANNO}-12-31 23:00:00", freq="H"
+    start=f"{ANNO}-01-01 00:00:00", end=f"{ANNO}-12-31 23:00:00", freq="h"
 )
 df_off = pd.DataFrame({"datetime": hours})
 df_off["mese"] = df_off["datetime"].dt.month
