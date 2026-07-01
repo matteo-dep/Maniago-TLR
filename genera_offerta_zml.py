@@ -8,7 +8,8 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 # ==========================================
-# IL TUO CODICE
+# INSERISCI QUI IL CARICAMENTO DATI E I FILTRI (df, offerta_zml, date_range)
+# ...
 # ==========================================
 
 # ---------------------------------------------------------------------------
@@ -42,12 +43,14 @@ fig_bilancio.add_trace(go.Scatter(
     fill='tozeroy', mode='none', fillcolor='rgba(40, 167, 69, 0.7)', 
     name='Copertura ZML', stackgroup='one'
 ))
+
 # Area Rossa: Quota integrata dalle caldaie (Si impila sopra ZML formando la curva della domanda totale)
 fig_bilancio.add_trace(go.Scatter(
     x=bilancio["datetime"], y=bilancio["Integrazione_Caldaie"], 
     fill='tonexty', mode='none', fillcolor='rgba(215, 40, 40, 0.7)', 
     name='Integrazione Caldaie (Mancante)', stackgroup='one'
 ))
+
 # Linea Grigia tratteggiata: Calore dissipato in aria da ZML
 fig_bilancio.add_trace(go.Scatter(
     x=bilancio["datetime"], y=bilancio["Calore_Dissipato_ZML"], 
