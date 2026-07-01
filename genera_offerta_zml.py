@@ -59,6 +59,12 @@ else:
 min_date = hourly["datetime"].min().date()
 max_date = hourly["datetime"].max().date()
 date_range = st.sidebar.slider("Seleziona range", min_value=min_date, max_value=max_date, value=(min_date, max_date))
+st.sidebar.markdown("---")
+st.sidebar.subheader("Parametri Impianto")
+capacita_accumulo = st.sidebar.slider(
+    "Capacità Accumulo Termico (MWh)", 
+    min_value=0, max_value=200, value=50, step=10
+)
 
 # --- QUI CREIAMO 'df', QUELLO CHE MANCAVA E DAVA ERRORE ---
 df = hourly[
@@ -69,9 +75,9 @@ df = hourly[
 ]
 
 # ===========================================================================
-# 3. GRAFICO PRINCIPALE: BILANCIO E SPRECHI ZML
+# 3. GRAFICO PRINCIPALE: BILANCIO E ACCUMULO TERMICO
 # ===========================================================================
-st.subheader("Bilancio Termico: Analisi Copertura e Sprechi")
+st.subheader("Bilancio Termico: Analisi Copertura, Accumulo e Sprechi")
 
 domanda_totale = df.groupby("datetime")["MWh"].sum().reset_index()
 domanda_totale.rename(columns={"MWh": "Domanda Reti (MWh)"}, inplace=True)
@@ -81,31 +87,98 @@ off_filtered = offerta_zml[mask_off].copy()
 bilancio = pd.merge(domanda_totale, off_filtered[["datetime", "MWh_termici"]], on="datetime", how="left")
 bilancio.rename(columns={"MWh_termici": "Offerta ZML (MWh)"}, inplace=True)
 
-bilancio["Calore_Usato_ZML"] = np.minimum(bilancio["Domanda Reti (MWh)"], bilancio["Offerta ZML (MWh)"])
-bilancio["Integrazione_Caldaie"] = np.maximum(0, bilancio["Domanda Reti (MWh)"] - bilancio["Offerta ZML (MWh)"])
-bilancio["Calore_Dissipato_ZML"] = np.maximum(0, bilancio["Offerta ZML (MWh)"] - bilancio["Domanda Reti (MWh)"])
+# Calcoli base (senza accumulo)
+bilancio["Calore_Usato_ZML_Diretto"] = np.minimum(bilancio["Domanda Reti (MWh)"], bilancio["Offerta ZML (MWh)"])
+bilancio["Esubero_ZML"] = np.maximum(0, bilancio["Offerta ZML (MWh)"] - bilancio["Domanda Reti (MWh)"])
+bilancio["Deficit_Rete"] = np.maximum(0, bilancio["Domanda Reti (MWh)"] - bilancio["Offerta ZML (MWh)"])
 
+# Simulazione Accumulo Termico (Iterativa)
+soc = np.zeros(len(bilancio))
+scarica_accumulo = np.zeros(len(bilancio))
+carica_accumulo = np.zeros(len(bilancio))
+
+livello_attuale = 0.0
+
+for i in range(len(bilancio)):
+    esubero = bilancio["Esubero_ZML"].iloc[i]
+    deficit = bilancio["Deficit_Rete"].iloc[i]
+    
+    # Se c'è esubero da ZML, carichiamo il serbatoio
+    if esubero > 0 and livello_attuale < capacita_accumulo:
+        energia_caricabile = min(esubero, capacita_accumulo - livello_attuale)
+        livello_attuale += energia_caricabile
+        carica_accumulo[i] = energia_caricabile
+        
+    # Se c'è deficit (serve la caldaia), proviamo prima a scaricare il serbatoio
+    elif deficit > 0 and livello_attuale > 0:
+        energia_scaricabile = min(deficit, livello_attuale)
+        livello_attuale -= energia_scaricabile
+        scarica_accumulo[i] = energia_scaricabile
+        
+    soc[i] = livello_attuale
+
+bilancio["Scarica_Accumulo"] = scarica_accumulo
+bilancio["Carica_Accumulo"] = carica_accumulo
+bilancio["SoC_Accumulo"] = soc
+
+# Ricalcoliamo i valori netti finali dopo l'uso dell'accumulo
+bilancio["Integrazione_Caldaie_Finale"] = bilancio["Deficit_Rete"] - bilancio["Scarica_Accumulo"]
+bilancio["Calore_Dissipato_ZML_Finale"] = bilancio["Esubero_ZML"] - bilancio["Carica_Accumulo"]
+
+# --- PLOT GRAFICO ---
 fig_bilancio = go.Figure()
-fig_bilancio.add_trace(go.Scatter(x=bilancio["datetime"], y=bilancio["Calore_Usato_ZML"], fill='tozeroy', mode='none', fillcolor='rgba(40, 167, 69, 0.7)', name='Copertura ZML', stackgroup='one'))
-fig_bilancio.add_trace(go.Scatter(x=bilancio["datetime"], y=bilancio["Integrazione_Caldaie"], fill='tonexty', mode='none', fillcolor='rgba(215, 40, 40, 0.7)', name='Integrazione Caldaie (Mancante)', stackgroup='one'))
-fig_bilancio.add_trace(go.Scatter(x=bilancio["datetime"], y=bilancio["Calore_Dissipato_ZML"], mode='lines', line=dict(color='rgba(150, 150, 150, 0.8)', width=1, dash='dot'), name='Calore Dissipato in Torre (Spreco ZML)'))
-fig_bilancio.update_layout(height=400, xaxis_title="Timeline", yaxis_title="Potenza Termica (MW)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+
+# 1. Base Verde: ZML usato direttamente
+fig_bilancio.add_trace(go.Scatter(
+    x=bilancio["datetime"], y=bilancio["Calore_Usato_ZML_Diretto"], 
+    fill='tozeroy', mode='none', fillcolor='rgba(40, 167, 69, 0.7)', 
+    name='ZML (Uso Diretto)', stackgroup='one'
+))
+
+# 2. Fascia Azzurra: Calore fornito dallo svuotamento dell'accumulo
+fig_bilancio.add_trace(go.Scatter(
+    x=bilancio["datetime"], y=bilancio["Scarica_Accumulo"], 
+    fill='tonexty', mode='none', fillcolor='rgba(23, 162, 184, 0.7)', 
+    name='Scarica Accumulo', stackgroup='one'
+))
+
+# 3. Fascia Rossa: Caldaie di backup (quello che manca ancora)
+fig_bilancio.add_trace(go.Scatter(
+    x=bilancio["datetime"], y=bilancio["Integrazione_Caldaie_Finale"], 
+    fill='tonexty', mode='none', fillcolor='rgba(215, 40, 40, 0.7)', 
+    name='Integrazione Caldaie (Mancante)', stackgroup='one'
+))
+
+# 4. Linea Grigia: Quello che ZML butta via comunque (perché rete e accumulo sono pieni)
+fig_bilancio.add_trace(go.Scatter(
+    x=bilancio["datetime"], y=bilancio["Calore_Dissipato_ZML_Finale"], 
+    mode='lines', line=dict(color='rgba(150, 150, 150, 0.8)', width=1, dash='dot'), 
+    name='Spreco ZML Finale (Torre)'
+))
+
+fig_bilancio.update_layout(
+    height=450, xaxis_title="Timeline", yaxis_title="Potenza Termica (MW)", 
+    hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+)
 st.plotly_chart(fig_bilancio, use_container_width=True)
 
 # ===========================================================================
-# 4. KPI NUMERICI
+# 4. KPI NUMERICI (AGGIORNATI CON ACCUMULO)
 # ===========================================================================
 tot_domanda = bilancio["Domanda Reti (MWh)"].sum()
-tot_usato_zml = bilancio["Calore_Usato_ZML"].sum()
-tot_integrato = bilancio["Integrazione_Caldaie"].sum()
-tot_dissipato = bilancio["Calore_Dissipato_ZML"].sum()
-perc_copertura = (tot_usato_zml / tot_domanda) * 100 if tot_domanda > 0 else 0
+tot_zml_diretto = bilancio["Calore_Usato_ZML_Diretto"].sum()
+tot_accumulo_usato = bilancio["Scarica_Accumulo"].sum()
+tot_integrato_finale = bilancio["Integrazione_Caldaie_Finale"].sum()
+tot_dissipato_finale = bilancio["Calore_Dissipato_ZML_Finale"].sum()
+
+copertura_totale_zml = tot_zml_diretto + tot_accumulo_usato
+perc_copertura = (copertura_totale_zml / tot_domanda) * 100 if tot_domanda > 0 else 0
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Domanda Totale", f"{tot_domanda:,.0f} MWh")
-col2.metric("Coperto da ZML", f"{tot_usato_zml:,.0f} MWh", f"{perc_copertura:.1f}% della domanda", delta_color="normal")
-col3.metric("Integrazione necessaria", f"{tot_integrato:,.0f} MWh")
-col4.metric("Dissipato in Torre (ZML)", f"{tot_dissipato:,.0f} MWh")
+col2.metric("Copertura Rinnovabile (ZML + TES)", f"{copertura_totale_zml:,.0f} MWh", f"{perc_copertura:.1f}% del totale", delta_color="normal")
+col3.metric("Integrazione Caldaie", f"{tot_integrato_finale:,.0f} MWh")
+col4.metric("Spreco ZML (Non recuperato)", f"{tot_dissipato_finale:,.0f} MWh")
 
 # ===========================================================================
 # 5. GRAFICO MENSILE: COPERTURA % E DOMANDA
