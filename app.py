@@ -477,6 +477,54 @@ def simula_accumulo_tiepido(dom_arr, scarto_pot_arr, scarto_T_arr, volume_m3,
     }
 
 
+def ottimizza_potenze(dom_arr, scarto_arr, scartoT_arr, volume_m3, T_min_acc, T_max_acc, dT_evap,
+                      T_mandata, eta_hp, T_ritorno, perdita_sett_pct,
+                      capex_hp_func, prezzo_el, backup_capex_kw, backup_opex_mwh, backup_cop,
+                      fattore_crf, picco_kw, max_ore_scoperte=0):
+    """
+    Trova le potenze ottimali di HP e backup che MINIMIZZANO il LCOH di sistema,
+    con il vincolo di lasciare al più `max_ore_scoperte` ore/anno non coperte.
+    Ricerca su griglia (il modello orario è velocissimo). Ritorna dict col risultato migliore.
+    """
+    def _valuta(p_hp, p_bk):
+        s = simula_accumulo_tiepido(
+            dom_arr, scarto_arr, scartoT_arr, volume_m3, T_min_acc, T_max_acc, dT_evap,
+            p_hp, 4.0, p_bk, architettura="diretta", backup_cop=backup_cop,
+            perdita_sett_pct=perdita_sett_pct, cop_dinamico=True,
+            T_mandata_cop=T_mandata, eta_hp_cop=eta_hp, T_ritorno_rete=T_ritorno)
+        if s["ore_non_coperte"] > max_ore_scoperte:
+            return None
+        capex = p_hp * capex_hp_func(p_hp) + p_bk * backup_capex_kw
+        opex = s["E_el_hp"] * prezzo_el + s["E_gas"] * backup_opex_mwh
+        e_tot = s["E_hp"] + s["E_gas"]
+        if e_tot < 1e-6:
+            return None
+        lcoh = (capex * fattore_crf + opex) / e_tot
+        return {"p_hp_kw": p_hp, "p_bk_kw": p_bk, "lcoh": lcoh, "E_hp": s["E_hp"], "E_gas": s["E_gas"],
+                "cop_medio": s["cop_medio"], "ore_non_coperte": s["ore_non_coperte"],
+                "quota_hp": s["E_hp"] / e_tot * 100}
+
+    best = None
+    # STADIO 1: griglia grossa 5x5
+    for p_hp in np.linspace(0.2, 1.0, 5) * picco_kw:
+        for p_bk in np.linspace(0.4, 1.2, 5) * picco_kw:
+            r = _valuta(p_hp, p_bk)
+            if r and (best is None or r["lcoh"] < best["lcoh"]):
+                best = r
+    if best is None:
+        return None
+    # STADIO 2: raffino intorno al migliore (±10% del picco, passo 5%)
+    step = 0.05 * picco_kw
+    for p_hp in [best["p_hp_kw"] + d for d in (-2*step, -step, 0, step, 2*step)]:
+        for p_bk in [best["p_bk_kw"] + d for d in (-2*step, -step, 0, step, 2*step)]:
+            if p_hp <= 0 or p_bk <= 0:
+                continue
+            r = _valuta(p_hp, p_bk)
+            if r and r["lcoh"] < best["lcoh"]:
+                best = r
+    return best
+
+
 buildings, domanda, aziende, pvgis = load_data()
 
 st.title("🔥 Maniago TLR — Domanda, Offerta, Dimensionamento")
@@ -884,20 +932,29 @@ with tab_dimensionamento:
     # -------------------------------------------------------------------------
     st.markdown("#### A) Domanda da coprire e scarto disponibile")
 
+    # eredita da Domanda/Offerta se disponibili, altrimenti default sensati (non bloccare mai)
     edifici_dim = st.session_state.get("_dom_edifici")
+    if not edifici_dim:
+        edifici_dim = buildings.loc[buildings["tipo_utenza"] == "Pubblico", "edificio"].tolist()
     fonti_dim = st.session_state.get("_off_fonti")
-    if edifici_dim is None or fonti_dim is None:
-        st.warning("Apri prima le schede **Domanda** e **Offerta** almeno una volta: il dimensionamento "
-                   "usa gli edifici e le fonti che hai selezionato lì.")
-        st.stop()
+    if not fonti_dim:
+        fonti_dim = sorted(genera_offerta_aziende(aziende, T_ritorno_ideale, 5.0)["fonte"].unique())
 
+    eredita_ok = bool(st.session_state.get("_dom_edifici")) and bool(st.session_state.get("_off_fonti"))
     zone_dim = st.session_state.get("_dom_zone", [])
-    st.caption(
-        f"Sto usando **{len(edifici_dim)} edifici** dalle zone selezionate in Domanda "
-        f"({', '.join(zone_dim) if zone_dim else '—'}) e **{len(fonti_dim)} fonti** "
-        f"selezionate in Offerta, con mandata/ritorno **{T_mandata_ideale}/{T_ritorno_ideale}°C**. "
-        f"Cambia le selezioni in quelle schede e questa si aggiorna di conseguenza."
-    )
+    if eredita_ok:
+        st.caption(
+            f"Sto usando **{len(edifici_dim)} edifici** dalle zone selezionate in Domanda "
+            f"({', '.join(zone_dim) if zone_dim else '—'}) e **{len(fonti_dim)} fonti** "
+            f"selezionate in Offerta, con mandata/ritorno **{T_mandata_ideale}/{T_ritorno_ideale}°C**. "
+            f"Cambia le selezioni in quelle schede e questa si aggiorna di conseguenza."
+        )
+    else:
+        st.info(
+            f"Sto usando i **valori predefiniti** ({len(edifici_dim)} edifici pubblici, tutte le "
+            f"{len(fonti_dim)} fonti). Apri le schede **Domanda** e **Offerta** per personalizzare la "
+            f"selezione: questa scheda erediterà automaticamente le tue scelte."
+        )
 
     # domanda: stessi edifici della Domanda, con il fattore di correzione privato applicato
     fattore_priv = st.session_state.get("_dom_fattore_privato", 1.0)
@@ -937,8 +994,65 @@ with tab_dimensionamento:
     )
 
     # -------------------------------------------------------------------------
-    # B) Accumulo termico (uno o più serbatoi in serie idraulica)
+    # A-bis) OTTIMIZZAZIONE AUTOMATICA delle potenze HP + backup
     # -------------------------------------------------------------------------
+    st.markdown("##### ⚙️ Ottimizzazione automatica delle potenze")
+    st.caption(
+        "Cerca la combinazione di potenza **HP + backup a gas** che minimizza il LCOH garantendo "
+        "copertura totale, sul profilo di domanda e scarto qui sopra. Trovate le taglie, le imposta come "
+        "valori di partenza negli slider sotto (che puoi comunque ritoccare)."
+    )
+    colopt1, colopt2 = st.columns([1, 2])
+    vol_opt = colopt1.number_input("Volume accumulo per l'ottimizzazione (m³)", 0, 4000, 800, step=100,
+                                    key="dim_vol_opt",
+                                    help="L'ottimizzazione usa questo volume; poi puoi affinarlo nel blocco B")
+    picco_dim_kw = float(dom_dim_series.max() * 1000)
+
+    def _capex_hp_opt(pot_kw):
+        p_mw = max(pot_kw / 1000.0, 0.1)
+        if p_mw <= 1: return 1240
+        if p_mw >= 10: return 670
+        for (p0, c0), (p1, c1) in [((1, 1240), (3, 860)), ((3, 860), (10, 670))]:
+            if p0 <= p_mw <= p1:
+                return c0 + (np.log(p_mw) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
+        return 670
+
+    if colopt1.button("🔎 Ottimizza HP + gas", key="dim_btn_ottimizza"):
+        with st.spinner("Ricerca della combinazione ottimale..."):
+            best = ottimizza_potenze(
+                dom_arr, scarto_arr, scartoT_arr, vol_opt, 25, float(T_mandata_ideale), 5,
+                float(T_mandata_ideale), 0.5, float(T_ritorno_ideale),
+                perdita_sett_pct=(np.interp(np.log(np.clip(vol_opt,500,5000)),[np.log(500),np.log(5000)],[2.0,1.0]) if vol_opt>0 else 0.0),
+                capex_hp_func=_capex_hp_opt, prezzo_el=180, backup_capex_kw=120, backup_opex_mwh=90/0.92,
+                backup_cop=None, fattore_crf=crf(0.04, 20), picco_kw=picco_dim_kw, max_ore_scoperte=0
+            )
+        if best:
+            hp_opt = int(round(best["p_hp_kw"] / 100) * 100)
+            gas_opt = int(round(best["p_bk_kw"] / 100) * 100)
+            st.session_state["_opt_hp_kw"] = hp_opt
+            st.session_state["_opt_gas_kw"] = gas_opt
+            st.session_state["dim_pot_hp"] = hp_opt
+            st.session_state["dim_pot_gas"] = gas_opt
+            st.session_state["_opt_result"] = best
+            st.rerun()
+        else:
+            st.session_state["_opt_result"] = None
+            st.warning("Nessuna combinazione copre il 100% con questi parametri: prova ad aumentare il volume o allargare le griglie.")
+
+    opt_res = st.session_state.get("_opt_result")
+    if opt_res:
+        with colopt2:
+            o1, o2, o3 = st.columns(3)
+            o1.metric("HP ottimale", f"{opt_res['p_hp_kw']:.0f} kW",
+                      help=f"{opt_res['p_hp_kw']/picco_dim_kw*100:.0f}% del picco domanda")
+            o2.metric("Gas ottimale", f"{opt_res['p_bk_kw']:.0f} kW",
+                      help=f"{opt_res['p_bk_kw']/picco_dim_kw*100:.0f}% del picco (copre la punta)")
+            o3.metric("LCOH minimo", f"{opt_res['lcoh']:.1f} €/MWh",
+                      help=f"Quota HP {opt_res['quota_hp']:.0f}%, COP medio {opt_res['cop_medio']:.2f}")
+            st.caption(f"✅ Taglie impostate come default negli slider sotto. "
+                       f"HP copre il **{opt_res['quota_hp']:.0f}%** dell'energia, il gas solo la punta residua "
+                       f"(schema base+peak dei factsheet).")
+
     st.divider()
     st.markdown("#### B) Accumulo termico")
     st.caption(
@@ -1008,10 +1122,13 @@ with tab_dimensionamento:
     st.divider()
     st.markdown("#### C) Pompa di calore")
     cC1, cC2, cC3 = st.columns(3)
-    pot_hp_kw = cC1.slider("Potenza termica HP (kW)", 0, int(dom_dim_series.max() * 1000) + 500,
-                           1000, step=100, key="dim_pot_hp",
+    _max_hp = int(dom_dim_series.max() * 1000) + 500
+    if "dim_pot_hp" not in st.session_state:
+        st.session_state["dim_pot_hp"] = min(int(st.session_state.get("_opt_hp_kw", 1000)), _max_hp)
+    pot_hp_kw = cC1.slider("Potenza termica HP (kW)", 0, _max_hp, step=100, key="dim_pot_hp",
                            help="Dimensionala perché lavori il più costante possibile: guarda 'ore HP attiva' sotto. "
-                                "Rif. IEA DHC F6: le grandi HP si dimensionano spesso a ~50% del picco e coprono ~80% dell'energia.")
+                                "Rif. IEA DHC F6: le grandi HP si dimensionano spesso a ~50% del picco e coprono ~80% dell'energia. "
+                                "Se hai usato l'ottimizzazione automatica, parte dal valore ottimo.")
     eta_hp = cC2.slider("Efficienza di 2° principio η (%)", 30, 60, 50, key="dim_hp_eta",
                         help="η di Lorentz. IEA DHC F6 e QM Handbook: valori reali 40-60% per HP industriali di qualità.") / 100
     prezzo_el = cC3.slider("Prezzo elettricità (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el")
@@ -1106,8 +1223,11 @@ with tab_dimensionamento:
 
     if backup_tipo == "Gas metano":
         cD1, cD2, cD3 = st.columns(3)
-        pot_gas_kw = cD1.slider("Potenza caldaia (kW)", 0, int(dom_dim_series.max()*1000)+1000, 2000,
-                                step=100, key="dim_pot_gas")
+        _max_gas = int(dom_dim_series.max()*1000)+1000
+        if "dim_pot_gas" not in st.session_state:
+            st.session_state["dim_pot_gas"] = min(int(st.session_state.get("_opt_gas_kw", 2000)), _max_gas)
+        pot_gas_kw = cD1.slider("Potenza caldaia (kW)", 0, _max_gas, step=100, key="dim_pot_gas",
+                                help="Se hai usato l'ottimizzazione automatica, parte dal valore ottimo.")
         rend_gas = cD2.slider("Rendimento (%)", 85, 98, 92, key="dim_rend_gas") / 100
         prezzo_gas = cD3.slider("Prezzo gas (€/MWh termico)", 40, 160, 90, key="dim_prezzo_gas")
         capex_kw_gas = st.slider("CAPEX (€/kW)", 60, 300, 120, step=10, key="dim_capex_gas")
