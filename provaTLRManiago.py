@@ -708,109 +708,6 @@ with tab_domanda:
                 detail = detail.sort_values("Totale MWh", ascending=False).reset_index()
                 st.dataframe(detail, use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.markdown("#### 🔧 Ottimizzazione: quali edifici pubblici escludere per alzare la densità")
-    st.caption(
-        "Analisi indipendente dal privato: parte dall'albero di collegamento minimo (MST) dei soli "
-        "edifici pubblici e rimuove uno alla volta quello con il peggior rapporto energia/lunghezza "
-        "di ramo — mostra quanto migliora la densità man mano che si tolgono gli edifici più "
-        "'costosi' da raggiungere rispetto a quanto scaldano."
-    )
-    cluster_ottim = st.selectbox("Cluster da analizzare", sorted(buildings["cluster"].unique()),
-                                 key="dom_ottim_cluster")
-
-    @st.cache_data
-    def ottimizza_densita(cluster_sel, _buildings):
-        try:
-            coords_pub = pd.read_csv("edifici_pubblici_coordinate.csv")
-        except FileNotFoundError:
-            return None
-        merged = coords_pub.merge(_buildings[["edificio", "cluster", "consumo_annuo_MWh"]], on="edificio", how="inner")
-        merged = merged[merged["cluster"] == cluster_sel].reset_index(drop=True)
-        n = len(merged)
-        if n < 3:
-            return None
-        def mst_prim(D):
-            """Minimum Spanning Tree con algoritmo di Prim, solo numpy.
-            Ritorna una matrice m×m con i pesi degli archi dell'albero (0 altrove),
-            equivalente a scipy.sparse.csgraph.minimum_spanning_tree(D).toarray()."""
-            m = D.shape[0]
-            mst = np.zeros((m, m))
-            if m < 2:
-                return mst
-            in_tree = np.zeros(m, dtype=bool)
-            in_tree[0] = True
-            best_dist = D[0].astype(float).copy()
-            best_from = np.zeros(m, dtype=int)
-            best_dist[0] = np.inf
-            for _ in range(m - 1):
-                j = int(np.argmin(np.where(in_tree, np.inf, best_dist)))
-                i = best_from[j]
-                mst[i, j] = D[i, j]  # arco i->j (triangolare, come scipy)
-                in_tree[j] = True
-                nuovi = D[j]
-                migliora = (~in_tree) & (nuovi < best_dist)
-                best_dist[migliora] = nuovi[migliora]
-                best_from[migliora] = j
-            return mst
-
-        def haversine_m(lat1, lon1, lat2, lon2):
-            R = 6371000
-            p1, p2 = np.radians(lat1), np.radians(lat2)
-            dphi, dlmb = np.radians(lat2-lat1), np.radians(lon2-lon1)
-            a = np.sin(dphi/2)**2 + np.cos(p1)*np.cos(p2)*np.sin(dlmb/2)**2
-            return 2*R*np.arcsin(np.sqrt(a))
-
-        attivi = list(range(n))
-        risultati = []
-        rimossi = []
-        while len(attivi) >= 3:
-            sub = merged.iloc[attivi].reset_index(drop=True)
-            m = len(sub)
-            D = np.zeros((m, m))
-            for i in range(m):
-                D[i, :] = haversine_m(sub["lat"][i], sub["lon"][i], sub["lat"].values, sub["lon"].values)
-            mst = mst_prim(D)
-            lunghezza = mst.sum() * 1.3
-            energia = sub["consumo_annuo_MWh"].sum()
-            densita_attuale = energia / lunghezza if lunghezza > 0 else np.nan
-            risultati.append({"n_edifici": m, "lunghezza_m": lunghezza, "energia_MWh": energia,
-                               "densita": densita_attuale, "escluso": rimossi[-1] if rimossi else None})
-            # trova la foglia (grado 1 nel MST) con il peggior rapporto energia/lunghezza-ramo
-            gradi = (mst > 0).sum(axis=0) + (mst > 0).sum(axis=1)
-            foglie = np.where(gradi == 1)[0]
-            if len(foglie) == 0:
-                break
-            peggior_foglia, peggior_score = None, np.inf
-            for f in foglie:
-                ramo = max(mst[f, :].max(), mst[:, f].max())
-                score = sub["consumo_annuo_MWh"].iloc[f] / ramo if ramo > 0 else np.inf
-                if score < peggior_score:
-                    peggior_score, peggior_foglia = score, f
-            rimossi.append(sub["edificio"].iloc[peggior_foglia])
-            attivi = [attivi[i] for i in range(m) if i != peggior_foglia]
-        return pd.DataFrame(risultati)
-
-    df_ottim = ottimizza_densita(cluster_ottim, buildings)
-    if df_ottim is None or df_ottim.empty:
-        st.info("Servono almeno 3 edifici pubblici in questo cluster per l'analisi.")
-    else:
-        fig_ottim = go.Figure()
-        fig_ottim.add_trace(go.Scatter(x=df_ottim["n_edifici"], y=df_ottim["densita"], mode="lines+markers",
-                                        line=dict(color=COLOR_ACCUMULO)))
-        fig_ottim.add_hline(y=2.0, line_dash="dot", line_color="red", annotation_text="soglia 2 MWh/(a·m)")
-        fig_ottim.update_layout(height=320, xaxis_title="N. edifici pubblici rimasti (via via che si potano i rami peggiori)",
-                                 yaxis_title="Densità (MWh/a·m)", xaxis_autorange="reversed")
-        st.plotly_chart(fig_ottim, use_container_width=True)
-        st.caption(
-            "Ordine di esclusione consigliato (dal primo da togliere): " +
-            ", ".join([str(x) for x in df_ottim["escluso"].dropna().tolist()])
-        )
-        with st.expander("Dettaglio passo per passo"):
-            st.dataframe(df_ottim.rename(columns={
-                "n_edifici": "N. edifici", "lunghezza_m": "Lunghezza (m)", "energia_MWh": "Energia (MWh)",
-                "densita": "Densità", "escluso": "Escluso in questo passo"
-            }).round(1), use_container_width=True, hide_index=True)
 
 # =============================================================================
 # TAB 2 - OFFERTA
@@ -933,8 +830,9 @@ with tab_offerta:
         fig_comp.add_hline(y=T_mandata_ideale, line_dash="dot", line_color="red",
                             annotation_text=f"T mandata ideale ({T_mandata_ideale}°C)",
                             annotation_position="top left")
-        fig_comp.update_layout(height=460, xaxis_title="Energia cumulata disponibile (MWh/anno)",
+        fig_comp.update_layout(height=680, xaxis_title="Energia cumulata disponibile (MWh/anno)",
                                 yaxis_title="Temperatura disponibile (°C)",
+                                font=dict(size=14),
                                 legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig_comp, use_container_width=True)
 
@@ -1246,25 +1144,30 @@ with tab_dimensionamento:
     )
 
     # -------------------------------------------------------------------------
-    # D) Backup / integrazione — scelta della tecnologia
+    # D) Backup e integrazione — HP alta T è primaria; qui scegli chi la affianca
+    #    + integrazione solare termico ADDITIVA (sopra qualunque combinazione)
     # -------------------------------------------------------------------------
     st.divider()
-    st.markdown("#### D) Backup / integrazione (copre quando HP+accumulo non bastano)")
-    backup_tipo = st.radio(
-        "Tecnologia di backup",
-        ["Gas metano", "2ª pompa di calore (aria/ambiente)", "Biomassa (cippato)", "Solare termico (integrazione)"],
-        key="dim_backup_tipo", horizontal=True,
-        help="A parità di HP primaria e domanda, cambia solo il backup e confronta i risultati "
-             "(salva gli scenari nella scheda Confronto)."
+    st.markdown("#### D) Backup e integrazione")
+    st.caption(
+        "La **HP alta T** (scheda C) è la tecnologia primaria in tutti gli scenari. Qui scegli la "
+        "tecnologia che la **affianca sul residuo** (quando accumulo + HP non bastano) e, in modo "
+        "indipendente, quanta **integrazione solare termico** aggiungere. Cambia una cosa alla volta e "
+        "salva gli scenari nella scheda Confronto per metterli a paragone."
     )
 
-    backup_cop = None          # None = backup termico; numero = backup elettrico (2ª HP)
-    backup_arr_max = None      # profilo max se non dispacciabile (solare)
+    backup_tipo = st.radio(
+        "Combinazione:  HP alta T +",
+        ["Caldaia (gas)", "HP bassa T (aria/ambiente)", "Biomassa (cippato)"],
+        key="dim_backup_tipo", horizontal=True,
+        help="La HP alta T resta primaria in tutti i casi; cambia solo la tecnologia di supporto sul picco."
+    )
+
+    backup_cop = None          # None = backup termico; numero = backup elettrico (HP bassa T)
     opex_backup_unitario = 0.0 # €/MWh di calore reso dal backup
     capex_backup = 0.0
-    backup_label = backup_tipo
 
-    if backup_tipo == "Gas metano":
+    if backup_tipo == "Caldaia (gas)":
         cD1, cD2, cD3 = st.columns(3)
         _max_gas = int(dom_dim_series.max()*1000)+1000
         if "dim_pot_gas" not in st.session_state:
@@ -1277,9 +1180,9 @@ with tab_dimensionamento:
         capex_backup = pot_gas_kw * capex_kw_gas
         opex_backup_unitario = prezzo_gas / rend_gas if rend_gas > 0 else 0
         pot_backup_kw = pot_gas_kw
-        backup_label = f"Gas {pot_gas_kw} kW"
+        backup_label = f"Caldaia gas {pot_gas_kw} kW"
 
-    elif backup_tipo == "2ª pompa di calore (aria/ambiente)":
+    elif backup_tipo == "HP bassa T (aria/ambiente)":
         cD1, cD2, cD3 = st.columns(3)
         pot_backup_kw = cD1.slider("Potenza termica (kW)", 0, int(dom_dim_series.max()*1000)+1000, 2000,
                                    step=100, key="dim_pot_hp2")
@@ -1287,15 +1190,15 @@ with tab_dimensionamento:
         eta_hp2 = cD3.slider("η 2° principio (%)", 30, 60, 40, key="dim_hp2_eta") / 100
         cop_hp2_carnot = (T_mandata_ideale+273.15)/max(T_mandata_ideale-T_amb,1)
         backup_cop = cop_hp2_carnot * eta_hp2
-        prezzo_el2 = st.slider("Prezzo elettricità 2ª HP (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el2")
+        prezzo_el2 = st.slider("Prezzo elettricità HP bassa T (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el2")
         capex_kw_hp2 = st.slider("CAPEX (€/kW termico)", 300, 1200, 700, step=50, key="dim_capex_hp2")
         capex_backup = pot_backup_kw * capex_kw_hp2
         opex_backup_unitario = prezzo_el2 / backup_cop if backup_cop > 0 else 0
-        st.caption(f"COP 2ª HP ≈ **{backup_cop:.2f}** (sorgente ambiente {T_amb}°C → {T_mandata_ideale}°C). "
-                   f"Più bassa della HP primaria perché parte dall'ambiente, non dallo scarto.")
-        backup_label = f"2ª HP {pot_backup_kw} kW (COP {backup_cop:.1f})"
+        st.caption(f"COP HP bassa T ≈ **{backup_cop:.2f}** (sorgente ambiente {T_amb}°C → {T_mandata_ideale}°C). "
+                   f"Più basso della HP alta T perché parte dall'ambiente, non dallo scarto industriale.")
+        backup_label = f"HP bassa T {pot_backup_kw} kW (COP {backup_cop:.1f})"
 
-    elif backup_tipo == "Biomassa (cippato)":
+    else:  # Biomassa (cippato)
         cD1, cD2, cD3 = st.columns(3)
         pot_backup_kw = cD1.slider("Potenza caldaia (kW)", 0, int(dom_dim_series.max()*1000)+1000, 2000,
                                    step=100, key="dim_pot_bio")
@@ -1308,27 +1211,54 @@ with tab_dimensionamento:
                    "poche ore → LCOH tipicamente elevato. Il confronto lo mostra coi numeri.")
         backup_label = f"Biomassa {pot_backup_kw} kW"
 
-    else:  # Solare termico (integrazione)
-        cD1, cD2, cD3 = st.columns(3)
-        area_sol = cD1.slider("Superficie collettori (m²)", 0, 8000, 2000, step=100, key="dim_area_sol")
-        eff_sol = cD2.slider("Efficienza netta (%)", 15, 50, 30, key="dim_eff_sol") / 100
-        capex_mq_sol = cD3.slider("CAPEX (€/m²)", 200, 900, 640, step=20, key="dim_capex_sol")
-        offerta_sol = genera_offerta_solare(pvgis, area_sol, eff_sol)
-        backup_arr_max = offerta_sol.groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0).values
-        capex_backup = area_sol * capex_mq_sol
-        opex_backup_unitario = 0.0
-        pot_backup_kw = 999999  # non dispacciabile: il limite è il profilo, non una potenza fissa
-        st.caption(f"⚠️ Solare come integrazione: produce d'estate ({offerta_sol['MWh'].sum():,.0f} MWh/anno "
-                   f"potenziali) quando il backup serve meno. Anticorrelato ai picchi invernali."
-                   .replace(",", "."))
-        backup_label = f"Solare {area_sol} m²"
-        pot_gas_kw = 0  # placeholder per compatibilità firma
+    pot_backup_kw_sim = pot_backup_kw
 
-    # normalizzo il nome della potenza backup per la chiamata di simulazione
-    if backup_tipo == "Solare termico (integrazione)":
-        pot_backup_kw_sim = 0  # il vincolo è backup_arr_max, non una potenza
-    else:
-        pot_backup_kw_sim = pot_backup_kw
+    # --- Integrazione SOLARE TERMICO (additiva, sopra qualunque combinazione) ---
+    st.markdown("##### ☀️ Integrazione solare termico")
+    st.caption(
+        "Il solare è **additivo**: copre parte della domanda quando c'è sole — soprattutto l'ACS estiva, "
+        "quando HP e backup lavorano poco — riducendone il carico. Il default dimensiona il campo perché "
+        "la **produzione solare estiva eguagli il fabbisogno ACS estivo** (giu-ago); da lì puoi spingere "
+        "la quota su o giù."
+    )
+    solare_on = st.checkbox("Aggiungi solare termico", value=True, key="dim_solare_on")
+
+    E_solar = 0.0
+    solar_avail = np.zeros(len(dom_arr))
+    capex_solare = 0.0
+    area_sol = 0
+    if solare_on:
+        # fabbisogno ACS estivo (giu-lug-ago) sugli edifici selezionati
+        acs_series = dom_dim.groupby("datetime")["MWh_ACS"].sum().reindex(idx_h, fill_value=0)
+        mesi_estivi = idx_h.month.isin([6, 7, 8])
+        acs_estiva = float(acs_series[mesi_estivi].sum())
+        # produzione solare estiva per campo di riferimento (1000 m² @ 30%) → area baseline
+        EFF_REF = 0.30
+        off_ref = genera_offerta_solare(pvgis, 1000.0, EFF_REF)
+        prod_ref = off_ref.groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0)
+        prod_ref_estiva = float(prod_ref[mesi_estivi].sum())
+        area_baseline = (acs_estiva / prod_ref_estiva * 1000.0) if prod_ref_estiva > 1e-6 else 2000.0
+
+        cS0, cS1, cS2 = st.columns(3)
+        cS0.metric("Fabbisogno ACS estivo (giu-ago)", f"{acs_estiva:,.0f} MWh".replace(",", "."),
+                   help="È il target base del solare: al 100% il campo è dimensionato per coprirlo in estate.")
+        quota_sol = cS1.slider("Quota solare (% dell'ACS estiva)", 0, 300, 100, step=10, key="dim_quota_sol",
+                               help="100% = produzione solare estiva ≈ ACS estiva. Sopra il 100% il solare "
+                                    "spinge oltre l'ACS, ma il surplus estivo va sprecato senza accumulo stagionale.")
+        eff_sol = cS2.slider("Efficienza netta collettori (%)", 15, 50, 30, key="dim_eff_sol") / 100
+        # l'area compensa un'efficienza diversa da quella di riferimento per tenere fermo il target energetico
+        area_sol = int(round(area_baseline * (quota_sol / 100.0) * (EFF_REF / eff_sol)))
+        capex_mq_sol = st.slider("CAPEX solare (€/m²)", 200, 900, 640, step=20, key="dim_capex_sol")
+
+        offerta_sol = genera_offerta_solare(pvgis, area_sol, eff_sol)
+        solar_avail = offerta_sol.groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0).values
+        capex_solare = area_sol * capex_mq_sol
+
+        cSa, cSb, cSc = st.columns(3)
+        cSa.metric("Superficie collettori", f"{area_sol:,} m²".replace(",", "."))
+        cSb.metric("Produzione solare potenziale", f"{solar_avail.sum():,.0f} MWh/a".replace(",", "."),
+                   help="Energia teorica del campo; quanta ne finisce utile dipende dalla domanda ora per ora.")
+        cSc.metric("CAPEX solare", f"{capex_solare:,.0f} €".replace(",", "."))
 
     # -------------------------------------------------------------------------
     # E) Parametri economici + simulazione
@@ -1347,11 +1277,17 @@ with tab_dimensionamento:
     )
     E_alta_diretta = float(q_alta_diretta.sum())
 
-    # SECONDO STADIO: la HP (accumulo tiepido) copre la domanda RESIDUA, gas come backup
+    # STADIO SOLARE: il solare termico (must-take) copre parte della domanda residua
+    q_solar_arr = np.minimum(dom_residua_arr, solar_avail)
+    E_solar = float(q_solar_arr.sum())
+    E_solar_sprecato = float((solar_avail - q_solar_arr).sum())
+    dom_dopo_solare = dom_residua_arr - q_solar_arr
+
+    # SECONDO STADIO: la HP alta T (accumulo tiepido) copre il residuo, backup a valle
     sim = simula_accumulo_tiepido(
-        dom_residua_arr, scarto_arr, scartoT_arr, volume_accumulo,
+        dom_dopo_solare, scarto_arr, scartoT_arr, volume_accumulo,
         T_min_acc, T_max_acc, dT_evap, pot_hp_kw, cop_reale, pot_backup_kw_sim,
-        architettura=architettura, backup_cop=backup_cop, backup_arr_max=backup_arr_max,
+        architettura=architettura, backup_cop=backup_cop, backup_arr_max=None,
         perdita_sett_pct=perdita_sett_pct,
         cop_dinamico=cop_dinamico, T_mandata_cop=T_mandata_ideale, eta_hp_cop=eta_hp,
         T_ritorno_rete=T_ritorno_ideale
@@ -1363,22 +1299,27 @@ with tab_dimensionamento:
     st.divider()
     st.markdown("#### Risultato della simulazione oraria")
 
-    # mix di copertura: alta T diretta + HP + gas
+    # mix di copertura: alta T diretta + solare + HP + backup
     E_hp, E_gas, E_nc = sim["E_hp"], sim["E_gas"], sim["E_non_coperta"]
     dom_tot = dom_dim_series.sum()
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("🔴 Alta T diretta", f"{E_alta_diretta:,.0f} MWh".replace(",", "."),
-              help=f"{E_alta_diretta/dom_tot*100:.0f}% della domanda coperta dai fumi caldi senza HP né gas "
-                   f"(calore quasi gratuito)")
-    r2.metric("🔵 Coperta da HP", f"{E_hp:,.0f} MWh".replace(",", "."),
+    cols_r = st.columns(5 if solare_on else 4)
+    ci = 0
+    cols_r[ci].metric("🔴 Alta T diretta", f"{E_alta_diretta:,.0f} MWh".replace(",", "."),
+              help=f"{E_alta_diretta/dom_tot*100:.0f}% della domanda dai fumi caldi, senza HP né backup "
+                   f"(calore quasi gratuito)"); ci += 1
+    if solare_on:
+        cols_r[ci].metric("☀️ Solare", f"{E_solar:,.0f} MWh".replace(",", "."),
+              help=f"{E_solar/dom_tot*100:.0f}% della domanda dal solare termico · "
+                   f"{E_solar_sprecato:,.0f} MWh estivi in surplus (sprecati senza accumulo stagionale)".replace(",", ".")); ci += 1
+    cols_r[ci].metric("🔵 HP alta T", f"{E_hp:,.0f} MWh".replace(",", "."),
               help=f"{E_hp/dom_tot*100:.0f}% della domanda · COP medio {sim['cop_medio']:.1f} · "
-                   f"{sim['ore_hp_attiva']:,} ore attiva".replace(",", "."))
-    r3.metric("Coperta da backup", f"{E_gas:,.0f} MWh".replace(",", "."),
-              help=f"{backup_label} · {E_gas/dom_tot*100:.0f}% della domanda · {sim['ore_gas_attivo']:,} ore attivo".replace(",", "."))
-    quota_rinnovabile = (E_alta_diretta + E_hp) / dom_tot * 100 if dom_tot > 0 else 0
-    r4.metric("Quota rinnovabile", f"{quota_rinnovabile:.0f}%",
-              help=f"Alta T diretta + HP sul totale domanda. COP medio HP {sim['cop_medio']:.2f}, "
-                   f"elettricità {sim['E_el_hp']:,.0f} MWh".replace(",", "."))
+                   f"{sim['ore_hp_attiva']:,} ore attiva".replace(",", ".")); ci += 1
+    cols_r[ci].metric("Backup", f"{E_gas:,.0f} MWh".replace(",", "."),
+              help=f"{backup_label} · {E_gas/dom_tot*100:.0f}% della domanda · {sim['ore_gas_attivo']:,} ore attivo".replace(",", ".")); ci += 1
+    quota_rinnovabile = (E_alta_diretta + E_solar + E_hp) / dom_tot * 100 if dom_tot > 0 else 0
+    cols_r[ci].metric("Quota rinnovabile", f"{quota_rinnovabile:.0f}%",
+              help=f"Alta T + solare + HP sul totale domanda (il backup conta a parte se rinnovabile). "
+                   f"Elettricità HP {sim['E_el_hp']:,.0f} MWh".replace(",", "."))
 
     if sim["ore_non_coperte"] > 0:
         st.error(
@@ -1390,8 +1331,10 @@ with tab_dimensionamento:
 
     # grafico mix
     fig_mix = go.Figure()
-    voci_mix = [("🔴 Alta T diretta", E_alta_diretta, "#B0413E"),
-                ("🔵 Pompa di calore", E_hp, COLOR_HP), (backup_label, E_gas, COLOR_CALDAIA)]
+    voci_mix = [("🔴 Alta T diretta", E_alta_diretta, "#B0413E")]
+    if solare_on and E_solar > 1:
+        voci_mix.append(("☀️ Solare", E_solar, "#E8B004"))
+    voci_mix += [("🔵 HP alta T", E_hp, COLOR_HP), (backup_label, E_gas, COLOR_CALDAIA)]
     if E_nc > 1:
         voci_mix.append(("Non coperto", E_nc, "#B0B0B0"))
     for nome, val, col in voci_mix:
@@ -1487,7 +1430,7 @@ with tab_dimensionamento:
     opex_gas = E_gas * opex_backup_unitario
 
     righe = [
-        {"Voce": f"Pompa di calore ({pot_hp_kw} kW)", "CAPEX (€)": round(capex_hp),
+        {"Voce": f"HP alta T ({pot_hp_kw} kW)", "CAPEX (€)": round(capex_hp),
          "CAPEX annuo (€/a)": round(capex_hp*fattore_crf), "OPEX (€/a)": round(opex_hp),
          "Energia (MWh/a)": round(E_hp),
          "Costo annuo (€/a)": round(capex_hp*fattore_crf + opex_hp),
@@ -1497,32 +1440,44 @@ with tab_dimensionamento:
          "Energia (MWh/a)": round(E_gas),
          "Costo annuo (€/a)": round(capex_backup*fattore_crf + opex_gas),
          "LCOH (€/MWh)": round((capex_backup*fattore_crf + opex_gas)/E_gas, 1) if E_gas > 1e-6 else None},
+    ]
+    if solare_on and E_solar > 1e-6:
+        righe.append(
+            {"Voce": f"Solare termico ({area_sol} m²)", "CAPEX (€)": round(capex_solare),
+             "CAPEX annuo (€/a)": round(capex_solare*fattore_crf), "OPEX (€/a)": 0,
+             "Energia (MWh/a)": round(E_solar),
+             "Costo annuo (€/a)": round(capex_solare*fattore_crf),
+             "LCOH (€/MWh)": round(capex_solare*fattore_crf/E_solar, 1) if E_solar > 1e-6 else None})
+    righe.append(
         {"Voce": f"Accumulo ({volume_accumulo} m³)", "CAPEX (€)": round(capex_acc),
          "CAPEX annuo (€/a)": round(capex_acc*fattore_crf), "OPEX (€/a)": 0,
          "Energia (MWh/a)": None, "Costo annuo (€/a)": round(capex_acc*fattore_crf),
-         "LCOH (€/MWh)": None},
-    ]
+         "LCOH (€/MWh)": None})
     df_tec = pd.DataFrame(righe)
     st.dataframe(df_tec, use_container_width=True, hide_index=True)
 
+    def _colore_voce(v):
+        if v.startswith("HP alta T"): return COLOR_HP
+        if v.startswith("Solare"): return "#E8B004"
+        return COLOR_CALDAIA
     df_lcoh = df_tec.dropna(subset=["LCOH (€/MWh)"]).sort_values("LCOH (€/MWh)")
     if not df_lcoh.empty:
         fig_lcoh = go.Figure(go.Bar(
             x=df_lcoh["LCOH (€/MWh)"], y=df_lcoh["Voce"], orientation="h",
-            marker_color=[COLOR_HP if "Pompa" in v else COLOR_CALDAIA for v in df_lcoh["Voce"]],
+            marker_color=[_colore_voce(v) for v in df_lcoh["Voce"]],
             text=df_lcoh["LCOH (€/MWh)"].map(lambda v: f"{v:.0f} €/MWh"), textposition="outside"))
-        fig_lcoh.update_layout(height=200, xaxis_title="LCOH (€/MWh)", yaxis_title="",
+        fig_lcoh.update_layout(height=220, xaxis_title="LCOH (€/MWh)", yaxis_title="",
                                margin=dict(t=10, b=10),
                                title="Costo del calore per fonte (più basso = più conveniente)")
         st.plotly_chart(fig_lcoh, use_container_width=True)
 
-    capex_sistema = capex_hp + capex_backup + capex_acc
+    capex_sistema = capex_hp + capex_backup + capex_acc + capex_solare
     costo_annuo_sistema = capex_sistema*fattore_crf + opex_hp + opex_gas
-    energia_fornita = E_hp + E_gas
+    energia_fornita = E_hp + E_gas + E_solar
     lcoh_sistema = costo_annuo_sistema / energia_fornita if energia_fornita > 1e-6 else np.nan
-    # quota rinnovabile: HP sempre; il backup conta come FER se NON è gas
-    backup_is_fer = backup_tipo != "Gas metano"
-    E_fer = E_hp + (E_gas if backup_is_fer else 0)
+    # quota rinnovabile: HP e solare sempre FER; il backup conta come FER se NON è la caldaia a gas
+    backup_is_fer = backup_tipo != "Caldaia (gas)"
+    E_fer = E_hp + E_solar + (E_gas if backup_is_fer else 0)
     quota_fer_pct = E_fer / energia_fornita * 100 if energia_fornita > 1e-6 else 0
 
     s1, s2, s3, s4 = st.columns(4)
@@ -1540,9 +1495,9 @@ with tab_dimensionamento:
         volumi = list(range(0, 4001, 500))
         rows = []
         for vol in volumi:
-            s = simula_accumulo_tiepido(dom_arr, scarto_arr, scartoT_arr, vol,
+            s = simula_accumulo_tiepido(dom_dopo_solare, scarto_arr, scartoT_arr, vol,
                                         T_min_acc, T_max_acc, dT_evap, pot_hp_kw, cop_reale, pot_backup_kw_sim,
-                                        architettura=architettura, backup_cop=backup_cop, backup_arr_max=backup_arr_max,
+                                        architettura=architettura, backup_cop=backup_cop, backup_arr_max=None,
                                         perdita_sett_pct=np.interp(np.log(np.clip(vol,500,5000)), [np.log(500),np.log(5000)], [2.0,1.0]) if vol>0 else 0.0,
                                         cop_dinamico=cop_dinamico, T_mandata_cop=T_mandata_ideale, eta_hp_cop=eta_hp,
                                         T_ritorno_rete=T_ritorno_ideale)
@@ -1574,7 +1529,8 @@ with tab_dimensionamento:
         "utenza": f"{len(edifici_dim)} edifici (da Domanda)",
         "T mandata/ritorno": f"{T_mandata_ideale}/{T_ritorno_ideale}°C",
         "carico_residuo_mwh": round(float(dom_tot)),
-        "tecnologie": f"HP {pot_hp_kw}kW (COP {sim['cop_medio']:.1f}{'din' if cop_dinamico else 'fisso'}) + {backup_label}",
+        "tecnologie": (f"HP alta T {pot_hp_kw}kW (COP {sim['cop_medio']:.1f}{'din' if cop_dinamico else 'fisso'}) + {backup_label}"
+                       + (f" + Solare {area_sol}m²" if (solare_on and E_solar > 1) else "")),
         "volume_accumulo": volume_accumulo,
         "capex_sistema": round(float(capex_sistema)),
         "costo_annuo_sistema": round(float(costo_annuo_sistema)),
