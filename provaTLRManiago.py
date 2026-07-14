@@ -54,7 +54,7 @@ COLOR_EX_BIOMAN = "#E63946"  # rosso acceso dedicato, sempre e solo per la zona 
 COLOR_ALTA_T  = "#D62728"  # rosso      → scarto alta T usato diretto in rete
 COLOR_SOLARE  = "#F2A900"  # ambra      → solare termico
 # HP alta T usa COLOR_HP (#2DA3A3, teal)
-COLOR_BACKUP  = "#3D5A80"  # blu navy   → tecnologia di supporto (gas/biomassa/HP bassa T)
+COLOR_BACKUP  = "#3D5A80"  # blu navy   → tecnologia di supporto (gas/biomassa/2ª HP)
 COLOR_NONCOP  = "#B5B5B5"  # grigio     → domanda non coperta
 
 
@@ -90,6 +90,42 @@ MONTH_NAMES = ["Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov"
 RHO_CP = 1.163  # kWh/(m3*K)
 HOURS_2024 = pd.date_range('2024-01-01', '2024-12-31 23:00', freq='h')
 DAYS_2024 = pd.date_range('2024-01-01', '2024-12-31', freq='D')
+
+
+def soil_temp_monthly(pvgis_df, depth_m=1.5, alpha=0.6e-6):
+    """Temperatura del terreno (°C) per mese alla profondità data (transitorio sinusoidale
+    smorzato applicato alla T aria oraria PVGIS T2m). A ~1.5 m la variazione diurna è
+    annullata → un valore per mese. Ritorna array di 12 valori (Gen..Dic)."""
+    T = pvgis_df["T2m"].astype(float).values
+    doy = pvgis_df["datetime"].dt.dayofyear.values.astype(float)
+    w = 2 * np.pi / 365.25
+    X = np.column_stack([np.ones_like(doy), np.cos(w * doy), np.sin(w * doy)])
+    coef, *_ = np.linalg.lstsq(X, T, rcond=None)
+    Tm = float(coef[0]); A = float(np.hypot(coef[1], coef[2]))
+    t_peak = float((np.arctan2(coef[2], coef[1]) / w) % 365.25)
+    P = 365.25 * 86400.0
+    d = np.sqrt(alpha * P / np.pi)          # profondità di smorzamento
+    damp = np.exp(-depth_m / d); lag = (depth_m / d) / w   # ritardo (giorni)
+    return np.array([Tm + A * damp * np.cos(w * (pd.Timestamp(2024, m, 15).dayofyear - t_peak - lag))
+                     for m in range(1, 13)])
+
+
+def cop_singola(T_src, T_mand, eta):
+    """COP di una HP a stadio singolo (Carnot × η). Funziona anche su array numpy."""
+    Tc = np.asarray(T_src, dtype=float) + 273.15
+    Th = float(T_mand) + 273.15
+    return eta * Th / np.maximum(Th - Tc, 1.0)
+
+
+def cop_cascata(T_src, T_mand, eta):
+    """COP di una HP a 2 stadi in cascata (sorgente T_src, mandata T_mand, °C).
+    Temperatura intermedia ottima = media geometrica in Kelvin. Array-friendly."""
+    Tc = np.asarray(T_src, dtype=float) + 273.15
+    Th = float(T_mand) + 273.15
+    Ti = np.sqrt(Tc * Th)                        # intermedio ottimo (K)
+    c1 = eta * Ti / np.maximum(Ti - Tc, 1.0)     # stadio basso
+    c2 = eta * Th / np.maximum(Th - Ti, 1.0)     # stadio alto
+    return 1.0 / (1.0 / c2 + (1.0 - 1.0 / c2) / c1)
 
 # =============================================================================
 # MOTORE OFFERTA (generico, da tabella aziende) — funzioni pure, nessuna UI qui
@@ -445,8 +481,9 @@ def simula_accumulo_tiepido(dom_arr, scarto_pot_arr, scarto_T_arr, volume_m3,
             p_backup = min(P_gas_mwh, backup_arr_max[i]) if P_gas_mwh > 0 else backup_arr_max[i]
         q_backup_i = min(max(residuo, 0.0), p_backup) if p_backup > 0 else 0.0
         q_gas[i] = q_backup_i
-        if backup_cop is not None and backup_cop > 0:
-            el_backup[i] = q_backup_i / backup_cop
+        _bc = backup_cop[i] if hasattr(backup_cop, "__len__") else backup_cop
+        if _bc is not None and _bc > 0:
+            el_backup[i] = q_backup_i / _bc
         non_coperta[i] = max(residuo - q_backup_i, 0.0)
         T_acc[i] = T
 
@@ -498,7 +535,7 @@ def simula_accumulo_alta_T(dom_arr, scarto_alta_arr, volume_m3, T_mandata, T_rit
 def ottimizza_scenario(dom_arr, scarto_tiep_arr, scartoT_arr, scarto_alta_arr, solar_avail,
                        T_mandata, T_ritorno, T_min_acc, dT_evap, eta_hp, prezzo_el,
                        capex_hp_func, capex_backup_kw, opex_backup_mwh, backup_cop,
-                       costo_m3, capex_solare_fisso, fattore_crf, perdita_func):
+                       costo_m3, capex_solare_fisso, fattore_crf, perdita_func, p_backup_min=0.0):
     """
     Trova P_hp, potenza backup, V_accumulo_tiepido e V_accumulo_altaT che MINIMIZZANO
     il LCOH di sistema (costo annuo totale / domanda annua), garantendo copertura 100%.
@@ -531,8 +568,8 @@ def ottimizza_scenario(dom_arr, scarto_tiep_arr, scartoT_arr, scarto_alta_arr, s
             dom_after, scarto_tiep_arr, scartoT_arr, v_tiep, T_min_acc, T_mandata, dT_evap,
             p_hp, 4.0, 1e9, architettura="diretta", backup_cop=backup_cop,
             perdita_sett_pct=perdita_func(v_tiep), cop_dinamico=True,
-            T_mandata_cop=T_mandata, eta_hp_cop=eta_hp, T_ritorno_rete=T_ritorno)
-        p_bk = float(s["q_gas"].max() * 1000.0)   # punta backup necessaria -> kW
+            T_mandata_cop=T_mandata, eta_hp_cop=eta_hp, T_ritorno_rete=None)
+        p_bk = max(float(s["q_gas"].max() * 1000.0), p_backup_min)   # punta residua, ma ≥ floor garantito
         capex = (p_hp * capex_hp_func(p_hp) + p_bk * capex_backup_kw
                  + v_tiep * costo_m3 + v_alta * costo_m3 + capex_solare_fisso)
         opex = s["E_el_hp"] * prezzo_el + s["E_gas"] * opex_backup_mwh
@@ -960,6 +997,8 @@ with tab_dimensionamento:
     scartoT_arr = scarto_T.values
     scarto_alta_arr = scarto_alta.values     # copre la domanda direttamente (accumulo caldo)
     dom_arr = dom_dim_series.values
+    # profilo temperatura suolo 1.5 m (sorgente della HP di supporto quando manca lo scarto)
+    soil_temp_arr = soil_temp_monthly(pvgis)[idx_h.month.values - 1]
 
     cA1, cA2, cA3, cA4 = st.columns(4)
     cA1.metric("Domanda annua", f"{dom_dim_series.sum():,.0f} MWh".replace(",", "."))
@@ -1097,8 +1136,11 @@ with tab_dimensionamento:
     _sol_on = st.session_state.get("dim_solare_on", True)
     if _tech == "Caldaia (gas)":
         _bk_capex, _bk_opex, _bk_cop = 120.0, 90.0 / 0.92, None
-    elif _tech == "HP bassa T (aria/ambiente)":
-        _bk_cop = (T_mandata_ideale + 273.15) / max(T_mandata_ideale - 10, 1) * 0.40
+    elif _tech == "2ª pompa di calore (acqua/aria)":
+        # sorgente della 2ª HP = acqua circuito interrato quando le aziende sono ferme = profilo suolo
+        _eta2 = st.session_state.get("dim_hp2_eta", 45) / 100.0
+        _cop_soil = cop_singola(soil_temp_arr, T_mandata_ideale, _eta2)
+        _bk_cop = float(np.average(_cop_soil, weights=dom_arr)) if dom_arr.sum() > 0 else float(np.mean(_cop_soil))
         _bk_capex, _bk_opex = 700.0, 180.0 / _bk_cop
     else:  # Biomassa (cippato)
         _bk_capex, _bk_opex, _bk_cop = 550.0, 35.0 / 0.85, None
@@ -1124,13 +1166,18 @@ with tab_dimensionamento:
     colopt1, colopt2 = st.columns([1, 2])
     colopt1.caption(f"Supporto: **{_tech}** · Solare: **{'sì' if _sol_on else 'no'}**"
                     + (f" ({_area_sol_opt} m²)" if _sol_on else ""))
+    _bk_floor = colopt1.number_input(
+        "Backup minimo garantito (kW)", 0, int(picco_dim_kw), 0, step=100, key="dim_bk_floor",
+        help="Potenza di backup SEMPRE installata a prescindere dall'ottimo economico, per avere una "
+             "riserva indipendente (es. una caldaia da 1000-2000 kW). L'ottimizzatore non scende sotto "
+             "questa soglia. 0 = solo il minimo per la punta (puro LCOH). NON serve coprire tutto il picco.")
     if colopt1.button("🔎 Ottimizza scenario", key="dim_btn_ottimizza"):
         with st.spinner("Ricerca della configurazione a LCOH minimo (copertura 100%)..."):
             best = ottimizza_scenario(
                 dom_arr, scarto_arr, scartoT_arr, scarto_alta_arr, _solar_avail,
                 float(T_mandata_ideale), float(T_ritorno_ideale), 25, 5, 0.5, 180,
                 _capex_hp_opt, _bk_capex, _bk_opex, _bk_cop,
-                _costo_m3_opt, _capex_solare, crf(0.04, 20), _perdita_opt)
+                _costo_m3_opt, _capex_solare, crf(0.04, 20), _perdita_opt, p_backup_min=float(_bk_floor))
         if best:
             hp_opt = int(round(best["p_hp_kw"] / 100) * 100)
             bk_opt = int(round(best["p_bk_kw"] / 100) * 100)
@@ -1139,11 +1186,13 @@ with tab_dimensionamento:
             st.session_state["_opt_hp_kw"] = hp_opt
             st.session_state["_opt_gas_kw"] = bk_opt
             st.session_state["dim_pot_hp"] = hp_opt
-            _key_bk = {"Caldaia (gas)": "dim_pot_gas", "HP bassa T (aria/ambiente)": "dim_pot_hp2",
+            _key_bk = {"Caldaia (gas)": "dim_pot_gas", "2ª pompa di calore (acqua/aria)": "dim_pot_hp2",
                        "Biomassa (cippato)": "dim_pot_bio"}.get(_tech, "dim_pot_gas")
             st.session_state[_key_bk] = bk_opt
             st.session_state["dim_volume"] = vt_opt
             st.session_state["dim_vol_alta"] = va_opt
+            best["_tech"] = _tech
+            best["_sol_on"] = _sol_on
             st.session_state["_opt_result"] = best
             st.rerun()
         else:
@@ -1152,12 +1201,19 @@ with tab_dimensionamento:
 
     opt_res = st.session_state.get("_opt_result")
     if opt_res:
+        _stale = (opt_res.get("_tech") != _tech) or (opt_res.get("_sol_on") != _sol_on)
+        if _stale:
+            colopt2.warning(f"⚠️ Risultato calcolato per **{opt_res.get('_tech','?')}** "
+                            f"(solare {'sì' if opt_res.get('_sol_on') else 'no'}). Hai cambiato la "
+                            f"selezione: **rilancia l'ottimizzazione** per aggiornarlo.")
+        colopt2.caption(f"Risultato ottimizzazione — supporto: **{opt_res.get('_tech','?')}** · "
+                        f"solare: **{'sì' if opt_res.get('_sol_on') else 'no'}**")
         with colopt2:
             o1, o2, o3, o4 = st.columns(4)
             o1.metric("HP primaria", f"{opt_res['p_hp_kw']:.0f} kW",
                       help=f"{opt_res['p_hp_kw']/picco_dim_kw*100:.0f}% del picco domanda")
             o2.metric("Supporto", f"{opt_res['p_bk_kw']:.0f} kW",
-                      help="potenza minima per coprire la punta residua")
+                      help="potenza minima per coprire la punta residua (min LCOH)")
             o3.metric("Acc. tiepido", f"{opt_res['v_tiep']:.0f} m³")
             o4.metric("Acc. alta T", f"{opt_res['v_alta']:.0f} m³",
                       help="0 se non ci sono flussi alta T selezionati")
@@ -1345,13 +1401,14 @@ with tab_dimensionamento:
 
     backup_tipo = st.radio(
         "Combinazione:  HP alta T +",
-        ["Caldaia (gas)", "HP bassa T (aria/ambiente)", "Biomassa (cippato)"],
+        ["Caldaia (gas)", "2ª pompa di calore (acqua/aria)", "Biomassa (cippato)"],
         key="dim_backup_tipo", horizontal=True,
         help="La HP alta T resta primaria in tutti i casi; cambia solo la tecnologia di supporto sul picco."
     )
 
-    backup_cop = None          # None = backup termico; numero = backup elettrico (HP bassa T)
-    opex_backup_unitario = 0.0 # €/MWh di calore reso dal backup
+    backup_cop = None          # None = backup termico; array orario = backup elettrico (2ª HP su suolo)
+    opex_backup_unitario = 0.0 # €/MWh di calore reso dal backup termico
+    prezzo_el_backup = 0.0     # €/MWh elettrico, usato se il backup è la 2ª HP
     capex_backup = 0.0
 
     if backup_tipo == "Caldaia (gas)":
@@ -1369,21 +1426,24 @@ with tab_dimensionamento:
         pot_backup_kw = pot_gas_kw
         backup_label = f"Caldaia gas {pot_gas_kw} kW"
 
-    elif backup_tipo == "HP bassa T (aria/ambiente)":
+    elif backup_tipo == "2ª pompa di calore (acqua/aria)":
         cD1, cD2, cD3 = st.columns(3)
         pot_backup_kw = cD1.slider("Potenza termica (kW)", 0, int(dom_dim_series.max()*1000)+1000, 2000,
                                    step=100, key="dim_pot_hp2")
-        T_amb = cD2.slider("T sorgente ambiente (°C)", 0, 20, 10, key="dim_hp2_tamb")
-        eta_hp2 = cD3.slider("η 2° principio (%)", 30, 60, 40, key="dim_hp2_eta") / 100
-        cop_hp2_carnot = (T_mandata_ideale+273.15)/max(T_mandata_ideale-T_amb,1)
-        backup_cop = cop_hp2_carnot * eta_hp2
-        prezzo_el2 = st.slider("Prezzo elettricità HP bassa T (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el2")
+        eta_hp2 = cD2.slider("η 2° principio (%)", 30, 60, 45, key="dim_hp2_eta") / 100
+        prezzo_el2 = cD3.slider("Prezzo elettricità (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el2")
         capex_kw_hp2 = st.slider("CAPEX (€/kW termico)", 300, 1200, 700, step=50, key="dim_capex_hp2")
         capex_backup = pot_backup_kw * capex_kw_hp2
-        opex_backup_unitario = prezzo_el2 / backup_cop if backup_cop > 0 else 0
-        st.caption(f"COP HP bassa T ≈ **{backup_cop:.2f}** (sorgente ambiente {T_amb}°C → {T_mandata_ideale}°C). "
-                   f"Più basso della HP alta T perché parte dall'ambiente, non dallo scarto industriale.")
-        backup_label = f"HP bassa T {pot_backup_kw} kW (COP {backup_cop:.1f})"
+        # sorgente = acqua del circuito interrato quando le aziende sono ferme = profilo suolo 1.5 m
+        backup_cop = cop_singola(soil_temp_arr, T_mandata_ideale, eta_hp2)   # COP orario (varia col suolo)
+        prezzo_el_backup = prezzo_el2
+        _cmin, _cmax, _cmed = float(backup_cop.min()), float(backup_cop.max()), float(backup_cop.mean())
+        st.caption(f"Sorgente = **acqua del circuito interrato quando le aziende sono ferme "
+                   f"(profilo suolo 1,5 m, {soil_temp_arr.min():.0f}–{soil_temp_arr.max():.0f}°C)**. "
+                   f"COP stadio singolo → mandata {T_mandata_ideale}°C: **{_cmin:.2f}–{_cmax:.2f}** "
+                   f"(medio {_cmed:.2f}). Copre le ore in cui manca lo scarto, prendendo dal suolo il "
+                   f"calore che altrimenti darebbe lo scarto (COP basso: più elettricità).")
+        backup_label = f"2ª HP suolo {pot_backup_kw} kW"
 
     else:  # Biomassa (cippato)
         cD1, cD2, cD3 = st.columns(3)
@@ -1470,14 +1530,15 @@ with tab_dimensionamento:
     E_solar_sprecato = float((solar_avail - q_solar_arr).sum())
     dom_dopo_solare = dom_residua_arr - q_solar_arr
 
-    # SECONDO STADIO: la HP alta T (accumulo tiepido) copre il residuo, backup a valle
+    # SECONDO STADIO: la HP primaria (accumulo tiepido) copre il residuo SOLO col calore di scarto
+    # reale (nessun "ritorno rete" gratuito). Quando lo scarto è esaurito subentra il backup scelto.
     sim = simula_accumulo_tiepido(
         dom_dopo_solare, scarto_arr, scartoT_arr, volume_accumulo,
         T_min_acc, T_max_acc, dT_evap, pot_hp_kw, cop_reale, pot_backup_kw_sim,
         architettura=architettura, backup_cop=backup_cop, backup_arr_max=None,
         perdita_sett_pct=perdita_sett_pct,
         cop_dinamico=cop_dinamico, T_mandata_cop=T_mandata_ideale, eta_hp_cop=eta_hp,
-        T_ritorno_rete=T_ritorno_ideale
+        T_ritorno_rete=None
     )
 
     # -------------------------------------------------------------------------
@@ -1621,8 +1682,12 @@ with tab_dimensionamento:
     capex_hp = pot_hp_kw * capex_kw_hp
     capex_acc = volume_accumulo * costo_m3_accumulo
     opex_hp = sim["E_el_hp"] * prezzo_el
-    # OPEX del backup: opex_backup_unitario è sempre in €/MWh di calore reso dal backup
-    opex_gas = E_gas * opex_backup_unitario
+    # OPEX del backup: se è la 2ª HP (backup_cop valorizzato) → elettricità reale × prezzo;
+    # altrimenti (gas/biomassa) → calore reso × costo unitario del combustibile.
+    if backup_cop is not None:
+        opex_gas = sim["E_el_backup"] * prezzo_el_backup
+    else:
+        opex_gas = E_gas * opex_backup_unitario
 
     righe = [
         {"Voce": f"HP alta T ({pot_hp_kw} kW)", "CAPEX (€)": round(capex_hp),
@@ -1657,13 +1722,18 @@ with tab_dimensionamento:
         return COLOR_BACKUP
     df_lcoh = df_tec.dropna(subset=["LCOH (€/MWh)"]).sort_values("LCOH (€/MWh)")
     if not df_lcoh.empty:
+        _xmax = float(df_lcoh["LCOH (€/MWh)"].max())
         fig_lcoh = go.Figure(go.Bar(
             x=df_lcoh["LCOH (€/MWh)"], y=df_lcoh["Voce"], orientation="h",
             marker_color=[_colore_voce(v) for v in df_lcoh["Voce"]],
-            text=df_lcoh["LCOH (€/MWh)"].map(lambda v: f"{v:.0f} €/MWh"), textposition="outside"))
-        fig_lcoh.update_layout(height=220, xaxis_title="LCOH (€/MWh)", yaxis_title="",
-                               margin=dict(t=10, b=10),
-                               title="Costo del calore per fonte (più basso = più conveniente)")
+            text=df_lcoh["LCOH (€/MWh)"].map(lambda v: f"{v:.0f} €/MWh"),
+            textposition="outside", cliponaxis=False))
+        fig_lcoh.update_layout(
+            height=150 + 70 * len(df_lcoh),
+            xaxis=dict(title="LCOH (€/MWh)", range=[0, _xmax * 1.22]),
+            yaxis=dict(title="", automargin=True),
+            margin=dict(t=55, b=30, l=10),
+            title="Costo del calore per fonte (più basso = più conveniente)")
         st.plotly_chart(fig_lcoh, use_container_width=True)
 
     capex_sistema = capex_hp + capex_backup + capex_acc + capex_solare
@@ -1695,7 +1765,7 @@ with tab_dimensionamento:
                                         architettura=architettura, backup_cop=backup_cop, backup_arr_max=None,
                                         perdita_sett_pct=np.interp(np.log(np.clip(vol,500,5000)), [np.log(500),np.log(5000)], [2.0,1.0]) if vol>0 else 0.0,
                                         cop_dinamico=cop_dinamico, T_mandata_cop=T_mandata_ideale, eta_hp_cop=eta_hp,
-                                        T_ritorno_rete=T_ritorno_ideale)
+                                        T_ritorno_rete=None)
             cx = capex_hp + capex_backup + vol*costo_m3_accumulo
             ca = cx*fattore_crf + s["E_el_hp"]*prezzo_el + s["E_gas"]*opex_backup_unitario
             ef = s["E_hp"] + s["E_gas"]
