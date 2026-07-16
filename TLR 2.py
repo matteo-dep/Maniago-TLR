@@ -447,7 +447,7 @@ def load_data():
     # 🗺️ Dizionario di mappatura per rinominare le zone
     mappa_zone = {
         "NE-Centro": "Zona 1 - Maniago centro / NE",
-        "ex Bioman": "Zona 2 - Ex Bioman",
+        "ex Bioman": "Zona 2 - ex Bioman",
         "Ovest": "Zona 3 - Maniago Ovest",
         "Campagna": "Zona 4 - Campagna"
     }
