@@ -46,16 +46,18 @@ COLOR_RISCALDAMENTO = "#C0522D"
 COLOR_ACS = "#2D7DC0"
 COLOR_OFFERTA = "#3FA34D"
 COLOR_ACCUMULO = "#8E5FC2"
-COLOR_HP = "#2DA3A3"
+COLOR_HP = "#22C3DD"  # ciano → HP alta T (alias di COLOR_HP_ALTA)
 COLOR_CALDAIA = "#B0413E"
 COLOR_EX_BIOMAN = "#E63946"  # rosso acceso dedicato, sempre e solo per la zona ex Bioman
 
-# --- Palette DISPATCH/COPERTURA: colori ben distinti tra loro (hue + luminosità) ---
-COLOR_ALTA_T  = "#D62728"  # rosso      → scarto alta T usato diretto in rete
-COLOR_SOLARE  = "#F2A900"  # ambra      → solare termico
-# HP alta T usa COLOR_HP (#2DA3A3, teal)
-COLOR_BACKUP  = "#3D5A80"  # blu navy   → tecnologia di supporto (gas/biomassa/2ª HP)
-COLOR_NONCOP  = "#B5B5B5"  # grigio     → domanda non coperta
+# --- Palette DISPATCH/COPERTURA: colori vivaci e ben distinti (per tema scuro) ---
+COLOR_ALTA_T   = "#FF4B4B"  # rosso vivo   → scarto ≥ mandata, diretto in linea (caldo diretto)
+COLOR_HP_ALTA  = COLOR_HP    # ciano        → HP alta T (intermedio → mandata)
+COLOR_HP_BASSA = "#B57EDC"  # viola        → HP bassa T (freddo/ground → intermedio, interno)
+COLOR_SOLARE   = "#F5C518"  # ambra        → solare termico
+COLOR_BACKUP   = "#FF9F1C"  # arancio      → caldaia gas/biomassa (supporto a combustibile)
+COLOR_NONCOP   = "#9AA0A6"  # grigio       → domanda non coperta
+COLOR_DOMANDA  = "#FFFFFF"  # bianco       → linea della domanda (visibile su sfondo scuro)
 
 
 def build_cluster_color_map(clusters_list):
@@ -1085,36 +1087,6 @@ with tab_offerta:
                 st.dataframe(detail_o.sort_values("Energia periodo (MWh)", ascending=False),
                              use_container_width=True, hide_index=True)
 
-            st.markdown("##### 🌡️ Temperatura oraria della sorgente (accumulo basso / HP)")
-            st.caption("Per ogni ora, la **T media** (pesata sull'energia) e la **T max** dello scarto "
-                       "disponibile: è la sorgente che carica l'accumulo basso e alimenta la HP. "
-                       "Curva di durata (ore ordinate dalla T più alta).")
-            off_t = off[off["T_disponibile"].notna() & (off["MWh"] > 0)].copy()
-            if off_t.empty:
-                st.info("Nessun flusso con temperatura disponibile nel periodo.")
-            else:
-                off_t["Tw"] = off_t["T_disponibile"] * off_t["MWh"]
-                g = off_t.groupby("datetime")
-                T_media = g["Tw"].sum() / g["MWh"].sum()
-                T_max = g["T_disponibile"].max()
-                T_media_pes = float(off_t["Tw"].sum() / off_t["MWh"].sum())
-                kt1, kt2, kt3 = st.columns(3)
-                kt1.metric("T media sorgente (pesata)", f"{T_media_pes:.0f}°C")
-                kt2.metric("T max media oraria", f"{T_max.mean():.0f}°C", help=f"picco {T_max.max():.0f}°C")
-                kt3.metric("Ore con scarto", f"{len(T_media):,}".replace(",", "."))
-                dur = pd.DataFrame({"media": np.sort(T_media.values)[::-1], "max": np.sort(T_max.values)[::-1]})
-                dur["ore"] = np.arange(1, len(dur) + 1)
-                fig_ts = go.Figure()
-                fig_ts.add_trace(go.Scatter(x=dur["ore"], y=dur["max"], mode="lines", name="T max oraria",
-                                            line=dict(color=COLOR_ALTA_T, width=1.6)))
-                fig_ts.add_trace(go.Scatter(x=dur["ore"], y=dur["media"], mode="lines", name="T media oraria",
-                                            line=dict(color=COLOR_HP, width=1.6)))
-                fig_ts.add_hline(y=T_mandata_ideale, line_dash="dot", line_color="gray",
-                                 annotation_text=f"mandata {T_mandata_ideale}°C", annotation_position="top left")
-                fig_ts.update_layout(height=340, xaxis_title="Ore/anno (ordinate per T decrescente)",
-                                     yaxis_title="Temperatura sorgente (°C)",
-                                     legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=30, b=10))
-                st.plotly_chart(fig_ts, use_container_width=True)
 
     st.divider()
     st.markdown("#### 🌡️ Curva composita: energia disponibile per soglia di temperatura, per azienda")
@@ -1167,6 +1139,38 @@ with tab_offerta:
         )
     else:
         st.info("Nessun flusso selezionato con dati di temperatura in questo periodo.")
+
+    st.divider()
+    st.markdown("#### 🌡️ Temperatura oraria della sorgente (per l'accumulo basso / HP)")
+    st.caption("Per ogni ora, la **T media** (pesata sull'energia dei flussi disponibili) e la **T max** "
+               "dello scarto: è la sorgente che carica l'accumulo basso e alimenta la HP bassa T. "
+               "Curva di durata (ore ordinate dalla T più alta).")
+    off_t = off[off["T_disponibile"].notna() & (off["MWh"] > 0)].copy()
+    if off_t.empty:
+        st.info("Nessun flusso con temperatura disponibile nel periodo.")
+    else:
+        off_t["Tw"] = off_t["T_disponibile"] * off_t["MWh"]
+        g = off_t.groupby("datetime")
+        T_media = g["Tw"].sum() / g["MWh"].sum()      # per ora: media pesata sull'energia
+        T_max = g["T_disponibile"].max()               # per ora: massima
+        kt1, kt2, kt3 = st.columns(3)
+        kt1.metric("T media oraria", f"{T_media.mean():.0f}°C",
+                   help="media nel tempo della T pesata sull'energia di ogni ora (≤ T max, ora coerente)")
+        kt2.metric("T max media oraria", f"{T_max.mean():.0f}°C", help=f"picco {T_max.max():.0f}°C")
+        kt3.metric("Ore con scarto", f"{len(T_media):,}".replace(",", "."))
+        dur = pd.DataFrame({"media": np.sort(T_media.values)[::-1], "max": np.sort(T_max.values)[::-1]})
+        dur["ore"] = np.arange(1, len(dur) + 1)
+        fig_ts = go.Figure()
+        fig_ts.add_trace(go.Scatter(x=dur["ore"], y=dur["max"], mode="lines", name="T max oraria",
+                                    line=dict(color=COLOR_ALTA_T, width=2)))
+        fig_ts.add_trace(go.Scatter(x=dur["ore"], y=dur["media"], mode="lines", name="T media oraria",
+                                    line=dict(color=COLOR_HP, width=2)))
+        fig_ts.add_hline(y=T_mandata_ideale, line_dash="dot", line_color="#BBBBBB",
+                         annotation_text=f"mandata {T_mandata_ideale}°C", annotation_position="top left")
+        fig_ts.update_layout(height=420, xaxis_title="Ore/anno (ordinate per T decrescente)",
+                             yaxis_title="Temperatura sorgente (°C)",
+                             legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=30, b=10))
+        st.plotly_chart(fig_ts, use_container_width=True)
 
 
 # =============================================================================
@@ -1355,68 +1359,83 @@ with tab_dimensionamento:
             st.caption("ℹ️ Accumulo **caldo a 0**: nessun flusso ≥ mandata. Diventa utile selezionando in "
                        "Offerta flussi fumi ad alta T (o abbassando la mandata sotto la T dei flussi).")
 
-        tab_dur, tab_heat = st.tabs(["📉 Curva di durata", "🗺️ Heatmap T × mese"])
-        with tab_dur:
-            st.caption("Ore ordinate per domanda decrescente. Sotto la domanda, chi la copre: scarto caldo "
-                       "diretto, HP alta T, supporto. Il vuoto fino alla linea è ciò che resta scoperto.")
-            order = np.argsort(dom_arr)[::-1]
-            x = np.arange(1, len(dom_arr) + 1)
-            fig_dur = go.Figure()
-            fig_dur.add_trace(go.Scatter(x=x, y=sim["q_hot_direct"][order], mode="lines", name="Caldo diretto",
-                                         stackgroup="c", line=dict(width=0, color=COLOR_ALTA_T),
-                                         fillcolor=hex_to_rgba(COLOR_ALTA_T, 0.85)))
-            fig_dur.add_trace(go.Scatter(x=x, y=sim["q_alta"][order], mode="lines", name="HP alta T",
-                                         stackgroup="c", line=dict(width=0, color=COLOR_HP),
-                                         fillcolor=hex_to_rgba(COLOR_HP, 0.8)))
-            fig_dur.add_trace(go.Scatter(x=x, y=sim["q_backup"][order], mode="lines", name=backup_tipo,
-                                         stackgroup="c", line=dict(width=0, color=COLOR_BACKUP),
-                                         fillcolor=hex_to_rgba(COLOR_BACKUP, 0.8)))
-            fig_dur.add_trace(go.Scatter(x=x, y=dom_arr[order], mode="lines", name="Domanda",
-                                         line=dict(color="black", width=1.6)))
-            fig_dur.update_layout(height=420, xaxis_title="Ore/anno", yaxis_title="MW",
-                                  legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=30, b=10))
-            st.plotly_chart(fig_dur, use_container_width=True)
-        with tab_heat:
-            _h = off_all[off_all["MWh"] > 0].copy()
-            if _h.empty:
-                st.info("Nessuno scarto disponibile.")
-            else:
-                _h["mese"] = _h["datetime"].dt.month
-                bins = [0, 30, 40, 50, 60, 70, 80, 100, 150, 2000]
-                labels = ["<30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-100", "100-150", "≥150"]
-                _h["fascia"] = pd.cut(_h["T_disponibile"], bins=bins, labels=labels, right=False)
-                piv = (_h.pivot_table(index="fascia", columns="mese", values="MWh", aggfunc="sum", observed=False)
-                       .reindex(index=labels).reindex(columns=range(1, 13)).fillna(0))
-                fig_hm = go.Figure(go.Heatmap(z=piv.values, x=[MONTH_NAMES[m-1] for m in piv.columns], y=labels,
-                                              colorscale="YlOrRd", colorbar=dict(title="MWh")))
-                for _lv, _lab in [(T_int, f"intermedio {T_int}°C"), (T_mandata_ideale, f"mandata {T_mandata_ideale}°C")]:
-                    try:
-                        _ib = next(i for i in range(len(labels)) if bins[i] <= _lv < bins[i+1])
-                        fig_hm.add_hline(y=_ib - 0.5, line_color="red", line_width=2,
-                                         annotation_text=_lab, annotation_position="top left")
-                    except StopIteration:
-                        pass
-                fig_hm.update_layout(height=420, yaxis_title="Temperatura scarto (°C)", margin=dict(t=30, b=10))
-                st.plotly_chart(fig_hm, use_container_width=True)
+        # split del contributo HP alta: quanto è "assistito" dalla HP bassa T (freddo/ground)
+        _cop_a = sim["cop_alta_s"]
+        _frac_a = np.where(_cop_a > 1, 1.0 - 1.0 / np.where(_cop_a > 1, _cop_a, 1), 0.0)
+        q_alta_via_bassa = np.minimum(sim["q_alta"], np.where(_frac_a > 0, sim["q_bassa"] / np.where(_frac_a > 0, _frac_a, 1), 0.0))
+        q_alta_diretta = np.maximum(sim["q_alta"] - q_alta_via_bassa, 0.0)
+        E_alta_via_bassa = float(q_alta_via_bassa.sum())
+        E_alta_diretta = float(q_alta_diretta.sum())
+
+        st.markdown("##### 📉 Curva di durata: chi copre la domanda")
+        st.caption("Ore ordinate per domanda decrescente (linea **bianca**). Sotto, chi la copre: scarto caldo "
+                   "diretto (rosso), HP alta T da scarto caldo (ciano), quota risollevata dalla HP bassa T da "
+                   "freddo/ground (viola), supporto (arancio). Il vuoto fino alla linea resta scoperto.")
+        order = np.argsort(dom_arr)[::-1]
+        x = np.arange(1, len(dom_arr) + 1)
+        fig_dur = go.Figure()
+        fig_dur.add_trace(go.Scatter(x=x, y=sim["q_hot_direct"][order], mode="lines", name="Caldo diretto",
+                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_ALTA_T, 0.9)))
+        fig_dur.add_trace(go.Scatter(x=x, y=q_alta_diretta[order], mode="lines", name="HP alta T (scarto caldo)",
+                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_HP, 0.9)))
+        fig_dur.add_trace(go.Scatter(x=x, y=q_alta_via_bassa[order], mode="lines", name="HP alta via HP bassa T",
+                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_HP_BASSA, 0.9)))
+        fig_dur.add_trace(go.Scatter(x=x, y=sim["q_backup"][order], mode="lines", name=f"supporto ({backup_tipo})",
+                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_BACKUP, 0.9)))
+        fig_dur.add_trace(go.Scatter(x=x, y=dom_arr[order], mode="lines", name="Domanda",
+                                     line=dict(color=COLOR_DOMANDA, width=2.4)))
+        fig_dur.update_layout(height=430, xaxis_title="Ore/anno", yaxis_title="MW",
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=30, b=10))
+        st.plotly_chart(fig_dur, use_container_width=True)
+
+        st.markdown("##### 🗺️ Heatmap: energia di scarto per mese e temperatura")
+        _h = off_all[off_all["MWh"] > 0].copy()
+        if _h.empty:
+            st.info("Nessuno scarto disponibile.")
+        else:
+            _h["mese"] = _h["datetime"].dt.month
+            bins = [0, 30, 40, 50, 60, 70, 80, 100, 150, 2000]
+            labels = ["<30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-100", "100-150", "≥150"]
+            _h["fascia"] = pd.cut(_h["T_disponibile"], bins=bins, labels=labels, right=False)
+            piv = (_h.pivot_table(index="fascia", columns="mese", values="MWh", aggfunc="sum", observed=False)
+                   .reindex(index=labels).reindex(columns=range(1, 13)).fillna(0))
+            fig_hm = go.Figure(go.Heatmap(z=piv.values, x=[MONTH_NAMES[m-1] for m in piv.columns], y=labels,
+                                          colorscale="YlOrRd", colorbar=dict(title="MWh")))
+            for _lv, _lab in [(T_int, f"intermedio {T_int}°C"), (T_mandata_ideale, f"mandata {T_mandata_ideale}°C")]:
+                try:
+                    _ib = next(i for i in range(len(labels)) if bins[i] <= _lv < bins[i+1])
+                    fig_hm.add_hline(y=_ib - 0.5, line_color="#22C3DD", line_width=2,
+                                     annotation_text=_lab, annotation_position="top left")
+                except StopIteration:
+                    pass
+            fig_hm.update_layout(height=420, yaxis_title="Temperatura scarto (°C)", margin=dict(t=30, b=10))
+            st.plotly_chart(fig_hm, use_container_width=True)
 
         st.divider()
         st.markdown("#### Copertura (simulazione oraria)")
-        r1, r2, r3, r4, r5 = st.columns(5)
-        r1.metric("🔴 Caldo diretto", f"{E_hot:,.0f} MWh".replace(",", "."), help=f"{E_hot/dom_tot*100:.0f}%")
-        r2.metric("🟠 HP alta T", f"{E_alta:,.0f} MWh".replace(",", "."),
-                  help=f"{E_alta/dom_tot*100:.0f}% · COP {sim['cop_alta_medio']:.2f}")
-        r3.metric("🔵 HP bassa T", f"{E_bassa:,.0f} MWh".replace(",", "."),
-                  help=f"trasferito all'intermedio (interno) · COP {sim['cop_bassa_medio']:.2f} · ground {sim['ore_ground']} ore")
-        r4.metric(f"⚙️ {backup_tipo}", f"{E_bk:,.0f} MWh".replace(",", "."), help=f"{E_bk/dom_tot*100:.0f}%")
-        r5.metric("Quota FER", f"{quota_fer:.0f}%")
+        mets = [("🔴 Caldo diretto", E_hot, f"{E_hot/dom_tot*100:.0f}% della domanda"),
+                ("🟦 HP alta T", E_alta, f"{E_alta/dom_tot*100:.0f}% · COP {sim['cop_alta_medio']:.2f}")]
+        if is_hp_par:
+            mets.append(("🟪 HP bassa T (interna)",
+                         E_bassa, f"→ intermedio (interno) · COP {sim['cop_bassa_medio']:.2f} · ground {sim['ore_ground']} ore"))
+        else:
+            mets.append((f"🟧 {backup_tipo}", E_bk, f"{E_bk/dom_tot*100:.0f}% della domanda"))
+        cols_r = st.columns(len(mets) + 1)
+        for i, (lab, val, hlp) in enumerate(mets):
+            cols_r[i].metric(lab, f"{val:,.0f} MWh".replace(",", "."), help=hlp)
+        cols_r[-1].metric("Quota FER", f"{quota_fer:.0f}%")
         if sim["ore_non_coperte"] > 0:
             st.error(f"⚠️ {sim['ore_non_coperte']} ore non coperte ({E_nc:,.0f} MWh): ottimizza o aumenta le taglie.".replace(",", "."))
         else:
             st.success("✅ Copertura 100% in tutte le ore.")
 
         fig_mix = go.Figure()
-        voci = [("🔴 Caldo diretto", E_hot, COLOR_ALTA_T), ("🟠 HP alta T", E_alta, COLOR_HP),
-                (f"⚙️ {backup_tipo}", E_bk, COLOR_BACKUP)]
+        voci = [("🔴 Caldo diretto", E_hot, COLOR_ALTA_T),
+                ("🟦 HP alta T (scarto caldo)", E_alta_diretta, COLOR_HP)]
+        if E_alta_via_bassa > 1:
+            voci.append(("🟪 HP alta via HP bassa T", E_alta_via_bassa, COLOR_HP_BASSA))
+        if E_bk > 1:
+            voci.append((f"🟧 {backup_tipo}", E_bk, COLOR_BACKUP))
         if E_nc > 1:
             voci.append(("Non coperto", E_nc, COLOR_NONCOP))
         tot_mix = sum(v for _, v, _ in voci) or 1.0
@@ -1425,13 +1444,13 @@ with tab_dimensionamento:
             fig_mix.add_trace(go.Bar(y=["Copertura"], x=[val], name=nome, orientation="h", marker_color=col,
                                      text=(f"{pct:.0f}%" if pct >= 6 else ""), textposition="inside",
                                      insidetextanchor="middle", textfont=dict(color="white", size=13), cliponaxis=False))
-        fig_mix.update_layout(barmode="stack", height=210, xaxis_title="MWh/anno",
-                              legend=dict(orientation="h", yanchor="top", y=-0.4), margin=dict(t=30, b=10),
+        fig_mix.update_layout(barmode="stack", height=220, xaxis_title="MWh/anno",
+                              legend=dict(orientation="h", yanchor="top", y=-0.5), margin=dict(t=30, b=10),
                               title="Chi copre la domanda")
         fig_mix.update_yaxes(showticklabels=False)
         st.plotly_chart(fig_mix, use_container_width=True)
-        st.caption("La HP bassa T non è una barra a sé: il suo calore è **interno** (riempie l'intermedio, "
-                   "poi la HP alta T lo consegna) → già dentro 'HP alta T'.")
+        st.caption("La banda **viola** è la quota di domanda che la HP bassa T rende possibile risollevando "
+                   "freddo/ground fino all'intermedio (poi consegnata dalla HP alta T).")
 
         st.divider()
         st.markdown("#### 💰 Costi e LCOH")
