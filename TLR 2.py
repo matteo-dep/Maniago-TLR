@@ -429,16 +429,40 @@ def genera_flusso(row, pinch=5.0, seed=0):
     return pd.DataFrame({'datetime': HOURS_2024, 'MWh': P, 'P_kW': P * 1000, 'T_disponibile': Td})
 
 
+# @st.cache_data
+# def load_data():
+#     buildings = pd.read_csv("maniago_domanda_edifici.csv")
+#     domanda = pd.read_csv("maniago_domanda_oraria_8760h_HDD_reale.csv", parse_dates=["datetime"])
+#     domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]], on="edificio", how="left")
+#     flussi = pd.read_csv("maniago_flussi_offerta.csv")
+#     flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
+#     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
+#     return buildings, domanda, flussi, pvgis
+
 @st.cache_data
 def load_data():
     buildings = pd.read_csv("maniago_domanda_edifici.csv")
     domanda = pd.read_csv("maniago_domanda_oraria_8760h_HDD_reale.csv", parse_dates=["datetime"])
+    
+    # 🗺️ Dizionario di mappatura per rinominare le zone
+    mappa_zone = {
+        "NE-Centro": "Zona 1 - Maniago centro / NE",
+        "ex Bioman": "Zona 2 - Ex Bioman",
+        "Ovest": "Zona 3 - Maniago Ovest",
+        "Campagna": "Zona 4 - Campagna"
+    }
+    
+    # Sostituiamo i nomi nel dataset degli edifici
+    buildings["cluster"] = buildings["cluster"].replace(mappa_zone)
+    
+    # Eseguiamo il merge con i nuovi nomi già applicati
     domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]], on="edificio", how="left")
+    
     flussi = pd.read_csv("maniago_flussi_offerta.csv")
     flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
+    
     return buildings, domanda, flussi, pvgis
-
 
 @st.cache_data
 def genera_offerta_flussi(flussi_df, pinch):
