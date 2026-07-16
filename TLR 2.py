@@ -183,6 +183,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_a
 
     q_hot_direct = np.zeros(n); q_alta = np.zeros(n); q_bassa = np.zeros(n)
     q_backup = np.zeros(n); el_alta = np.zeros(n); el_bassa = np.zeros(n)
+    q_ground = np.zeros(n)
     non_cop = np.zeros(n); scarto_perso = np.zeros(n)
     cop_alta_s = np.zeros(n); cop_bassa_s = np.full(n, np.nan)
     ore_ground = 0
@@ -234,6 +235,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_a
                 q_b = from_bassa                                  # calore reso all'intermedio
                 E_b = q_b * (1.0 - 1.0 / cop_b) if cop_b > 1 else q_b
                 da_basso = min(E_b, soc_low); soc_low -= da_basso
+                q_ground[i] = max(E_b - da_basso, 0.0)     # calore preso dal suolo (non è scarto)
                 if src_is_ground or da_basso < E_b - 1e-9:
                     ore_ground += 1
                 q_bassa[i] = q_b
@@ -258,6 +260,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_a
     cop_bassa_medio = E_bassa / E_el_bassa if E_el_bassa > 1e-9 else 0.0
     return {
         "q_hot_direct": q_hot_direct, "q_alta": q_alta, "q_bassa": q_bassa, "q_backup": q_backup,
+        "q_ground": q_ground, "E_ground": float(q_ground.sum()),
         "el_alta": el_alta, "el_bassa": el_bassa, "non_cop": non_cop,
         "cop_alta_s": cop_alta_s, "cop_bassa_s": cop_bassa_s,
         "E_hot_diretto": E_hot, "E_hp_alta": E_alta, "E_hp_bassa": E_bassa, "E_backup": E_bk,
@@ -1359,32 +1362,36 @@ with tab_dimensionamento:
             st.caption("ℹ️ Accumulo **caldo a 0**: nessun flusso ≥ mandata. Diventa utile selezionando in "
                        "Offerta flussi fumi ad alta T (o abbassando la mandata sotto la T dei flussi).")
 
-        # split del contributo HP alta: quanto è "assistito" dalla HP bassa T (freddo/ground)
-        _cop_a = sim["cop_alta_s"]
-        _frac_a = np.where(_cop_a > 1, 1.0 - 1.0 / np.where(_cop_a > 1, _cop_a, 1), 0.0)
-        q_alta_via_bassa = np.minimum(sim["q_alta"], np.where(_frac_a > 0, sim["q_bassa"] / np.where(_frac_a > 0, _frac_a, 1), 0.0))
-        q_alta_diretta = np.maximum(sim["q_alta"] - q_alta_via_bassa, 0.0)
-        E_alta_via_bassa = float(q_alta_via_bassa.sum())
-        E_alta_diretta = float(q_alta_diretta.sum())
+        # DECOMPOSIZIONE PER FONTE DI ENERGIA (quanta domanda arriva da: scarto / suolo / elettricità / supporto)
+        el_hp = sim["el_alta"] + sim["el_bassa"]                       # lavoro dei compressori
+        ground = sim["q_ground"]                                       # calore dal suolo (rinnovabile, NON scarto)
+        scarto_via_hp = np.maximum(sim["q_alta"] - el_hp - ground, 0.0)  # scarto (caldo+freddo) risollevato dalle HP
+        E_scarto_via_hp = float(scarto_via_hp.sum())
+        E_ground = sim["E_ground"]; E_el = float(el_hp.sum())
+        E_scarto_tot = E_hot + E_scarto_via_hp                        # scarto totale che PARTECIPA in energia
+        C_GROUND = "#7EC8E3"
 
-        st.markdown("##### 📉 Curva di durata: chi copre la domanda")
-        st.caption("Ore ordinate per domanda decrescente (linea **bianca**). Sotto, chi la copre: scarto caldo "
-                   "diretto (rosso), HP alta T da scarto caldo (ciano), quota risollevata dalla HP bassa T da "
-                   "freddo/ground (viola), supporto (arancio). Il vuoto fino alla linea resta scoperto.")
+        st.markdown("##### 📉 Curva di durata: da dove arriva l'energia")
+        st.caption("Ore ordinate per domanda decrescente (linea **bianca**). Sotto, le **fonti** che la coprono in "
+                   "energia: **scarto** usato diretto (rosso) o risollevato dalle HP (verde) = la quota di calore di "
+                   "scarto che partecipa; **suolo/ground** (azzurro); **elettricità** dei compressori (ciano); "
+                   "**supporto** a combustibile (arancio). Il vuoto fino alla linea resta scoperto.")
         order = np.argsort(dom_arr)[::-1]
         x = np.arange(1, len(dom_arr) + 1)
         fig_dur = go.Figure()
-        fig_dur.add_trace(go.Scatter(x=x, y=sim["q_hot_direct"][order], mode="lines", name="Caldo diretto",
-                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_ALTA_T, 0.9)))
-        fig_dur.add_trace(go.Scatter(x=x, y=q_alta_diretta[order], mode="lines", name="HP alta T (scarto caldo)",
-                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_HP, 0.9)))
-        fig_dur.add_trace(go.Scatter(x=x, y=q_alta_via_bassa[order], mode="lines", name="HP alta via HP bassa T",
-                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_HP_BASSA, 0.9)))
-        fig_dur.add_trace(go.Scatter(x=x, y=sim["q_backup"][order], mode="lines", name=f"supporto ({backup_tipo})",
-                                     stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(COLOR_BACKUP, 0.9)))
+        bande = [("Scarto diretto", sim["q_hot_direct"], COLOR_ALTA_T),
+                 ("Scarto risollevato dalle HP", scarto_via_hp, COLOR_OFFERTA),
+                 ("Suolo / ground loop", ground, C_GROUND),
+                 ("Elettricità HP", el_hp, COLOR_HP),
+                 (f"Supporto ({backup_tipo})", sim["q_backup"], COLOR_BACKUP)]
+        for nome, arr, col in bande:
+            if float(arr.sum()) < 1:
+                continue
+            fig_dur.add_trace(go.Scatter(x=x, y=arr[order], mode="lines", name=nome,
+                                         stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(col, 0.9)))
         fig_dur.add_trace(go.Scatter(x=x, y=dom_arr[order], mode="lines", name="Domanda",
                                      line=dict(color=COLOR_DOMANDA, width=2.4)))
-        fig_dur.update_layout(height=430, xaxis_title="Ore/anno", yaxis_title="MW",
+        fig_dur.update_layout(height=440, xaxis_title="Ore/anno", yaxis_title="MW",
                               legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=30, b=10))
         st.plotly_chart(fig_dur, use_container_width=True)
 
@@ -1413,13 +1420,13 @@ with tab_dimensionamento:
 
         st.divider()
         st.markdown("#### Copertura (simulazione oraria)")
-        mets = [("🔴 Caldo diretto", E_hot, f"{E_hot/dom_tot*100:.0f}% della domanda"),
-                ("🟦 HP alta T", E_alta, f"{E_alta/dom_tot*100:.0f}% · COP {sim['cop_alta_medio']:.2f}")]
+        mets = [("Caldo diretto", E_hot, f"{E_hot/dom_tot*100:.0f}% della domanda"),
+                ("HP alta T", E_alta, f"{E_alta/dom_tot*100:.0f}% consegnato · COP {sim['cop_alta_medio']:.2f}")]
         if is_hp_par:
-            mets.append(("🟪 HP bassa T (interna)",
-                         E_bassa, f"→ intermedio (interno) · COP {sim['cop_bassa_medio']:.2f} · ground {sim['ore_ground']} ore"))
+            mets.append(("HP bassa T (interna)", E_bassa,
+                         f"→ intermedio (interno) · COP {sim['cop_bassa_medio']:.2f} · ground {sim['ore_ground']} ore"))
         else:
-            mets.append((f"🟧 {backup_tipo}", E_bk, f"{E_bk/dom_tot*100:.0f}% della domanda"))
+            mets.append((f"Supporto: {backup_tipo}", E_bk, f"{E_bk/dom_tot*100:.0f}% della domanda"))
         cols_r = st.columns(len(mets) + 1)
         for i, (lab, val, hlp) in enumerate(mets):
             cols_r[i].metric(lab, f"{val:,.0f} MWh".replace(",", "."), help=hlp)
@@ -1429,28 +1436,29 @@ with tab_dimensionamento:
         else:
             st.success("✅ Copertura 100% in tutte le ore.")
 
+        st.markdown("**Da dove arriva l'energia** (fonti, sull'anno)")
         fig_mix = go.Figure()
-        voci = [("🔴 Caldo diretto", E_hot, COLOR_ALTA_T),
-                ("🟦 HP alta T (scarto caldo)", E_alta_diretta, COLOR_HP)]
-        if E_alta_via_bassa > 1:
-            voci.append(("🟪 HP alta via HP bassa T", E_alta_via_bassa, COLOR_HP_BASSA))
-        if E_bk > 1:
-            voci.append((f"🟧 {backup_tipo}", E_bk, COLOR_BACKUP))
+        voci = [("Scarto diretto", E_hot, COLOR_ALTA_T),
+                ("Scarto risollevato dalle HP", E_scarto_via_hp, COLOR_OFFERTA),
+                ("Suolo / ground loop", E_ground, C_GROUND),
+                ("Elettricità HP", E_el, COLOR_HP),
+                (f"Supporto ({backup_tipo})", E_bk, COLOR_BACKUP)]
         if E_nc > 1:
             voci.append(("Non coperto", E_nc, COLOR_NONCOP))
+        voci = [(n, v, c) for n, v, c in voci if v > 1]
         tot_mix = sum(v for _, v, _ in voci) or 1.0
         for nome, val, col in voci:
             pct = val / tot_mix * 100
-            fig_mix.add_trace(go.Bar(y=["Copertura"], x=[val], name=nome, orientation="h", marker_color=col,
+            fig_mix.add_trace(go.Bar(y=["Fonti"], x=[val], name=nome, orientation="h", marker_color=col,
                                      text=(f"{pct:.0f}%" if pct >= 6 else ""), textposition="inside",
                                      insidetextanchor="middle", textfont=dict(color="white", size=13), cliponaxis=False))
         fig_mix.update_layout(barmode="stack", height=220, xaxis_title="MWh/anno",
-                              legend=dict(orientation="h", yanchor="top", y=-0.5), margin=dict(t=30, b=10),
-                              title="Chi copre la domanda")
+                              legend=dict(orientation="h", yanchor="top", y=-0.5), margin=dict(t=30, b=10))
         fig_mix.update_yaxes(showticklabels=False)
         st.plotly_chart(fig_mix, use_container_width=True)
-        st.caption("La banda **viola** è la quota di domanda che la HP bassa T rende possibile risollevando "
-                   "freddo/ground fino all'intermedio (poi consegnata dalla HP alta T).")
+        st.caption(f"**Scarto che partecipa** = rosso + verde = **{E_scarto_tot:,.0f} MWh/a** "
+                   f"({E_scarto_tot/dom_tot*100:.0f}% della domanda). Il resto è elettricità dei compressori, "
+                   f"suolo e (se scelto) combustibile di supporto.".replace(",", "."))
 
         st.divider()
         st.markdown("#### 💰 Costi e LCOH")
