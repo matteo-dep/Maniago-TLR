@@ -1547,7 +1547,7 @@ with tab_dimensionamento:
         if solare_on:
             righe.append({"Voce": f"Solare ({area_sol} m²)", "CAPEX (€)": round(capex_solare), "OPEX (€/a)": 0})
         st.dataframe(pd.DataFrame(righe), use_container_width=True, hide_index=True)
-          df_c = pd.DataFrame(righe)
+       df_c = pd.DataFrame(righe)
             _pal = [COLOR_HP, (COLOR_HP_BASSA if is_hp_par else COLOR_BACKUP), COLOR_ACCUMULO, COLOR_SOLARE]
             pc1, pc2 = st.columns(2)
             with pc1:
@@ -1563,7 +1563,6 @@ with tab_dimensionamento:
                 fig_opex.update_layout(title=f"OPEX annuo · {opex:,.0f} €/a".replace(",", "."),
                                        height=330, margin=dict(t=45, b=10), legend=dict(orientation="h", y=-0.1))
                 st.plotly_chart(fig_opex, use_container_width=True)
-
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("CAPEX di sistema", f"{capex_sistema:,.0f} €".replace(",", "."))
         s2.metric("Costo annuo", f"{costo_annuo:,.0f} €/a".replace(",", "."))
