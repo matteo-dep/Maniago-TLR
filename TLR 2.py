@@ -61,37 +61,17 @@ COLOR_DOMANDA  = "#FFFFFF"  # bianco       → linea della domanda (visibile su 
 
 
 def build_cluster_color_map(clusters_list):
-    # """Un solo colore solido per zona di rete: la zona 'ex Bioman' è sempre rossa,
-    # le altre pescano (senza ripetizioni) da una palette qualitativa ad alto contrasto."""
-    # palette = [c for c in (px.colors.qualitative.Set2 + px.colors.qualitative.Dark2)
-    #            if c.lower() != COLOR_EX_BIOMAN.lower()]
-    # color_map, i = {}, 0
-    # for cl in clusters_list:
-    #     if "bioman" in str(cl).lower():
-    #         color_map[cl] = COLOR_EX_BIOMAN
-    #     else:
-    #         color_map[cl] = palette[i % len(palette)]
-    #         i += 1
-    # return color_map
-def build_cluster_color_map(clusters_list):
-    """Associa un colore fisso e specifico a ciascuna delle 4 zone di rete."""
-    colori_fissi = {
-        "Zona 1": "#2D7DC0",  # Blu
-        "Zona 2": "#E63946",  # Rosso (Ex Bioman)
-        "Zona 3": "#3FA34D",  # Verde
-        "Zona 4": "#E9C46A"   # Giallo
-    }
-    
-    color_map = {}
+    """Un solo colore solido per zona di rete: la zona 'ex Bioman' è sempre rossa,
+    le altre pescano (senza ripetizioni) da una palette qualitativa ad alto contrasto."""
+    palette = [c for c in (px.colors.qualitative.Set2 + px.colors.qualitative.Dark2)
+               if c.lower() != COLOR_EX_BIOMAN.lower()]
+    color_map, i = {}, 0
     for cl in clusters_list:
-        nome_cl = str(cl)
-        for chiave, colore in colori_fissi.items():
-            if chiave in nome_cl:
-                color_map[cl] = colore
-                break
+        if "bioman" in str(cl).lower():
+            color_map[cl] = COLOR_EX_BIOMAN
         else:
-            # Colore di fallback (grigio) se compare una zona imprevista
-            color_map[cl] = "#888888"
+            color_map[cl] = palette[i % len(palette)]
+            i += 1
     return color_map
 
 def hex_to_rgba(color, alpha=0.85):
