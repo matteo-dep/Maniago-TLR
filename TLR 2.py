@@ -60,19 +60,24 @@ COLOR_NONCOP   = "#9AA0A6"  # grigio       → domanda non coperta
 COLOR_DOMANDA  = "#FFFFFF"  # bianco       → linea della domanda (visibile su sfondo scuro)
 
 
+ZONA_RENAME = {
+    "NE-Centro": "Zona 1 - Maniago centro / NE",
+    "Ex Bioman": "Zona 2 - Ex Bioman",
+    "Ovest":     "Zona 3 - Maniago Ovest",
+    "Campagna":  "Zona 4 - Campagna",
+}
+ZONA_COLORI = {
+    "Zona 1 - Maniago centro / NE": "#2D7DC0",   # blu
+    "Zona 2 - Ex Bioman":           "#E63946",   # rosso
+    "Zona 3 - Maniago Ovest":       "#3FA34D",   # verde
+    "Zona 4 - Campagna":            "#E9C46A",   # giallo
+}
+
+
 def build_cluster_color_map(clusters_list):
-    """Un solo colore solido per zona di rete: la zona 'ex Bioman' è sempre rossa,
-    le altre pescano (senza ripetizioni) da una palette qualitativa ad alto contrasto."""
-    palette = [c for c in (px.colors.qualitative.Set2 + px.colors.qualitative.Dark2)
-               if c.lower() != COLOR_EX_BIOMAN.lower()]
-    color_map, i = {}, 0
-    for cl in clusters_list:
-        if "bioman" in str(cl).lower():
-            color_map[cl] = COLOR_EX_BIOMAN
-        else:
-            color_map[cl] = palette[i % len(palette)]
-            i += 1
-    return color_map
+    """Colore fisso per zona di rete (vedi ZONA_COLORI)."""
+    return {cl: ZONA_COLORI.get(cl, "#888888") for cl in clusters_list}
+
 
 def hex_to_rgba(color, alpha=0.85):
     """Converte un colore hex (o rgb(...) plotly) in rgba con opacità fissa,
@@ -858,6 +863,8 @@ def ottimizza_scenario(dom_arr, scarto_tiep_arr, scartoT_arr, scarto_alta_arr, s
 
 
 buildings, domanda, flussi, pvgis = load_data()
+buildings["cluster"] = buildings["cluster"].replace(ZONA_RENAME)
+domanda["cluster"] = domanda["cluster"].replace(ZONA_RENAME)
 
 st.title("🔥 Maniago TLR — Domanda, Offerta, Dimensionamento")
 st.caption(
