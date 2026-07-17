@@ -470,6 +470,11 @@ def genera_flusso(row, pinch=5.0, seed=0):
 @st.cache_data
 def load_data():
     buildings = pd.read_csv("maniago_domanda_edifici.csv")
+    try:
+        _coord = pd.read_csv("edifici_pubblici_coordinate.csv")[["edificio", "lat", "lon", "indirizzo"]]
+        buildings = buildings.merge(_coord, on="edificio", how="left")
+    except Exception:
+        buildings["lat"] = np.nan; buildings["lon"] = np.nan; buildings["indirizzo"] = ""
     domanda = pd.read_csv("maniago_domanda_oraria_8760h_HDD_reale.csv", parse_dates=["datetime"])
     domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]], on="edificio", how="left")
     flussi = pd.read_csv("maniago_flussi_offerta.csv")
@@ -977,6 +982,33 @@ with tab_domanda:
             k3.metric("Quota ACS", f"{(acs_tot/tot*100 if tot else 0):.0f}%",
                       help=f"{acs_tot:,.0f} MWh ACS su {tot:,.0f} MWh totali".replace(",", "."))
             k4.metric("Fattore di carico", f"{load_factor*100:.1f}%")
+
+            # --- Mappa degli edifici serviti ---
+            bsel = buildings[buildings["edificio"].isin(selected_buildings)].copy()
+            bmap = bsel.dropna(subset=["lat", "lon"]) if "lat" in bsel.columns else bsel.iloc[0:0]
+            if not bmap.empty:
+                st.markdown("##### 🗺️ Mappa degli edifici serviti")
+                fig_map = go.Figure()
+                for cl in selected_clusters:
+                    sub = bmap[bmap["cluster"] == cl]
+                    if sub.empty:
+                        continue
+                    fig_map.add_trace(go.Scattermapbox(
+                        lat=sub["lat"], lon=sub["lon"], mode="markers", name=cl,
+                        marker=dict(size=(sub["consumo_annuo_MWh"].clip(lower=1) ** 0.5) * 2.5 + 7,
+                                    color=CLUSTER_COLORS.get(cl, "#888888")),
+                        text=(sub["edificio"] + "<br>" + sub["indirizzo"].fillna("").astype(str)
+                              + "<br>" + sub["consumo_annuo_MWh"].round(0).astype(int).astype(str) + " MWh/a"),
+                        hoverinfo="text"))
+                fig_map.update_layout(
+                    mapbox=dict(style="open-street-map",
+                                center=dict(lat=float(bmap["lat"].mean()), lon=float(bmap["lon"].mean())), zoom=13),
+                    height=430, margin=dict(t=10, b=0, l=0, r=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01))
+                st.plotly_chart(fig_map, use_container_width=True)
+                _senza = bsel.shape[0] - bmap.shape[0]
+                if _senza > 0:
+                    st.caption(f"{_senza} edifici senza coordinate non mostrati (es. privati: arriveranno dal file Excel).")
 
             fig = go.Figure()
             cluster_nel_grafico = [c for c in selected_clusters if c in agg_cluster["cluster"].unique()]
@@ -1547,7 +1579,12 @@ with tab_dimensionamento:
         if solare_on:
             righe.append({"Voce": f"Solare ({area_sol} m²)", "CAPEX (€)": round(capex_solare), "OPEX (€/a)": 0})
         st.dataframe(pd.DataFrame(righe), use_container_width=True, hide_index=True)
-        s1, s2, s3, s4 = st.columns(4)
+        fig_co = go.Figure(go.Pie(labels=["CAPEX (annualizzato)", "OPEX (annuo)"],
+                                  values=[capex_sistema * fattore_crf, opex], hole=0.5,
+                                  marker=dict(colors=["#5B8DEF", "#F4A259"]), sort=False))
+        fig_co.update_layout(title=f"Costo annuo · {costo_annuo:,.0f} €/a".replace(",", "."),
+                             height=300, margin=dict(t=45, b=10), legend=dict(orientation="h", y=-0.1))
+        st.plotly_chart(fig_co, use_container_width=True)
         df_c = pd.DataFrame(righe)
         _pal = [COLOR_HP, (COLOR_HP_BASSA if is_hp_par else COLOR_BACKUP), COLOR_ACCUMULO, COLOR_SOLARE]
         pc1, pc2 = st.columns(2)
@@ -1564,6 +1601,7 @@ with tab_dimensionamento:
             fig_opex.update_layout(title=f"OPEX annuo · {opex:,.0f} €/a".replace(",", "."),
                                    height=330, margin=dict(t=45, b=10), legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig_opex, use_container_width=True)
+        s1, s2, s3, s4 = st.columns(4)
         s1.metric("CAPEX di sistema", f"{capex_sistema:,.0f} €".replace(",", "."))
         s2.metric("Costo annuo", f"{costo_annuo:,.0f} €/a".replace(",", "."))
         s3.metric("LCOH di sistema", f"{lcoh:.1f} €/MWh" if not np.isnan(lcoh) else "n/d")
