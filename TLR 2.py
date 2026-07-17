@@ -60,40 +60,20 @@ COLOR_NONCOP   = "#9AA0A6"  # grigio       → domanda non coperta
 COLOR_DOMANDA  = "#FFFFFF"  # bianco       → linea della domanda (visibile su sfondo scuro)
 
 
-# def build_cluster_color_map(clusters_list):
-#     """Un solo colore solido per zona di rete: la zona 'ex Bioman' è sempre rossa,
-#     le altre pescano (senza ripetizioni) da una palette qualitativa ad alto contrasto."""
-#     palette = [c for c in (px.colors.qualitative.Set2 + px.colors.qualitative.Dark2)
-#                if c.lower() != COLOR_EX_BIOMAN.lower()]
-#     color_map, i = {}, 0
-#     for cl in clusters_list:
-#         if "bioman" in str(cl).lower():
-#             color_map[cl] = COLOR_EX_BIOMAN
-#         else:
-#             color_map[cl] = palette[i % len(palette)]
-#             i += 1
-#     return color_map
-
 def build_cluster_color_map(clusters_list):
-    """Associa un colore fisso e specifico a ciascuna delle 4 zone di rete."""
-    colori_fissi = {
-        "Zona 1": "#2D7DC0",  # Blu
-        "Zona 2": "#E63946",  # Rosso (Ex Bioman)
-        "Zona 3": "#3FA34D",  # Verde
-        "Zona 4": "#E9C46A"   # Giallo
-    }
-    
-    color_map = {}
+    """Un solo colore solido per zona di rete: la zona 'ex Bioman' è sempre rossa,
+    le altre pescano (senza ripetizioni) da una palette qualitativa ad alto contrasto."""
+    palette = [c for c in (px.colors.qualitative.Set2 + px.colors.qualitative.Dark2)
+               if c.lower() != COLOR_EX_BIOMAN.lower()]
+    color_map, i = {}, 0
     for cl in clusters_list:
-        nome_cl = str(cl)
-        for chiave, colore in colori_fissi.items():
-            if chiave in nome_cl:
-                color_map[cl] = colore
-                break
+        if "bioman" in str(cl).lower():
+            color_map[cl] = COLOR_EX_BIOMAN
         else:
-            # Colore di fallback (grigio) se compare una zona imprevista
-            color_map[cl] = "#888888"
+            color_map[cl] = palette[i % len(palette)]
+            i += 1
     return color_map
+
 
 def hex_to_rgba(color, alpha=0.85):
     """Converte un colore hex (o rgb(...) plotly) in rgba con opacità fissa,
@@ -155,21 +135,31 @@ def routing_flussi(off_df, idx_h, mandata, T_int):
       T_disp ≥ mandata            → accumulo CALDO (diretto in linea)
       T_int  ≤ T_disp < mandata   → accumulo INTERMEDIO (scambiatore diretto)
       T_disp < T_int              → accumulo BASSO (sorgente della HP bassa T)
-    Ritorna 4 array orari allineati a idx_h: q_hot, q_int, q_low (MWh) e T_low (°C,
-    T media pesata dei flussi freddi di quell'ora; NaN se non ce ne sono)."""
+    Ritorna: q_hot, q_int, q_low (MWh, orari) e la STRATIFICAZIONE dell'accumulo basso:
+    q_low_bins [ore × fasce] = energia dei flussi freddi per fascia di temperatura (5°C),
+    bin_T [fasce] = temperatura rappresentativa di ogni fascia. Così la HP bassa può pescare
+    dallo strato più caldo disponibile (COP migliore) invece che dalla media miscelata."""
     o = off_df[off_df["MWh"] > 0].copy()
     o["T"] = o["T_disponibile"]
     hot = o[o["T"] >= mandata].groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0.0)
     intm = o[(o["T"] >= T_int) & (o["T"] < mandata)].groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0.0)
     low = o[o["T"] < T_int].copy()
     q_low = low.groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0.0)
-    low["Tw"] = low["T"] * low["MWh"]
-    num = low.groupby("datetime")["Tw"].sum().reindex(idx_h)
-    T_low = (num / q_low.replace(0, np.nan))
-    return hot.values, intm.values, q_low.values, T_low.values
+    edges = np.arange(0.0, T_int + 5.0, 5.0)              # fasce da 5°C: 0-5, ..., fino a T_int
+    bin_T = (edges[:-1] + edges[1:]) / 2.0                # temp rappresentativa di ogni fascia
+    K = len(bin_T)
+    if low.empty:
+        q_low_bins = np.zeros((len(idx_h), K))
+    else:
+        low = low.copy()
+        low["bin"] = np.clip(np.digitize(low["T"].values, edges) - 1, 0, K - 1)
+        piv = low.pivot_table(index="datetime", columns="bin", values="MWh", aggfunc="sum", observed=False)
+        piv = piv.reindex(index=idx_h, columns=range(K), fill_value=0.0).fillna(0.0)
+        q_low_bins = piv.values
+    return hot.values, intm.values, q_low.values, q_low_bins, bin_T
 
 
-def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_arr,
+def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                      mandata, ritorno, T_int, dT_evap, eta_hp,
                      V_hot, V_int, V_low,
                      P_hp_alta_kw, P_hp_bassa_kw,
@@ -208,22 +198,31 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_a
     cop_alta_s = np.zeros(n); cop_bassa_s = np.full(n, np.nan)
     ore_ground = 0
 
-    soc_hot = soc_int = soc_low = 0.0
-    cop_a_fix = None
+    soc_hot = soc_int = 0.0
+    soc_low_bins = np.zeros(len(bin_T))
     for i in range(n):
         if perdita_ora > 0:
-            soc_hot -= soc_hot * perdita_ora; soc_int -= soc_int * perdita_ora; soc_low -= soc_low * perdita_ora
+            soc_hot -= soc_hot * perdita_ora; soc_int -= soc_int * perdita_ora
+            soc_low_bins *= (1.0 - perdita_ora)
 
         # --- carica accumuli con lo scarto ---
         ch = min(q_hot_arr[i], C_hot - soc_hot); soc_hot += ch
         scarto_perso[i] += max(q_hot_arr[i] - ch, 0.0)
         ci = min(q_int_arr[i], C_int - soc_int); soc_int += ci
         scarto_perso[i] += max(q_int_arr[i] - ci, 0.0)
+        q_low_h = q_low_bins[i]                       # energia freddi per fascia, quest'ora
         if is_hp:
-            cl = min(q_low_arr[i], C_low - soc_low); soc_low += cl
-            scarto_perso[i] += max(q_low_arr[i] - cl, 0.0)
+            soc_low_bins = soc_low_bins + q_low_h
+            over = soc_low_bins.sum() - C_low
+            if over > 1e-12:                          # capacità piena: scarta dalle fasce più FREDDE
+                scarto_perso[i] += over
+                for k in range(len(soc_low_bins)):
+                    drop = min(soc_low_bins[k], over)
+                    soc_low_bins[k] -= drop; over -= drop
+                    if over <= 1e-12:
+                        break
         else:
-            scarto_perso[i] += q_low_arr[i]          # flussi freddi non sfruttati
+            scarto_perso[i] += float(q_low_h.sum())   # flussi freddi non sfruttati (gas/biomassa)
 
         dom = dom_arr[i]
         # --- accumulo caldo copre diretto in linea ---
@@ -244,19 +243,34 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_a
             from_int = min(E_a, soc_int); soc_int -= from_int
             from_bassa = E_a - from_int
             if from_bassa > 1e-12 and is_hp and P_bassa > 0:
-                # sorgente della HP bassa T: accumulo basso se ha energia, altrimenti ground loop
-                if soc_low > 1e-9:
-                    src_T = T_low_arr[i] if np.isfinite(T_low_arr[i]) else ritorno
+                # sorgente HP bassa: pesca dallo STRATO PIÙ CALDO dell'accumulo basso; se esaurito, dal suolo
+                soc_tot = soc_low_bins.sum()
+                g_T = max(soil_arr[i], antigelo)
+                if soc_tot > 1e-9:
+                    need = from_bassa; e_acc = 0.0; wt = 0.0
+                    for k in range(len(bin_T) - 1, -1, -1):     # dal più caldo
+                        take = min(soc_low_bins[k], need)
+                        e_acc += take; wt += take * bin_T[k]; need -= take
+                        if need <= 1e-12:
+                            break
+                    if need > 1e-12:                            # il resto lo darà il suolo
+                        wt += need * g_T; e_acc += need
+                    src_T = wt / e_acc if e_acc > 0 else g_T
                     src_is_ground = False
                 else:
-                    src_T = max(soil_arr[i], antigelo); src_is_ground = True
+                    src_T = g_T; src_is_ground = True
                 cop_b = cop_singola(src_T - dT_evap, T_int, eta_hp)
                 cop_bassa_s[i] = cop_b
                 q_b = from_bassa                                  # calore reso all'intermedio
                 E_b = q_b * (1.0 - 1.0 / cop_b) if cop_b > 1 else q_b
-                da_basso = min(E_b, soc_low); soc_low -= da_basso
-                q_ground[i] = max(E_b - da_basso, 0.0)     # calore preso dal suolo (non è scarto)
-                if src_is_ground or da_basso < E_b - 1e-9:
+                need = E_b                                        # preleva E_b dalle fasce più calde
+                for k in range(len(soc_low_bins) - 1, -1, -1):
+                    take = min(soc_low_bins[k], need)
+                    soc_low_bins[k] -= take; need -= take
+                    if need <= 1e-12:
+                        break
+                q_ground[i] = max(need, 0.0)                      # residuo preso dal suolo
+                if src_is_ground or q_ground[i] > 1e-9:
                     ore_ground += 1
                 q_bassa[i] = q_b
                 el_bassa[i] = q_b / cop_b if cop_b > 0 else 0.0
@@ -296,7 +310,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_a
 # =============================================================================
 
 
-def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_arr,
+def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                       mandata, ritorno, T_int, dT_evap, eta_hp, parallelo,
                       capex_hp_func, capex_backup_kw, opex_backup_mwh, backup_cop,
                       prezzo_el, costo_m3, capex_solare_fisso, fattore_crf, perdita_func, antigelo):
@@ -329,7 +343,7 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_
     v_low_cands = [0.0, 400.0, 800.0] if is_hp else [0.0]
 
     def _valuta(v_hot, v_int, v_low):
-        r = dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_arr, T_low_arr, soil_arr,
+        r = dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                              mandata, ritorno, T_int, dT_evap, eta_hp,
                              v_hot, v_int, v_low, P_alta, P_bassa,
                              parallelo=parallelo, P_backup_kw=P_bk, backup_cop=backup_cop,
@@ -449,41 +463,16 @@ def genera_flusso(row, pinch=5.0, seed=0):
     return pd.DataFrame({'datetime': HOURS_2024, 'MWh': P, 'P_kW': P * 1000, 'T_disponibile': Td})
 
 
-# @st.cache_data
-# def load_data():
-#     buildings = pd.read_csv("maniago_domanda_edifici.csv")
-#     domanda = pd.read_csv("maniago_domanda_oraria_8760h_HDD_reale.csv", parse_dates=["datetime"])
-#     domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]], on="edificio", how="left")
-#     flussi = pd.read_csv("maniago_flussi_offerta.csv")
-#     flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
-#     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
-#     return buildings, domanda, flussi, pvgis
-
 @st.cache_data
 def load_data():
     buildings = pd.read_csv("maniago_domanda_edifici.csv")
     domanda = pd.read_csv("maniago_domanda_oraria_8760h_HDD_reale.csv", parse_dates=["datetime"])
-    
-    # 🗺️ Dizionario di mappatura per rinominare le zone
-    mappa_zone = {
-        "NE-Centro": "Zona 1 - Maniago centro / NE",
-        "ex Bioman": "Zona 2 - Ex Bioman",
-        "Ex Bioman": "Zona 2 - Ex Bioman",  # Aggiunta variante con la 'E' maiuscola
-        "Ovest": "Zona 3 - Maniago Ovest",
-        "Campagna": "Zona 4 - Campagna"
-    }
-    
-    # Sostituiamo i nomi nel dataset degli edifici
-    buildings["cluster"] = buildings["cluster"].replace(mappa_zone)
-    
-    # Eseguiamo il merge con i nuovi nomi già applicati
     domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]], on="edificio", how="left")
-    
     flussi = pd.read_csv("maniago_flussi_offerta.csv")
     flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
-    
     return buildings, domanda, flussi, pvgis
+
 
 @st.cache_data
 def genera_offerta_flussi(flussi_df, pinch):
@@ -1307,13 +1296,15 @@ with tab_dimensionamento:
             st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
 
         # routing (serve all'ottimizzatore qui sotto)
-        q_hot_arr, q_int_arr, q_low_arr, T_low_arr = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
-        q_low_eff = q_low_arr + solar_low
+        q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
+        q_low_bins_eff = q_low_bins.copy()
+        if solare_on:
+            q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low   # solare → fascia più calda dell'accumulo basso
 
         st.markdown("#### 🔎 Ottimizzazione")
         if st.button("Ottimizza scenario", key="dim_btn_opt", use_container_width=True):
             with st.spinner("LCOH minimo, copertura 100%..."):
-                best = ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_eff, T_low_arr, soil_temp_arr,
+                best = ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
                                          float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
                                          backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
                                          prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func, float(antigelo))
@@ -1344,7 +1335,7 @@ with tab_dimensionamento:
 
     # =========================== CALCOLO ===========================
     perd = perdita_func(max(V_hot, V_int, V_low))
-    sim = dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_eff, T_low_arr, soil_temp_arr,
+    sim = dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
                            float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
                            V_hot, V_int, V_low, P_alta, P_bassa,
                            parallelo=backup_tipo, P_backup_kw=P_bk, backup_cop=backup_cop,
@@ -1414,20 +1405,21 @@ with tab_dimensionamento:
         E_scarto_via_hp = float(scarto_via_hp.sum())
         E_ground = sim["E_ground"]; E_el = float(el_hp.sum())
         E_scarto_tot = E_hot + E_scarto_via_hp                        # scarto totale che PARTECIPA in energia
-        C_GROUND = "#7EC8E3"
+        C_GROUND = "#8C6D46"                                          # marrone (distinto dall'elettricità)
 
         st.markdown("##### 📉 Curva di durata: da dove arriva l'energia")
         st.caption("Ore ordinate per domanda decrescente (linea **bianca**). Sotto, le **fonti** che la coprono in "
                    "energia: **scarto** usato diretto (rosso) o risollevato dalle HP (verde) = la quota di calore di "
-                   "scarto che partecipa; **suolo/ground** (azzurro); **elettricità** dei compressori (ciano); "
-                   "**supporto** a combustibile (arancio). Il vuoto fino alla linea resta scoperto.")
+                   "scarto che partecipa; **suolo/ground** (marrone); **elettricità** dei compressori HP alta (ciano) "
+                   "e HP bassa (viola); **supporto** a combustibile (arancio). Il vuoto fino alla linea resta scoperto.")
         order = np.argsort(dom_arr)[::-1]
         x = np.arange(1, len(dom_arr) + 1)
         fig_dur = go.Figure()
         bande = [("Scarto diretto", sim["q_hot_direct"], COLOR_ALTA_T),
                  ("Scarto risollevato dalle HP", scarto_via_hp, COLOR_OFFERTA),
                  ("Suolo / ground loop", ground, C_GROUND),
-                 ("Elettricità HP", el_hp, COLOR_HP),
+                 ("Elettricità HP alta", sim["el_alta"], COLOR_HP),
+                 ("Elettricità HP bassa", sim["el_bassa"], COLOR_HP_BASSA),
                  (f"Supporto ({backup_tipo})", sim["q_backup"], COLOR_BACKUP)]
         for nome, arr, col in bande:
             if float(arr.sum()) < 1:
@@ -1486,7 +1478,8 @@ with tab_dimensionamento:
         voci = [("Scarto diretto", E_hot, COLOR_ALTA_T),
                 ("Scarto risollevato dalle HP", E_scarto_via_hp, COLOR_OFFERTA),
                 ("Suolo / ground loop", E_ground, C_GROUND),
-                ("Elettricità HP", E_el, COLOR_HP),
+                ("Elettricità HP alta", float(sim["el_alta"].sum()), COLOR_HP),
+                ("Elettricità HP bassa", float(sim["el_bassa"].sum()), COLOR_HP_BASSA),
                 (f"Supporto ({backup_tipo})", E_bk, COLOR_BACKUP)]
         if E_nc > 1:
             voci.append(("Non coperto", E_nc, COLOR_NONCOP))
@@ -1504,6 +1497,38 @@ with tab_dimensionamento:
         st.caption(f"**Scarto che partecipa** = rosso + verde = **{E_scarto_tot:,.0f} MWh/a** "
                    f"({E_scarto_tot/dom_tot*100:.0f}% della domanda). Il resto è elettricità dei compressori, "
                    f"suolo e (se scelto) combustibile di supporto.".replace(",", "."))
+
+        # bilancio energetico sintetico (per confrontare gli scenari)
+        st.markdown("**Bilancio energetico dello scenario**")
+        _spf = (E_hot + E_alta) / E_el if E_el > 1e-6 else 0.0
+        bb = st.columns(4)
+        bb[0].metric("Scarto utilizzato", f"{E_scarto_tot:,.0f} MWh".replace(",", "."),
+                     help=f"{E_scarto_tot/dom_tot*100:.0f}% della domanda (diretto + risollevato via HP)")
+        bb[1].metric("Elettricità HP", f"{E_el:,.0f} MWh".replace(",", "."),
+                     help=f"compressori (alta {sim['E_el_alta']:.0f} + bassa {sim['E_el_bassa']:.0f}) · SPF sistema {_spf:.1f}")
+        bb[2].metric("Suolo / ground", f"{E_ground:,.0f} MWh".replace(",", "."), help=f"{sim['ore_ground']} ore su ground loop")
+        bb[3].metric("Combustibile", f"{E_bk:,.0f} MWh".replace(",", "."),
+                     help=(f"{backup_tipo}" if not is_hp_par else "nessuno (scenario elettrico)"))
+
+        # curva di durata del COP delle due HP
+        st.markdown("**📈 Curva di durata del COP delle pompe di calore**")
+        st.caption("Per ogni HP, i COP orari ordinati dal più alto al più basso (solo ore in cui la macchina lavora).")
+        fig_cop = go.Figure()
+        _ca = sim["cop_alta_s"][(sim["q_alta"] > 1e-6) & np.isfinite(sim["cop_alta_s"])]
+        if len(_ca):
+            fig_cop.add_trace(go.Scatter(y=np.sort(_ca)[::-1], x=np.arange(1, len(_ca) + 1),
+                                         mode="lines", name="COP HP alta T", line=dict(color=COLOR_HP, width=2)))
+        _cb = sim["cop_bassa_s"][(sim["q_bassa"] > 1e-6) & np.isfinite(sim["cop_bassa_s"])]
+        if len(_cb):
+            fig_cop.add_trace(go.Scatter(y=np.sort(_cb)[::-1], x=np.arange(1, len(_cb) + 1),
+                                         mode="lines", name="COP HP bassa T", line=dict(color=COLOR_HP_BASSA, width=2)))
+        if len(_ca) or len(_cb):
+            fig_cop.update_layout(height=320, xaxis_title="Ore di funzionamento (ordinate per COP decrescente)",
+                                  yaxis_title="COP", legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                  margin=dict(t=30, b=10))
+            st.plotly_chart(fig_cop, use_container_width=True)
+        else:
+            st.info("Nessuna HP attiva in questo scenario.")
 
         st.divider()
         st.markdown("#### 💰 Costi e LCOH")
