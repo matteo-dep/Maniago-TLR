@@ -541,7 +541,36 @@ def load_data():
     domanda = domanda[domanda["edificio"].isin(buildings["edificio"])].copy()
     domanda = domanda.drop(columns=["cluster"], errors="ignore").merge(
         buildings[["edificio", "cluster"]], on="edificio", how="left")
-    return buildings, domanda, flussi, pvgis
+
+    # --- PRIVATI (footprint GeoJSON): singoli edifici per la mappa, domanda oraria aggregata
+    #     per zona × livello di estensione (2941 × 8760 sarebbe troppo pesante).
+    try:
+        priv = pd.read_csv("maniago_privati_edifici.csv")
+    except Exception:
+        priv = pd.DataFrame(columns=["edificio", "cluster", "anello", "lat", "lon",
+                                     "MWh_SH", "MWh_ACS", "consumo_annuo_MWh", "tipo_utenza"])
+    if not priv.empty:
+        # profili orari normalizzati (stesso clima dei pubblici): riscaldamento e ACS
+        _p = domanda.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
+        _f_sh = (_p["MWh_riscaldamento"] / _p["MWh_riscaldamento"].sum()).values
+        _f_acs = (_p["MWh_ACS"] / _p["MWh_ACS"].sum()).values
+        _idx = _p.index
+        _agg = priv.groupby(["cluster", "anello"])[["MWh_SH", "MWh_ACS"]].sum().reset_index()
+        _righe = []
+        for r in _agg.itertuples():
+            _nome = f"Privati {r.cluster} · est.{int(r.anello)}"
+            _righe.append(pd.DataFrame({
+                "datetime": _idx, "edificio": _nome,
+                "MWh_riscaldamento": _f_sh * r.MWh_SH, "MWh_ACS": _f_acs * r.MWh_ACS,
+                "cluster": r.cluster, "tipologia": "Residenziale privato",
+                "tipo_utenza": "Privato (potenziale)"}))
+            buildings = pd.concat([buildings, pd.DataFrame([{
+                "edificio": _nome, "cluster": r.cluster, "tipologia": "Residenziale privato",
+                "consumo_annuo_MWh": r.MWh_SH + r.MWh_ACS, "tipo_utenza": "Privato (potenziale)",
+                "anello": int(r.anello), "lat": np.nan, "lon": np.nan}])], ignore_index=True)
+        domanda = pd.concat([domanda] + _righe, ignore_index=True)
+    buildings["anello"] = buildings.get("anello", pd.Series(index=buildings.index, dtype=float)).fillna(0).astype(int)
+    return buildings, domanda, flussi, pvgis, priv
 
 
 @st.cache_data
@@ -928,7 +957,7 @@ def ottimizza_scenario(dom_arr, scarto_tiep_arr, scartoT_arr, scarto_alta_arr, s
     return best
 
 
-buildings, domanda, flussi, pvgis = load_data()
+buildings, domanda, flussi, pvgis, privati = load_data()
 
 st.title("🔥 Maniago TLR — Domanda, Offerta, Dimensionamento")
 st.caption(
@@ -967,17 +996,22 @@ with tab_domanda:
 
         st.markdown("**Utenza**")
         pub_on = st.checkbox("Pubblico", value=True, key="dom_tu_pub")
-        st.caption("Privato (potenziale tecnico, per zona):")
-        zone_private = sorted(buildings.loc[buildings["tipo_utenza"] == "Privato (potenziale)", "edificio"].unique())
-        selected_privati = [z for z in zone_private if st.checkbox(z.replace("Residenziale ", ""), value=False, key=f"dom_priv_{z}")]
+        st.caption("Privati (footprint GIS): livello di estensione della rete")
+        liv_est = st.slider("Livello di estensione", 0, 6, 0, key="dom_liv_est",
+                            help="0 = nessun privato. 1-6 = anelli cumulativi di estensione della rete: "
+                                 "include tutti gli edifici privati fino a quel livello, nelle zone attive.")
+        selected_privati = []
+        if liv_est > 0:
+            selected_privati = buildings.loc[
+                (buildings["tipo_utenza"] == "Privato (potenziale)")
+                & (buildings["anello"] <= liv_est), "edificio"].tolist()
 
         fattore_correzione = 100
-        if selected_privati:
+        if liv_est > 0:
             fattore_correzione = st.slider(
                 "Fattore di correzione privato (%)", 10, 100, 100, step=5, key="dom_priv_fattore",
-                help="Il potenziale privato viene da un coefficiente GIS uniforme (~150 kWh/m²/anno, "
-                     "vicino allo standard 'vecchio/non ristrutturato') che probabilmente sovrastima "
-                     "il reale. Usa questo slider per testare scenari più prudenti."
+                help="La domanda dei privati viene dai footprint GIS (coefficiente uniforme, tende a "
+                     "sovrastimare). Usa questo slider per scenari più prudenti."
             )
 
         st.markdown("**Componente**")
@@ -1072,6 +1106,19 @@ with tab_domanda:
                         text=(sub["edificio"] + "<br>" + sub["indirizzo"].fillna("").astype(str)
                               + "<br>" + sub["consumo_annuo_MWh"].round(0).astype(int).astype(str) + " MWh/a"),
                         hoverinfo="text"))
+                # privati inclusi nel livello di estensione scelto
+                if liv_est > 0 and not privati.empty:
+                    _pv = privati[(privati["anello"] <= liv_est)
+                                  & (privati["cluster"].isin(selected_clusters))]
+                    if not _pv.empty:
+                        fig_map.add_trace(go.Scattermapbox(
+                            lat=_pv["lat"], lon=_pv["lon"], mode="markers",
+                            name=f"Privati (est. ≤{liv_est}): {len(_pv)}",
+                            marker=dict(size=6, color="#B57EDC", opacity=0.75),
+                            text=(_pv["nome"].fillna("").astype(str) + "<br>" + _pv["via"].fillna("").astype(str)
+                                  + "<br>est." + _pv["anello"].astype(str) + " · "
+                                  + _pv["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a"),
+                            hoverinfo="text"))
                 fig_map.update_layout(
                     mapbox=dict(style="open-street-map",
                                 center=dict(lat=float(bmap["lat"].mean()), lon=float(bmap["lon"].mean())), zoom=13),
