@@ -582,10 +582,15 @@ def load_data():
         priv = pd.DataFrame(columns=["edificio", "cluster", "anello", "lat", "lon",
                                      "MWh_SH", "MWh_ACS", "consumo_annuo_MWh", "tipo_utenza"])
     if not priv.empty:
-        # profili orari normalizzati (stesso clima dei pubblici): riscaldamento e ACS
-        _p = domanda.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
+        # profilo orario RESIDENZIALE: la forma delle utenze occupate 24h (RSA) è molto più
+        # vicina a un'abitazione rispetto alla media dei pubblici (scuole/uffici, vuoti di notte).
+        _res = domanda[domanda["tipologia"].astype(str).str.contains("RSA", na=False)]
+        _base = _res if not _res.empty else domanda
+        _p = _base.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
+        _p = _p.reindex(domanda["datetime"].drop_duplicates().sort_values(), fill_value=0.0)
         _f_sh = (_p["MWh_riscaldamento"] / _p["MWh_riscaldamento"].sum()).values
-        _f_acs = (_p["MWh_ACS"] / _p["MWh_ACS"].sum()).values
+        _f_acs_src = domanda.groupby("datetime")["MWh_ACS"].sum()
+        _f_acs = (_f_acs_src / _f_acs_src.sum()).values
         _idx = _p.index
         _agg = priv.groupby(["cluster", "anello"])[["MWh_SH", "MWh_ACS"]].sum().reset_index()
         _righe = []
@@ -607,10 +612,14 @@ def load_data():
     except Exception:
         cond = pd.DataFrame(columns=["cluster", "unita"])
     if not cond.empty and not priv.empty:
-        _p = domanda.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
-        _f_sh = (_p["MWh_riscaldamento"] / _p["MWh_riscaldamento"].sum()).values
-        _f_acs = (_p["MWh_ACS"] / _p["MWh_ACS"].sum()).values
+        _pubb = domanda[domanda["tipo_utenza"] == "Pubblico"]
+        _res2 = _pubb[_pubb["tipologia"].astype(str).str.contains("RSA", na=False)]
+        _b2 = _res2 if not _res2.empty else _pubb
+        _p = _b2.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
         _idx = _p.index
+        _f_sh = (_p["MWh_riscaldamento"] / _p["MWh_riscaldamento"].sum()).values
+        _acs_src = _pubb.groupby("datetime")["MWh_ACS"].sum().reindex(_idx, fill_value=0.0)
+        _f_acs = (_acs_src / _acs_src.sum()).values
         _righe_c = []
         for _z, _g in cond.groupby("cluster"):
             _u = float(_g["unita"].sum())
@@ -1193,14 +1202,13 @@ with tab_domanda:
                         text=(sub["edificio"] + "<br>" + sub["indirizzo"].fillna("").astype(str)
                               + "<br>" + sub["consumo_annuo_MWh"].round(0).astype(int).astype(str) + " MWh/a"),
                         hoverinfo="text"))
-                # privati inclusi nel livello di estensione scelto
-                if liv_est > 0 and not privati.empty:
-                    _pv = privati[(privati["anello"] <= liv_est)
-                                  & (privati["cluster"].isin(selected_clusters))]
+                # privati delle sole zone in cui sono stati spuntati
+                if sel_priv_zone and not privati.empty:
+                    _pv = privati[privati["cluster"].isin(sel_priv_zone)]
                     if not _pv.empty:
                         fig_map.add_trace(go.Scattermapbox(
                             lat=_pv["lat"], lon=_pv["lon"], mode="markers",
-                            name=f"Privati (est. ≤{liv_est}): {len(_pv)}",
+                            name=f"Privati: {len(_pv)}",
                             marker=dict(size=6, color="#B57EDC", opacity=0.75),
                             text=(_pv["nome"].fillna("").astype(str) + "<br>" + _pv["via"].fillna("").astype(str)
                                   + "<br>est." + _pv["anello"].astype(str) + " · "
@@ -1283,15 +1291,12 @@ with tab_domanda:
                        "MWh/anno per metro di rete. È l'indicatore chiave di fattibilità del TLR: "
                        "sotto ~1,2 MWh/(m·a) la rete fatica a ripagarsi, sopra ~2 è buona.")
             cD1, cD2 = st.columns(2)
+            tasso_all = fattore_correzione
             costo_m_rete = cD1.slider("Costo rete (€/m di trincea)", 200, 1500, 600, step=50,
                                       key="dom_costo_rete",
                                       help="Posa di tubazione preisolata in trincea, valore tipico per centro urbano.")
-            tasso_all = cD2.slider("Tasso di allacciamento privati (%)", 10, 100, 100, step=5,
-                                   key="dom_tasso_all",
-                                   help="Quota di edifici privati che si allaccia davvero. Riduce la densità: "
-                                        "la rete resta lunga uguale, l'energia venduta cala.")
             righe_d = []
-            for _z in selected_clusters:
+            for _z in (sel_priv_zone or selected_clusters):
                 _pz2 = privati[privati["cluster"] == _z]
                 if _pz2.empty:
                     continue
@@ -1331,6 +1336,23 @@ with tab_domanda:
                     st.caption(f"Al livello **{liv_est}** nelle zone attive: rete ≈ **{_tot_L:,.0f} m**, "
                                f"CAPEX rete ≈ **{_tot_L*costo_m_rete:,.0f} €** "
                                f"(non incluso nel LCOH di produzione della scheda Dimensionamento).".replace(",", "."))
+
+        # --- Elenco dei condomini selezionati ---
+        if sel_cond_zone and not condomini.empty:
+            st.divider()
+            st.markdown("##### 🏢 Condomini censiti nelle zone selezionate")
+            _cs = condomini[condomini["cluster"].isin(sel_cond_zone)].copy()
+            _cs["MWh/a stimati"] = (_cs["unita"] * mwh_unita * tasso_cond / 100.0).round(1)
+            cq1, cq2, cq3 = st.columns(3)
+            cq1.metric("Condomini", f"{len(_cs)}")
+            cq2.metric("Unità abitative", f"{_cs['unita'].sum():,.0f}".replace(",", "."))
+            cq3.metric("Domanda stimata", f"{_cs['MWh/a stimati'].sum():,.0f} MWh/a".replace(",", "."),
+                       help=f"{mwh_unita} MWh per unità · adesione {tasso_cond}%")
+            _tab = _cs[["cluster", "via", "civico", "denominazione", "amministratore", "unita", "MWh/a stimati"]]
+            _tab = _tab.rename(columns={"cluster": "Zona", "via": "Via", "civico": "Civico",
+                                        "denominazione": "Denominazione", "amministratore": "Amministratore",
+                                        "unita": "Unità"}).sort_values(["Zona", "Unità"], ascending=[True, False])
+            st.dataframe(_tab, use_container_width=True, hide_index=True)
 
 
 # =============================================================================
