@@ -527,6 +527,10 @@ def load_data():
     # dai footprint GeoJSON: le escludiamo per non contare due volte la domanda.
     buildings = buildings[~buildings["edificio"].str.startswith("Residenziale Zona")].copy()
     _zp = carica_zone_confini()
+    if not _zp:
+        st.error("⚠️ File **TLR_zones_borders.geojson** non trovato nella cartella dell'app: "
+                 "le zone restano quelle vecchie e i filtri appariranno vuoti. "
+                 "Copia i file .geojson e maniago_privati_edifici.csv accanto a provaTLRManiago.py.")
     if _zp:
         _centri = {ZONE_NOMI[z]: (np.mean([r[:, 1].mean() for r in a]), np.mean([r[:, 0].mean() for r in a]))
                    for z, a in _zp.items()}
@@ -538,6 +542,11 @@ def load_data():
                 z = min(_centri, key=lambda k: (_centri[k][0] - r.lat) ** 2 + (_centri[k][1] - r.lon) ** 2)
             _out.append(z if z else "Zona 4 - Centro")
         buildings["cluster"] = _out
+    else:
+        # senza confini: mappo comunque i vecchi nomi sui nuovi, così i default restano validi
+        buildings["cluster"] = buildings["cluster"].replace({
+            "NE-Centro": "Zona 1 - Comune NE", "Ex Bioman": "Zona 2 - Ex Bioman",
+            "Campagna": "Zona 3 - Sud", "Ovest": "Zona 5 - Ovest"})
     domanda = domanda[domanda["edificio"].isin(buildings["edificio"])].copy()
     domanda = domanda.drop(columns=["cluster"], errors="ignore").merge(
         buildings[["edificio", "cluster"]], on="edificio", how="left")
