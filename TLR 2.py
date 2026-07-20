@@ -1080,8 +1080,8 @@ st.caption(
     "(anno 2011, corretto verso i 2.850 GG ufficiali di Maniago) · Tutto calcolato live, un solo file."
 )
 
-tab_domanda, tab_offerta, tab_dimensionamento, tab_confronto = st.tabs(
-    ["🏠 Domanda", "♻️ Offerta", "🧮 Dimensionamento", "📊 Confronto scenari"]
+tab_domanda, tab_offerta, tab_dimensionamento, tab_confronto, tab_economia = st.tabs(
+    ["🏠 Domanda", "♻️ Offerta", "🧮 Dimensionamento", "📊 Confronto scenari", "💶 Analisi economica"]
 )
 
 # =============================================================================
@@ -1523,6 +1523,12 @@ with tab_domanda:
             t3.metric("CAPEX rete", f"{_len_t*costo_m_tr/1e6:.1f} M€")
             t4.metric("Densità lineare", f"{_dom_tr/_len_t:.2f} MWh/(m·a)",
                       help="sotto ~1,2 la rete fatica a ripagarsi; sopra ~2 è buona")
+            st.session_state["_rete_info"] = {
+                "lunghezza_m": float(_len_t), "capex_rete": float(_len_t * costo_m_tr),
+                "densita": float(_dom_tr / _len_t), "n_utenze": int(len(_tr)),
+                "costo_m": int(costo_m_tr), "traccia_lat": _lat_l, "traccia_lon": _lon_l,
+                "pt_lat": _tr["lat"].tolist(), "pt_lon": _tr["lon"].tolist(),
+            }
 
 
 # =============================================================================
@@ -2130,6 +2136,15 @@ with tab_dimensionamento:
         "lcoh_sistema": round(float(lcoh), 1) if not np.isnan(lcoh) else None,
         "quota_fer_pct": round(quota_fer),
         "ore_non_coperte": sim["ore_non_coperte"],
+        # dettaglio per l'analisi economica
+        "capex_hp_alta": round(capex_alta), "capex_hp_bassa": round(capex_bassa),
+        "capex_caldaia": round(capex_bk), "capex_accumuli": round(capex_acc),
+        "capex_solare": round(capex_solare),
+        "opex_elettrico": round(sim["E_el_tot"] * prezzo_el), "opex_combustibile": round(E_bk * opex_bk_mwh),
+        "E_el_mwh": round(sim["E_el_tot"]), "E_comb_mwh": round(E_bk),
+        "E_scarto_mwh": round(E_hot + max(sim["E_hp_alta"] - sim["E_el_tot"] - sim["E_ground"], 0)),
+        "backup_tipo": backup_tipo, "cop_alta": round(sim["cop_alta_medio"], 2),
+        "rete": st.session_state.get("_rete_info"),
     }
 
 # =============================================================================
@@ -2173,6 +2188,7 @@ with tab_confronto:
                 "LCOH (€/MWh)": snap["lcoh_sistema"],
                 "Ore non coperte": snap["ore_non_coperte"],
             })
+            st.session_state.setdefault("scenari_full", {})[nome_scenario] = dict(snap)
             st.success(f"Scenario '{nome_scenario}' salvato.")
 
     if st.session_state.scenari_salvati:
@@ -2226,3 +2242,221 @@ st.caption(
     "Profili aziende: motore generico per tipo_profilo, parametri da validare con log dati reali. "
     "Simulazione accumulo: dispatch greedy orario, nessun limite di potenza carica/scarico."
 )
+
+# =============================================================================
+# TAB 5 - ANALISI ECONOMICA
+# =============================================================================
+def van(flussi_cassa, tasso):
+    """Valore Attuale Netto di una serie di flussi (anno 0 incluso)."""
+    return float(sum(f / (1 + tasso) ** t for t, f in enumerate(flussi_cassa)))
+
+
+def tir(flussi_cassa, lo=-0.9, hi=1.5):
+    """Tasso Interno di Rendimento per bisezione; None se non esiste nell'intervallo."""
+    f_lo, f_hi = van(flussi_cassa, lo), van(flussi_cassa, hi)
+    if f_lo * f_hi > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        f_mid = van(flussi_cassa, mid)
+        if abs(f_mid) < 1e-6:
+            return mid
+        if f_lo * f_mid < 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return (lo + hi) / 2
+
+
+with tab_economia:
+    st.markdown("### Analisi economica degli scenari")
+    _full = st.session_state.get("scenari_full", {})
+    if not _full:
+        st.info("Nessuno scenario salvato. Vai in **Dimensionamento**, imposta il sistema, poi in "
+                "**Confronto scenari** premi *Salva scenario corrente*. Puoi salvarne quanti vuoi "
+                "(es. gas / biomassa / HP bassa T, con e senza privati) e confrontarli qui.")
+    else:
+        col_par, col_ris = st.columns([1, 3])
+
+        with col_par:
+            st.markdown("#### ⚙️ Ipotesi economiche")
+            scen_sel = st.multiselect("Scenari da analizzare", list(_full.keys()),
+                                      default=list(_full.keys()), key="ec_scen")
+            anni = st.slider("Orizzonte (anni)", 10, 40, 25, key="ec_anni")
+            tasso = st.slider("Tasso di sconto (%)", 0.0, 12.0, 4.0, step=0.5, key="ec_tasso") / 100
+            st.markdown("**Ricavi**")
+            prezzo_vendita = st.slider("Prezzo di vendita calore (€/MWh)", 40, 200, 95, step=5,
+                                       key="ec_prezzo_v",
+                                       help="Tariffa al cliente finale, al netto di IVA.")
+            allacc_una_tantum = st.slider("Contributo di allacciamento (€/utenza)", 0, 8000, 1500,
+                                          step=100, key="ec_allacc",
+                                          help="Una tantum incassato all'anno 0 per ogni utenza collegata.")
+            st.markdown("**Costi**")
+            om_pct = st.slider("O&M annuo (% del CAPEX)", 0.0, 5.0, 2.0, step=0.25, key="ec_om") / 100
+            contributo = st.slider("Contributo a fondo perduto (% CAPEX)", 0, 80, 40, step=5,
+                                   key="ec_contributo",
+                                   help="Quota di CAPEX coperta da finanziamenti pubblici (PNRR, bandi regionali).")
+            incl_rete = st.checkbox("Includi CAPEX rete", value=True, key="ec_incl_rete")
+            st.markdown("**Confronto con gas metano**")
+            prezzo_gas_ut = st.slider("Prezzo gas utente (€/MWh)", 40, 180, 95, step=5, key="ec_gas_p",
+                                      help="Costo del metano per l'utente finale, comprensivo di oneri.")
+            rend_cald = st.slider("Rendimento caldaie esistenti (%)", 70, 100, 88, key="ec_gas_r") / 100
+            escalation = st.slider("Escalation prezzi energia (%/anno)", 0.0, 5.0, 2.0, step=0.5,
+                                   key="ec_esc") / 100
+
+        with col_ris:
+            if not scen_sel:
+                st.warning("Seleziona almeno uno scenario.")
+            else:
+                risultati = []
+                for nome in scen_sel:
+                    s = _full[nome]
+                    rete = s.get("rete") or {}
+                    capex_prod = float(s.get("capex_sistema") or 0)
+                    capex_rete = float(rete.get("capex_rete") or 0) if incl_rete else 0.0
+                    capex_tot = capex_prod + capex_rete
+                    capex_netto = capex_tot * (1 - contributo / 100)
+                    dom_mwh = float(s.get("carico_residuo_mwh") or 0)
+                    n_ut = int(rete.get("n_utenze") or 0)
+                    opex_en = float(s.get("opex_elettrico") or 0) + float(s.get("opex_combustibile") or 0)
+                    opex_om = capex_tot * om_pct
+                    ricavo_calore = dom_mwh * prezzo_vendita
+                    costo_gas_oggi = dom_mwh / rend_cald * prezzo_gas_ut
+                    # flussi di cassa (ottica del gestore)
+                    cf = [-capex_netto + n_ut * allacc_una_tantum]
+                    for t in range(1, anni + 1):
+                        k = (1 + escalation) ** t
+                        cf.append(ricavo_calore * k - (opex_en * k + opex_om))
+                    v = van(cf, tasso)
+                    r = tir(cf)
+                    margine = ricavo_calore - opex_en - opex_om
+                    payback = None
+                    cum = cf[0]
+                    for t in range(1, anni + 1):
+                        cum += cf[t]
+                        if cum >= 0:
+                            payback = t
+                            break
+                    lcoh_tot = ((capex_netto * crf(tasso, anni)) + opex_en + opex_om) / dom_mwh if dom_mwh > 0 else np.nan
+                    risultati.append({
+                        "Scenario": nome, "Tecnologie": s.get("tecnologie", ""),
+                        "Domanda (MWh/a)": round(dom_mwh), "Utenze": n_ut,
+                        "CAPEX prod. (€)": round(capex_prod), "CAPEX rete (€)": round(capex_rete),
+                        "CAPEX totale (€)": round(capex_tot), "CAPEX netto (€)": round(capex_netto),
+                        "OPEX energia (€/a)": round(opex_en), "O&M (€/a)": round(opex_om),
+                        "Ricavi (€/a)": round(ricavo_calore), "Margine (€/a)": round(margine),
+                        "VAN (€)": round(v), "TIR (%)": (round(r * 100, 1) if r is not None else None),
+                        "Payback (anni)": payback,
+                        "LCOH completo (€/MWh)": round(float(lcoh_tot), 1) if dom_mwh > 0 else None,
+                        "Costo gas oggi (€/a)": round(costo_gas_oggi),
+                        "Risparmio vs gas (€/a)": round(costo_gas_oggi - (opex_en + opex_om)),
+                        "Quota FER (%)": s.get("quota_fer_pct"),
+                        "Densità (MWh/m·a)": round(float(rete.get("densita") or 0), 2),
+                        "Rete (km)": round(float(rete.get("lunghezza_m") or 0) / 1000, 1),
+                    })
+                df_ec = pd.DataFrame(risultati)
+
+                st.markdown("#### 📋 Risultati per scenario")
+                for r in risultati:
+                    with st.expander(f"**{r['Scenario']}** · VAN {r['VAN (€)']/1e6:.2f} M€ · "
+                                     f"TIR {r['TIR (%)'] if r['TIR (%)'] is not None else 'n/d'}% · "
+                                     f"LCOH {r['LCOH completo (€/MWh)']} €/MWh",
+                                     expanded=(len(risultati) <= 2)):
+                        st.caption(f"{r['Tecnologie']} · {r['Domanda (MWh/a)']:,} MWh/a · "
+                                   f"{r['Utenze']} utenze · rete {r['Rete (km)']} km".replace(",", "."))
+                        e1, e2, e3, e4 = st.columns(4)
+                        e1.metric("VAN", f"{r['VAN (€)']/1e6:.2f} M€",
+                                  help=f"a {anni} anni, tasso {tasso*100:.1f}%")
+                        e2.metric("TIR", f"{r['TIR (%)']}%" if r["TIR (%)"] is not None else "n/d")
+                        e3.metric("Payback", f"{r['Payback (anni)']} anni" if r["Payback (anni)"] else "oltre orizzonte")
+                        e4.metric("LCOH completo", f"{r['LCOH completo (€/MWh)']} €/MWh",
+                                  help="produzione + rete + O&M, CAPEX annualizzato")
+                        f1, f2 = st.columns(2)
+                        with f1:
+                            _lab = ["HP alta T", "HP bassa T", "Caldaia", "Accumuli", "Solare", "Rete"]
+                            _s = _full[r["Scenario"]]
+                            _val = [_s.get("capex_hp_alta", 0), _s.get("capex_hp_bassa", 0),
+                                    _s.get("capex_caldaia", 0), _s.get("capex_accumuli", 0),
+                                    _s.get("capex_solare", 0), r["CAPEX rete (€)"]]
+                            _c = [COLOR_HP, COLOR_HP_BASSA, COLOR_BACKUP, COLOR_ACCUMULO, COLOR_SOLARE, COLOR_ALTA_T]
+                            _k = [(l, v, c) for l, v, c in zip(_lab, _val, _c) if v and v > 0]
+                            fig_cx = go.Figure(go.Pie(labels=[k[0] for k in _k], values=[k[1] for k in _k],
+                                                      hole=0.5, marker=dict(colors=[k[2] for k in _k]), sort=False))
+                            fig_cx.update_layout(title=f"CAPEX · {r['CAPEX totale (€)']/1e6:.2f} M€",
+                                                 height=300, margin=dict(t=45, b=10),
+                                                 legend=dict(orientation="h", y=-0.1))
+                            st.plotly_chart(fig_cx, use_container_width=True)
+                        with f2:
+                            _s = _full[r["Scenario"]]
+                            _lo = [("Elettricità HP", _s.get("opex_elettrico", 0), COLOR_HP),
+                                   ("Combustibile", _s.get("opex_combustibile", 0), COLOR_BACKUP),
+                                   ("O&M", r["O&M (€/a)"], COLOR_ACCUMULO)]
+                            _lo = [x for x in _lo if x[1] and x[1] > 0]
+                            fig_ox = go.Figure(go.Pie(labels=[x[0] for x in _lo], values=[x[1] for x in _lo],
+                                                      hole=0.5, marker=dict(colors=[x[2] for x in _lo]), sort=False))
+                            fig_ox.update_layout(title=f"OPEX · {(r['OPEX energia (€/a)']+r['O&M (€/a)'])/1e3:.0f} k€/a",
+                                                 height=300, margin=dict(t=45, b=10),
+                                                 legend=dict(orientation="h", y=-0.1))
+                            st.plotly_chart(fig_ox, use_container_width=True)
+                        g1, g2, g3 = st.columns(3)
+                        g1.metric("Costo con gas oggi", f"{r['Costo gas oggi (€/a)']/1e3:.0f} k€/a",
+                                  help=f"{r['Domanda (MWh/a)']} MWh / rendimento {rend_cald*100:.0f}% × {prezzo_gas_ut} €/MWh")
+                        g2.metric("Costo esercizio TLR", f"{(r['OPEX energia (€/a)']+r['O&M (€/a)'])/1e3:.0f} k€/a")
+                        g3.metric("Risparmio vs gas", f"{r['Risparmio vs gas (€/a)']/1e3:.0f} k€/a",
+                                  delta=f"{r['Risparmio vs gas (€/a)']/max(r['Costo gas oggi (€/a)'],1)*100:.0f}%")
+                        # mappa del tracciato dello scenario
+                        _rete = _full[r["Scenario"]].get("rete") or {}
+                        if _rete.get("traccia_lat"):
+                            fig_m = go.Figure()
+                            fig_m.add_trace(go.Scattermapbox(lat=_rete["traccia_lat"], lon=_rete["traccia_lon"],
+                                                             mode="lines", line=dict(width=2, color=COLOR_ALTA_T),
+                                                             name="Tracciato", hoverinfo="skip"))
+                            fig_m.add_trace(go.Scattermapbox(lat=_rete["pt_lat"], lon=_rete["pt_lon"],
+                                                             mode="markers", marker=dict(size=5, color=COLOR_HP),
+                                                             name="Utenze", hoverinfo="skip"))
+                            fig_m.add_trace(go.Scattermapbox(lat=[CENTRALE_LAT], lon=[CENTRALE_LON],
+                                                             mode="markers", marker=dict(size=16, color="#FF9F1C"),
+                                                             name="Centrale", hoverinfo="skip"))
+                            fig_m.update_layout(mapbox=dict(style="open-street-map",
+                                                            center=dict(lat=(np.mean(_rete["pt_lat"]) + CENTRALE_LAT) / 2,
+                                                                        lon=(np.mean(_rete["pt_lon"]) + CENTRALE_LON) / 2),
+                                                            zoom=12),
+                                                height=380, margin=dict(t=5, b=0, l=0, r=0),
+                                                legend=dict(orientation="h", yanchor="bottom", y=1.01))
+                            st.plotly_chart(fig_m, use_container_width=True)
+
+                st.divider()
+                st.markdown("#### ⚖️ Confronto tra scenari")
+                _metriche = {"VAN (€)": "VAN (€)", "TIR (%)": "TIR (%)",
+                             "LCOH completo (€/MWh)": "LCOH completo (€/MWh)",
+                             "CAPEX totale (€)": "CAPEX totale (€)",
+                             "OPEX energia (€/a)": "OPEX energia (€/a)",
+                             "Quota FER (%)": "Quota FER (%)",
+                             "Densità (MWh/m·a)": "Densità (MWh/m·a)",
+                             "Risparmio vs gas (€/a)": "Risparmio vs gas (€/a)"}
+                scelte = st.multiselect("Parametri da confrontare", list(_metriche.keys()),
+                                        default=["VAN (€)", "TIR (%)", "LCOH completo (€/MWh)", "Quota FER (%)"],
+                                        key="ec_metriche")
+                if scelte:
+                    _n = len(scelte)
+                    for i in range(0, _n, 2):
+                        cc = st.columns(min(2, _n - i))
+                        for j, m in enumerate(scelte[i:i + 2]):
+                            _d = df_ec[["Scenario", m]].dropna()
+                            if _d.empty:
+                                continue
+                            fig_b = go.Figure(go.Bar(x=_d["Scenario"], y=_d[m],
+                                                     marker_color=[COLOR_HP, COLOR_BACKUP, COLOR_OFFERTA,
+                                                                   COLOR_HP_BASSA, COLOR_SOLARE][:len(_d)],
+                                                     text=_d[m].round(1), textposition="outside"))
+                            fig_b.update_layout(title=m, height=300, margin=dict(t=45, b=10),
+                                                yaxis=dict(zeroline=True, zerolinecolor="#888"))
+                            cc[j].plotly_chart(fig_b, use_container_width=True)
+                st.markdown("##### Tabella completa")
+                st.dataframe(df_ec, use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Scarica confronto (CSV)", df_ec.to_csv(index=False).encode("utf-8"),
+                                   "maniago_analisi_economica.csv", "text/csv")
+                st.caption("**VAN** = valore attuale netto dei flussi di cassa del gestore (ricavi da vendita "
+                           "calore + allacciamenti − CAPEX netto − OPEX − O&M). **TIR** = tasso che azzera il VAN. "
+                           "**LCOH completo** include produzione, rete e O&M con CAPEX annualizzato. "
+                           "Il confronto col gas è sui soli costi di esercizio, a parità di calore fornito.")
