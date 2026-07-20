@@ -2385,7 +2385,7 @@ with tab_economia:
                             fig_cx.update_layout(title=f"CAPEX · {r['CAPEX totale (€)']/1e6:.2f} M€",
                                                  height=300, margin=dict(t=45, b=10),
                                                  legend=dict(orientation="h", y=-0.1))
-                            st.plotly_chart(fig_cx, use_container_width=True)
+                            st.plotly_chart(fig_cx, use_container_width=True, key=f"ec_cx_{r['Scenario']}")
                         with f2:
                             _s = _full[r["Scenario"]]
                             _lo = [("Elettricità HP", _s.get("opex_elettrico", 0), COLOR_HP),
@@ -2397,7 +2397,7 @@ with tab_economia:
                             fig_ox.update_layout(title=f"OPEX · {(r['OPEX energia (€/a)']+r['O&M (€/a)'])/1e3:.0f} k€/a",
                                                  height=300, margin=dict(t=45, b=10),
                                                  legend=dict(orientation="h", y=-0.1))
-                            st.plotly_chart(fig_ox, use_container_width=True)
+                            st.plotly_chart(fig_ox, use_container_width=True, key=f"ec_ox_{r['Scenario']}")
                         g1, g2, g3 = st.columns(3)
                         g1.metric("Costo con gas oggi", f"{r['Costo gas oggi (€/a)']/1e3:.0f} k€/a",
                                   help=f"{r['Domanda (MWh/a)']} MWh / rendimento {rend_cald*100:.0f}% × {prezzo_gas_ut} €/MWh")
@@ -2423,7 +2423,7 @@ with tab_economia:
                                                             zoom=12),
                                                 height=380, margin=dict(t=5, b=0, l=0, r=0),
                                                 legend=dict(orientation="h", yanchor="bottom", y=1.01))
-                            st.plotly_chart(fig_m, use_container_width=True)
+                            st.plotly_chart(fig_m, use_container_width=True, key=f"ec_map_{r['Scenario']}")
 
                 st.divider()
                 st.markdown("#### ⚖️ Confronto tra scenari")
@@ -2451,7 +2451,7 @@ with tab_economia:
                                                      text=_d[m].round(1), textposition="outside"))
                             fig_b.update_layout(title=m, height=300, margin=dict(t=45, b=10),
                                                 yaxis=dict(zeroline=True, zerolinecolor="#888"))
-                            cc[j].plotly_chart(fig_b, use_container_width=True)
+                            cc[j].plotly_chart(fig_b, use_container_width=True, key=f"ec_bar_{m}")
                 st.markdown("##### Tabella completa")
                 st.dataframe(df_ec, use_container_width=True, hide_index=True)
                 st.download_button("⬇️ Scarica confronto (CSV)", df_ec.to_csv(index=False).encode("utf-8"),
