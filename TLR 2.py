@@ -116,6 +116,28 @@ def zona_da_coordinate(lat, lon, zone_poly):
     return None
 
 
+def stima_lunghezza_rete(lat, lon, fattore_tortuosita=1.35):
+    """Lunghezza indicativa della rete (m) che collega i punti dati, come albero di
+    connessione minimo (MST, algoritmo di Prim) sulle distanze in piano locale.
+    Il fattore di tortuosità tiene conto che le tubazioni seguono le strade, non le rette."""
+    lat = np.asarray(lat, dtype=float); lon = np.asarray(lon, dtype=float)
+    ok = np.isfinite(lat) & np.isfinite(lon)
+    lat, lon = lat[ok], lon[ok]
+    n = len(lat)
+    if n < 2:
+        return 0.0
+    R = 6371000.0
+    la = np.radians(lat); lo = np.radians(lon)
+    x = R * lo * np.cos(la.mean()); y = R * la
+    in_albero = np.zeros(n, dtype=bool); in_albero[0] = True
+    dist = np.hypot(x - x[0], y - y[0]); tot = 0.0
+    for _ in range(n - 1):
+        dist[in_albero] = np.inf
+        j = int(np.argmin(dist)); tot += float(dist[j]); in_albero[j] = True
+        dist = np.minimum(dist, np.hypot(x - x[j], y - y[j]))
+    return tot * fattore_tortuosita
+
+
 def build_cluster_color_map(clusters_list):
     """Colore fisso per zona di rete (vedi ZONA_COLORI)."""
     return {cl: ZONA_COLORI.get(cl, "#888888") for cl in clusters_list}
@@ -1005,15 +1027,26 @@ with tab_domanda:
 
         st.markdown("**Utenza**")
         pub_on = st.checkbox("Pubblico", value=True, key="dom_tu_pub")
-        st.caption("Privati (footprint GIS): livello di estensione della rete")
-        liv_est = st.slider("Livello di estensione", 0, 6, 0, key="dom_liv_est",
-                            help="0 = nessun privato. 1-6 = anelli cumulativi di estensione della rete: "
-                                 "include tutti gli edifici privati fino a quel livello, nelle zone attive.")
+        st.caption("Privati (footprint GIS): estensione della rete")
+        _pz = privati[privati["cluster"].isin(selected_clusters)] if not privati.empty else privati
+        _inc = (_pz.groupby("anello")["consumo_annuo_MWh"].sum().reindex(range(1, 7), fill_value=0.0)
+                if not _pz.empty else pd.Series(0.0, index=range(1, 7)))
+        _cum = _inc.cumsum()
+        _liv_utili = [0] + [int(a) for a in range(1, 7) if _inc[a] > 1]
+        def _fmt_liv(l):
+            if l == 0:
+                return "0 · solo pubblici"
+            return f"{l} · +{_cum[l]:,.0f} MWh".replace(",", ".")
+        liv_est = st.select_slider("Livello di estensione", options=_liv_utili, value=0,
+                                   format_func=_fmt_liv, key="dom_liv_est",
+                                   help="Anelli cumulativi: ogni livello aggiunge i privati di quell'anello "
+                                        "nelle zone attive. Sono mostrati solo i livelli che aggiungono "
+                                        "edifici alle zone selezionate.")
         selected_privati = []
         if liv_est > 0:
             selected_privati = buildings.loc[
                 (buildings["tipo_utenza"] == "Privato (potenziale)")
-                & (buildings["anello"] <= liv_est), "edificio"].tolist()
+                & (buildings["anello"] <= liv_est) & (buildings["anello"] > 0), "edificio"].tolist()
 
         fattore_correzione = 100
         if liv_est > 0:
@@ -1039,8 +1072,8 @@ with tab_domanda:
         )
 
     mask_building = (buildings["cluster"].isin(selected_clusters)
-                     & buildings["tipologia"].isin(selected_tip)
-                     & (((buildings["tipo_utenza"] == "Pubblico") & pub_on)
+                     & (((buildings["tipo_utenza"] == "Pubblico") & pub_on
+                         & buildings["tipologia"].isin(selected_tip))
                         | buildings["edificio"].isin(selected_privati)))
     selected_buildings = buildings.loc[mask_building, "edificio"].tolist()
 
@@ -1136,7 +1169,64 @@ with tab_domanda:
                 st.plotly_chart(fig_map, use_container_width=True)
                 _senza = bsel.shape[0] - bmap.shape[0]
                 if _senza > 0:
-                    st.caption(f"{_senza} edifici senza coordinate non mostrati (es. privati: arriveranno dal file Excel).")
+                    st.caption(f"{_senza} edifici senza coordinate non mostrati.")
+
+            # --- Densità termica lineare per zona ed estensione ---
+            if not privati.empty:
+                st.markdown("##### 📏 Densità termica lineare (quanto rende il tubo)")
+                st.caption("Per ogni zona e livello di estensione: lunghezza indicativa della rete "
+                           "(albero minimo tra gli edifici × tortuosità 1,35) e **densità lineare** = "
+                           "MWh/anno per metro di rete. È l'indicatore chiave di fattibilità del TLR: "
+                           "sotto ~1,2 MWh/(m·a) la rete fatica a ripagarsi, sopra ~2 è buona.")
+                cD1, cD2 = st.columns(2)
+                costo_m_rete = cD1.slider("Costo rete (€/m di trincea)", 200, 1500, 600, step=50,
+                                          key="dom_costo_rete",
+                                          help="Posa di tubazione preisolata in trincea, valore tipico per centro urbano.")
+                tasso_all = cD2.slider("Tasso di allacciamento privati (%)", 10, 100, 100, step=5,
+                                       key="dom_tasso_all",
+                                       help="Quota di edifici privati che si allaccia davvero. Riduce la densità: "
+                                            "la rete resta lunga uguale, l'energia venduta cala.")
+                righe_d = []
+                for _z in selected_clusters:
+                    _pz2 = privati[privati["cluster"] == _z]
+                    if _pz2.empty:
+                        continue
+                    for _l in [a for a in range(1, 7) if (_pz2["anello"] <= a).any()]:
+                        _s = _pz2[_pz2["anello"] <= _l]
+                        if _s.empty:
+                            continue
+                        _L = stima_lunghezza_rete(_s["lat"].values, _s["lon"].values)
+                        _E = _s["consumo_annuo_MWh"].sum() * (tasso_all / 100.0) * (fattore_correzione / 100.0)
+                        if _L < 1:
+                            continue
+                        righe_d.append({"Zona": _z, "Livello": _l, "Edifici": len(_s),
+                                        "Domanda (MWh/a)": round(_E), "Rete (m)": round(_L),
+                                        "Densità (MWh/m·a)": round(_E / _L, 2),
+                                        "CAPEX rete (€)": round(_L * costo_m_rete)})
+                if righe_d:
+                    df_d = pd.DataFrame(righe_d)
+                    fig_d = go.Figure()
+                    for _z in df_d["Zona"].unique():
+                        _sub = df_d[df_d["Zona"] == _z]
+                        fig_d.add_trace(go.Scatter(x=_sub["Livello"], y=_sub["Densità (MWh/m·a)"],
+                                                   mode="lines+markers", name=_z,
+                                                   line=dict(color=CLUSTER_COLORS.get(_z, "#888"), width=2.5),
+                                                   marker=dict(size=9)))
+                    fig_d.add_hline(y=2.0, line_dash="dot", line_color="#3FA34D",
+                                    annotation_text="buona (2,0)", annotation_position="top left")
+                    fig_d.add_hline(y=1.2, line_dash="dot", line_color="#E63946",
+                                    annotation_text="soglia critica (1,2)", annotation_position="bottom left")
+                    fig_d.update_layout(height=350, xaxis_title="Livello di estensione",
+                                        yaxis_title="Densità lineare (MWh per metro di rete, anno)",
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                        margin=dict(t=30, b=10))
+                    st.plotly_chart(fig_d, use_container_width=True)
+                    st.dataframe(df_d, use_container_width=True, hide_index=True)
+                    _tot_L = df_d[df_d["Livello"] == max(liv_est, 1)]["Rete (m)"].sum()
+                    if liv_est > 0 and _tot_L > 0:
+                        st.caption(f"Al livello **{liv_est}** nelle zone attive: rete ≈ **{_tot_L:,.0f} m**, "
+                                   f"CAPEX rete ≈ **{_tot_L*costo_m_rete:,.0f} €** "
+                                   f"(non incluso nel LCOH di produzione della scheda Dimensionamento).".replace(",", "."))
 
             fig = go.Figure()
             cluster_nel_grafico = [c for c in selected_clusters if c in agg_cluster["cluster"].unique()]
