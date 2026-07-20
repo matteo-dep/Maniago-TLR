@@ -76,6 +76,9 @@ ZONA_COLORI = {
     "Zona 4 - Centro":    "#9B5DE5",   # viola
     "Zona 5 - Ovest":     "#3FA34D",   # verde
 }
+# la frazione di Campagna (a est di questa longitudine) è ESCLUSA dall'analisi:
+# troppo lontana e isolata (~2,4 km dalla centrale, densità lineare ~0,04 MWh/(m·a))
+CAMPAGNA_LON_MIN = 12.73
 
 
 def _anelli_zona(geom):
@@ -109,6 +112,8 @@ def zona_da_coordinate(lat, lon, zone_poly):
     """Nome della zona che contiene il punto, altrimenti None."""
     if lat is None or lon is None or (isinstance(lat, float) and np.isnan(lat)):
         return None
+    if lon is not None and lon > CAMPAGNA_LON_MIN:      # frazione di Campagna: esclusa
+        return "__ESCLUSO__"
     for zid, anelli in zone_poly.items():
         for r in anelli:
             if _punto_in_anello(lon, lat, r):
@@ -606,6 +611,10 @@ def load_data():
                 z = min(_centri, key=lambda k: (_centri[k][0] - r.lat) ** 2 + (_centri[k][1] - r.lon) ** 2)
             _out.append(z if z else "Zona 4 - Centro")
         buildings["cluster"] = _out
+        # frazione di Campagna: fuori analisi (isolata, non allacciabile in modo sensato)
+        _esclusi = buildings["cluster"] == "__ESCLUSO__"
+        if _esclusi.any():
+            buildings = buildings[~_esclusi].copy()
     else:
         # senza confini: mappo comunque i vecchi nomi sui nuovi, così i default restano validi
         buildings["cluster"] = buildings["cluster"].replace({
