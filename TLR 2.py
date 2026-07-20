@@ -1175,6 +1175,7 @@ with tab_domanda:
 
             # --- Mappa degli edifici serviti ---
             bsel = buildings[buildings["edificio"].isin(selected_buildings)].copy()
+            bsel_all = buildings[buildings["tipo_utenza"] == "Pubblico"].copy()
             bmap = bsel.dropna(subset=["lat", "lon"]) if "lat" in bsel.columns else bsel.iloc[0:0]
             if not bmap.empty:
                 st.markdown("##### 🗺️ Mappa degli edifici serviti")
@@ -1223,6 +1224,68 @@ with tab_domanda:
                 _senza = bsel.shape[0] - bmap.shape[0]
                 if _senza > 0:
                     st.caption(f"{_senza} edifici senza coordinate non mostrati.")
+
+                # --- Mappa di densità della domanda termica ---
+                st.markdown("##### 🔥 Densità della domanda termica")
+                dc1, dc2 = st.columns([2, 1])
+                vista_dens = dc1.radio("Cosa mostrare",
+                                       ["Potenziale totale (tutti gli edifici)", "Solo selezionati"],
+                                       horizontal=True, key="dom_dens_vista",
+                                       help="Il potenziale totale serve a decidere DOVE conviene estendere: "
+                                            "mostra la densità a prescindere da cosa hai spuntato.")
+                cella_m = dc2.select_slider("Cella (m)", options=[100, 150, 200], value=150, key="dom_dens_cella")
+                _pts = []
+                if vista_dens.startswith("Potenziale"):
+                    if not privati.empty:
+                        _pts.append(privati[["lat", "lon", "consumo_annuo_MWh"]])
+                    _pts.append(bsel_all[["lat", "lon", "consumo_annuo_MWh"]].dropna(subset=["lat", "lon"]))
+                else:
+                    _pts.append(bmap[["lat", "lon", "consumo_annuo_MWh"]])
+                    if sel_priv_zone and not privati.empty:
+                        _q = privati[privati["cluster"].isin(sel_priv_zone)].copy()
+                        _q["consumo_annuo_MWh"] = _q["consumo_annuo_MWh"] * fattore_correzione / 100.0
+                        _pts.append(_q[["lat", "lon", "consumo_annuo_MWh"]])
+                _pts = pd.concat(_pts, ignore_index=True).dropna(subset=["lat", "lon"])
+                if _pts.empty:
+                    st.info("Nessun edificio georeferenziato da mostrare.")
+                else:
+                    _la0 = float(_pts["lat"].mean())
+                    _dy = cella_m / 111320.0
+                    _dx = cella_m / (111320.0 * np.cos(np.radians(_la0)))
+                    _gi = ((_pts["lat"] - _pts["lat"].min()) / _dy).astype(int)
+                    _gj = ((_pts["lon"] - _pts["lon"].min()) / _dx).astype(int)
+                    _grid = (_pts.assign(gi=_gi, gj=_gj)
+                             .groupby(["gi", "gj"])
+                             .agg(MWh=("consumo_annuo_MWh", "sum"), lat=("lat", "mean"), lon=("lon", "mean"))
+                             .reset_index())
+                    _ha = (cella_m / 100.0) ** 2
+                    _grid["dens"] = _grid["MWh"] / _ha
+                    fig_dens = go.Figure(go.Densitymapbox(
+                        lat=_grid["lat"], lon=_grid["lon"], z=_grid["dens"],
+                        radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.75,
+                        colorbar=dict(title="MWh/(ha·a)"),
+                        hovertemplate="%{z:.0f} MWh/(ha·a)<extra></extra>"))
+                    for _zid, _anelli in carica_zone_confini().items():
+                        _nm = ZONE_NOMI.get(_zid, "")
+                        for _r in _anelli:
+                            fig_dens.add_trace(go.Scattermapbox(
+                                lat=list(_r[:, 1]) + [_r[0, 1]], lon=list(_r[:, 0]) + [_r[0, 0]],
+                                mode="lines", showlegend=False, hoverinfo="skip",
+                                line=dict(width=1.5, color=ZONA_COLORI.get(_nm, "#888")), opacity=0.8))
+                    fig_dens.update_layout(
+                        mapbox=dict(style="carto-darkmatter",
+                                    center=dict(lat=_la0, lon=float(_pts["lon"].mean())), zoom=12.6),
+                        height=460, margin=dict(t=10, b=0, l=0, r=0))
+                    st.plotly_chart(fig_dens, use_container_width=True)
+                    _q90 = _grid["dens"].quantile(0.9)
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Densità mediana", f"{_grid['dens'].median():.0f} MWh/(ha·a)")
+                    m2.metric("Celle sopra 300", f"{(_grid['dens'] > 300).mean()*100:.0f}%",
+                              help="Sopra ~300 MWh/(ha·a) il TLR è generalmente favorevole; 100-300 media; sotto 100 rada")
+                    m3.metric("Energia nelle celle dense", f"{_grid.loc[_grid['dens'] > 300, 'MWh'].sum()/_grid['MWh'].sum()*100:.0f}%",
+                              help="Quota di domanda concentrata nelle celle sopra 300 MWh/(ha·a)")
+                    st.caption(f"Griglia da {cella_m} m ({_ha:.2f} ha per cella). Le aree calde sono quelle dove il "
+                               f"TLR rende di più: è lì che conviene tracciare la dorsale.")
 
 
             fig = go.Figure()
