@@ -19,6 +19,7 @@ Per aggiungere una nuova azienda: aggiungi una riga a maniago_aziende_offerta.cs
 """
 import streamlit as st
 import pandas as pd
+import json
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
@@ -60,18 +61,59 @@ COLOR_NONCOP   = "#9AA0A6"  # grigio       → domanda non coperta
 COLOR_DOMANDA  = "#FFFFFF"  # bianco       → linea della domanda (visibile su sfondo scuro)
 
 
-ZONA_RENAME = {
-    "NE-Centro": "Zona 1 - Maniago centro / NE",
-    "Ex Bioman": "Zona 2 - Ex Bioman",
-    "Ovest":     "Zona 3 - Maniago Ovest",
-    "Campagna":  "Zona 4 - Campagna",
+ZONE_NOMI = {
+    1: "Zona 1 - Comune NE",
+    2: "Zona 2 - Ex Bioman",
+    3: "Zona 3 - Sud",
+    4: "Zona 4 - Centro",
+    5: "Zona 5 - Ovest",
 }
+ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Ex Bioman"]      # zone attive di default
 ZONA_COLORI = {
-    "Zona 1 - Maniago centro / NE": "#2D7DC0",   # blu
-    "Zona 2 - Ex Bioman":           "#E63946",   # rosso
-    "Zona 3 - Maniago Ovest":       "#3FA34D",   # verde
-    "Zona 4 - Campagna":            "#E9C46A",   # giallo
+    "Zona 1 - Comune NE": "#2D7DC0",   # blu
+    "Zona 2 - Ex Bioman": "#E63946",   # rosso
+    "Zona 3 - Sud":       "#E9C46A",   # giallo
+    "Zona 4 - Centro":    "#9B5DE5",   # viola
+    "Zona 5 - Ovest":     "#3FA34D",   # verde
 }
+
+
+def _anelli_zona(geom):
+    """Anelli esterni di un (Multi)Polygon → lista di array Nx2 [lon, lat]."""
+    polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
+    return [np.asarray(p[0], dtype=float) for p in polys]
+
+
+@st.cache_data
+def carica_zone_confini(path="TLR_zones_borders.geojson"):
+    """Poligoni dei confini di zona: {id_zona: [anelli]}. {} se il file manca."""
+    try:
+        gj = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        return {}
+    return {ft["properties"]["id"]: _anelli_zona(ft["geometry"]) for ft in gj["features"]}
+
+
+def _punto_in_anello(lon, lat, ring):
+    x, y = ring[:, 0], ring[:, 1]
+    n = len(x); dentro = False; j = n - 1
+    for i in range(n):
+        if ((y[i] > lat) != (y[j] > lat)) and \
+           (lon < (x[j] - x[i]) * (lat - y[i]) / (y[j] - y[i] + 1e-15) + x[i]):
+            dentro = not dentro
+        j = i
+    return dentro
+
+
+def zona_da_coordinate(lat, lon, zone_poly):
+    """Nome della zona che contiene il punto, altrimenti None."""
+    if lat is None or lon is None or (isinstance(lat, float) and np.isnan(lat)):
+        return None
+    for zid, anelli in zone_poly.items():
+        for r in anelli:
+            if _punto_in_anello(lon, lat, r):
+                return ZONE_NOMI.get(zid)
+    return None
 
 
 def build_cluster_color_map(clusters_list):
@@ -480,6 +522,25 @@ def load_data():
     flussi = pd.read_csv("maniago_flussi_offerta.csv")
     flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
+    # zona geografica dai confini disegnati.
+    # NB: le righe "Residenziale Zona ..." sono vecchie stime aggregate dei privati, ora sostituite
+    # dai footprint GeoJSON: le escludiamo per non contare due volte la domanda.
+    buildings = buildings[~buildings["edificio"].str.startswith("Residenziale Zona")].copy()
+    _zp = carica_zone_confini()
+    if _zp:
+        _centri = {ZONE_NOMI[z]: (np.mean([r[:, 1].mean() for r in a]), np.mean([r[:, 0].mean() for r in a]))
+                   for z, a in _zp.items()}
+        _out = []
+        for r in buildings.itertuples():
+            z = zona_da_coordinate(r.lat, r.lon, _zp)
+            if z is None and not (r.lat is None or (isinstance(r.lat, float) and np.isnan(r.lat))):
+                # fuori dai poligoni ma con coordinate → zona con centro più vicino
+                z = min(_centri, key=lambda k: (_centri[k][0] - r.lat) ** 2 + (_centri[k][1] - r.lon) ** 2)
+            _out.append(z if z else "Zona 4 - Centro")
+        buildings["cluster"] = _out
+    domanda = domanda[domanda["edificio"].isin(buildings["edificio"])].copy()
+    domanda = domanda.drop(columns=["cluster"], errors="ignore").merge(
+        buildings[["edificio", "cluster"]], on="edificio", how="left")
     return buildings, domanda, flussi, pvgis
 
 
@@ -868,8 +929,6 @@ def ottimizza_scenario(dom_arr, scarto_tiep_arr, scartoT_arr, scarto_alta_arr, s
 
 
 buildings, domanda, flussi, pvgis = load_data()
-buildings["cluster"] = buildings["cluster"].replace(ZONA_RENAME)
-domanda["cluster"] = domanda["cluster"].replace(ZONA_RENAME)
 
 st.title("🔥 Maniago TLR — Domanda, Offerta, Dimensionamento")
 st.caption(
@@ -903,7 +962,8 @@ with tab_domanda:
         st.markdown("#### Filtri")
         clusters = sorted(buildings["cluster"].unique())
         CLUSTER_COLORS = build_cluster_color_map(clusters)
-        selected_clusters = [c for c in clusters if st.checkbox(c, value=True, key=f"dom_cl_{c}")]
+        selected_clusters = [c for c in clusters
+                             if st.checkbox(c, value=(c in ZONE_DEFAULT), key=f"dom_cl_{c}")]
 
         st.markdown("**Utenza**")
         pub_on = st.checkbox("Pubblico", value=True, key="dom_tu_pub")
@@ -989,6 +1049,18 @@ with tab_domanda:
             if not bmap.empty:
                 st.markdown("##### 🗺️ Mappa degli edifici serviti")
                 fig_map = go.Figure()
+                # confini delle zone (contorni colorati, sotto ai punti)
+                for _zid, _anelli in carica_zone_confini().items():
+                    _nome = ZONE_NOMI.get(_zid, f"Zona {_zid}")
+                    _att = _nome in selected_clusters
+                    for _r in _anelli:
+                        fig_map.add_trace(go.Scattermapbox(
+                            lat=list(_r[:, 1]) + [_r[0, 1]], lon=list(_r[:, 0]) + [_r[0, 0]],
+                            mode="lines", name=f"confine {_nome}", legendgroup=f"z{_zid}",
+                            showlegend=False, hoverinfo="skip",
+                            line=dict(width=2.5 if _att else 1,
+                                      color=ZONA_COLORI.get(_nome, "#888888")),
+                            opacity=0.95 if _att else 0.35))
                 for cl in selected_clusters:
                     sub = bmap[bmap["cluster"] == cl]
                     if sub.empty:
