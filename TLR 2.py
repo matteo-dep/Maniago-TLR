@@ -116,6 +116,47 @@ def zona_da_coordinate(lat, lon, zone_poly):
     return None
 
 
+AZIENDE_COORD = {
+    "ZML":         (46.1478, 12.7139),
+    "Pietro Rosa": (46.1432, 12.7215),
+    "Pandolfo":    (46.1485, 12.7160),
+    "Inossman":    (46.1501, 12.7145),
+}
+# sottocentrale: baricentro ottimo tra ZML e Pandolfo (min. metri di tubo pesati)
+CENTRALE_LAT, CENTRALE_LON = 46.1479, 12.7151
+
+
+def mst_archi(lat, lon, radice=None):
+    """Albero di connessione minimo (Prim) sui punti dati; se 'radice' è (lat,lon) parte da lì.
+    Ritorna (archi, lunghezza_totale_m): archi = lista di ((lat1,lon1),(lat2,lon2),dist_m)."""
+    lat = np.asarray(lat, dtype=float); lon = np.asarray(lon, dtype=float)
+    ok = np.isfinite(lat) & np.isfinite(lon)
+    lat, lon = lat[ok], lon[ok]
+    if radice is not None:
+        lat = np.insert(lat, 0, radice[0]); lon = np.insert(lon, 0, radice[1])
+    n = len(lat)
+    if n < 2:
+        return [], 0.0
+    R = 6371000.0
+    la = np.radians(lat); lo = np.radians(lon)
+    x = R * lo * np.cos(la.mean()); y = R * la
+    dentro = np.zeros(n, dtype=bool); dentro[0] = True
+    dist = np.hypot(x - x[0], y - y[0])
+    padre = np.zeros(n, dtype=int)
+    archi = []; tot = 0.0
+    for _ in range(n - 1):
+        d2 = np.where(dentro, np.inf, dist)
+        j = int(np.argmin(d2))
+        if not np.isfinite(d2[j]):
+            break
+        p = int(padre[j]); tot += float(dist[j]); dentro[j] = True
+        archi.append(((lat[p], lon[p]), (lat[j], lon[j]), float(dist[j])))
+        nd = np.hypot(x - x[j], y - y[j])
+        agg = nd < dist
+        padre[agg] = j; dist = np.minimum(dist, nd)
+    return archi, tot
+
+
 def stima_lunghezza_rete(lat, lon, fattore_tortuosita=1.35):
     """Lunghezza indicativa della rete (m) che collega i punti dati, come albero di
     connessione minimo (MST, algoritmo di Prim) sulle distanze in piano locale.
@@ -1260,16 +1301,9 @@ with tab_domanda:
                              .reset_index())
                     _ha = (cella_m / 100.0) ** 2
                     _grid["dens"] = _grid["MWh"] / _ha
-                    # fig_dens = go.Figure(go.Densitymapbox(
-                    #     lat=_grid["lat"], lon=_grid["lon"], z=_grid["dens"],
-                    #     radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.75,
-                    #     colorbar=dict(title="MWh/(ha·a)"),
-                    #     hovertemplate="%{z:.0f} MWh/(ha·a)<extra></extra>"))
-                    _zmax = float(_grid["dens"].quantile(0.90))
                     fig_dens = go.Figure(go.Densitymapbox(
                         lat=_grid["lat"], lon=_grid["lon"], z=_grid["dens"],
-                        radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.8,
-                        zmin=0, zmax=_zmax,
+                        radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.75,
                         colorbar=dict(title="MWh/(ha·a)"),
                         hovertemplate="%{z:.0f} MWh/(ha·a)<extra></extra>"))
                     for _zid, _anelli in carica_zone_confini().items():
@@ -1424,6 +1458,63 @@ with tab_domanda:
                                         "unita": "Unità"}).sort_values(["Zona", "Unità"], ascending=[True, False])
             st.dataframe(_tab, use_container_width=True, hide_index=True)
 
+        # --- Ipotesi di tracciato della rete dalla sottocentrale ---
+        st.divider()
+        st.markdown("##### 🛤️ Ipotesi di tracciato della rete")
+        st.caption(f"Rete ad albero minimo che parte dalla **sottocentrale** "
+                   f"({CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}, area industriale presso ZML/Pandolfo) e "
+                   f"raggiunge le utenze selezionate. È un'ipotesi di ordine di grandezza: il tracciato "
+                   f"reale segue le strade, qui le lunghezze sono maggiorate del fattore di tortuosità.")
+        _tr = []
+        if not bmap.empty:
+            _tr.append(bmap[["lat", "lon", "consumo_annuo_MWh"]])
+        if sel_priv_zone and not privati.empty:
+            _tr.append(privati[privati["cluster"].isin(sel_priv_zone)][["lat", "lon", "consumo_annuo_MWh"]])
+        _tr = pd.concat(_tr, ignore_index=True).dropna(subset=["lat", "lon"]) if _tr else pd.DataFrame()
+        if _tr.empty:
+            st.info("Seleziona almeno un'utenza georeferenziata per vedere il tracciato.")
+        else:
+            tc1, tc2 = st.columns(2)
+            tort = tc1.slider("Fattore di tortuosità", 1.0, 2.0, 1.35, step=0.05, key="dom_tort",
+                              help="I tubi seguono le strade: 1,35 è un valore tipico urbano.")
+            costo_m_tr = tc2.slider("Costo rete (€/m)", 200, 1500, 600, step=50, key="dom_costo_tr")
+            _archi, _len = mst_archi(_tr["lat"].values, _tr["lon"].values,
+                                     radice=(CENTRALE_LAT, CENTRALE_LON))
+            _len_t = _len * tort
+            _lat_l, _lon_l = [], []
+            for (a, b, _d) in _archi:
+                _lat_l += [a[0], b[0], None]; _lon_l += [a[1], b[1], None]
+            fig_tr = go.Figure()
+            fig_tr.add_trace(go.Scattermapbox(lat=_lat_l, lon=_lon_l, mode="lines",
+                                              line=dict(width=2, color="#FF4B4B"),
+                                              name="Tracciato ipotizzato", hoverinfo="skip"))
+            fig_tr.add_trace(go.Scattermapbox(
+                lat=_tr["lat"], lon=_tr["lon"], mode="markers", name="Utenze",
+                marker=dict(size=5, color="#22C3DD", opacity=0.7),
+                text=_tr["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a", hoverinfo="text"))
+            for _n, (_la, _lo) in AZIENDE_COORD.items():
+                fig_tr.add_trace(go.Scattermapbox(lat=[_la], lon=[_lo], mode="markers",
+                                                  name=_n, marker=dict(size=9, color="#F5C518"),
+                                                  text=_n, hoverinfo="text", showlegend=False))
+            fig_tr.add_trace(go.Scattermapbox(
+                lat=[CENTRALE_LAT], lon=[CENTRALE_LON], mode="markers+text", name="Sottocentrale",
+                marker=dict(size=18, color="#FF9F1C"), text=["CENTRALE"], textposition="top right",
+                textfont=dict(size=13, color="#FF9F1C")))
+            _clat = (float(_tr["lat"].mean()) + CENTRALE_LAT) / 2
+            _clon = (float(_tr["lon"].mean()) + CENTRALE_LON) / 2
+            fig_tr.update_layout(mapbox=dict(style="open-street-map",
+                                             center=dict(lat=_clat, lon=_clon), zoom=12.2),
+                                 height=560, margin=dict(t=10, b=0, l=0, r=0),
+                                 legend=dict(orientation="h", yanchor="bottom", y=1.01))
+            st.plotly_chart(fig_tr, use_container_width=True)
+            _dom_tr = float(_tr["consumo_annuo_MWh"].sum())
+            t1, t2, t3, t4 = st.columns(4)
+            t1.metric("Lunghezza rete", f"{_len_t/1000:.1f} km", help=f"{_len_t:,.0f} m con tortuosità {tort}".replace(",", "."))
+            t2.metric("Utenze collegate", f"{len(_tr):,}".replace(",", "."))
+            t3.metric("CAPEX rete", f"{_len_t*costo_m_tr/1e6:.1f} M€")
+            t4.metric("Densità lineare", f"{_dom_tr/_len_t:.2f} MWh/(m·a)",
+                      help="sotto ~1,2 la rete fatica a ripagarsi; sopra ~2 è buona")
+
 
 # =============================================================================
 # TAB 2 - OFFERTA
@@ -1489,6 +1580,61 @@ with tab_offerta:
     off = off[(off["month"] >= month_range_o[0]) & (off["month"] <= month_range_o[1])]
 
     with col_contenuto2:
+        st.markdown("#### 🏭 Sorgenti di scarto e sottocentrale")
+        st.caption(f"La **sottocentrale** (HP + accumuli) è ipotizzata in area industriale presso "
+                   f"ZML/Pandolfo: è lì che conviene, perché il calore di scarto a bassa temperatura "
+                   f"richiede portate elevate e va sollevato subito prima di essere trasportato in città.")
+        _sel_az = sorted(set(a for a in AZIENDE_COORD if not off.empty
+                             and off["azienda"].astype(str).str.startswith(a).any())) if not off.empty else []
+        _pw = (off.groupby("azienda")["MWh"].sum() if not off.empty else pd.Series(dtype=float))
+        fig_src = go.Figure()
+        for _n, (_la, _lo) in AZIENDE_COORD.items():
+            _match = [k for k in _pw.index if str(k).startswith(_n)]
+            _e = float(_pw[_match].sum()) if _match else 0.0
+            _att = _e > 0
+            fig_src.add_trace(go.Scattermapbox(
+                lat=[_la, CENTRALE_LAT], lon=[_lo, CENTRALE_LON], mode="lines",
+                line=dict(width=(2 + 6 * min(_e / max(_pw.sum(), 1), 1)) if _att else 1,
+                          color=COLOR_OFFERTA if _att else "#666666"),
+                showlegend=False, hoverinfo="skip", opacity=0.9 if _att else 0.35))
+            fig_src.add_trace(go.Scattermapbox(
+                lat=[_la], lon=[_lo], mode="markers+text",
+                marker=dict(size=(12 + 22 * min(_e / max(_pw.sum(), 1), 1)) if _att else 10,
+                            color=COLOR_OFFERTA if _att else "#777777"),
+                text=[_n], textposition="top right", textfont=dict(size=12, color="#DDDDDD"),
+                name=_n, hovertext=[f"{_n}<br>{_e:,.0f} MWh/a nel periodo".replace(",", ".")
+                                    if _att else f"{_n}<br>nessun flusso selezionato"],
+                hoverinfo="text", showlegend=False))
+        fig_src.add_trace(go.Scattermapbox(
+            lat=[CENTRALE_LAT], lon=[CENTRALE_LON], mode="markers+text",
+            marker=dict(size=20, color="#FF9F1C"), text=["SOTTOCENTRALE"], textposition="bottom center",
+            textfont=dict(size=13, color="#FF9F1C"), name="Sottocentrale",
+            hovertext=[f"Sottocentrale<br>{CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}"], hoverinfo="text",
+            showlegend=False))
+        fig_src.update_layout(
+            mapbox=dict(style="open-street-map",
+                        center=dict(lat=np.mean([v[0] for v in AZIENDE_COORD.values()] + [CENTRALE_LAT]),
+                                    lon=np.mean([v[1] for v in AZIENDE_COORD.values()] + [CENTRALE_LON])),
+                        zoom=14.2),
+            height=430, margin=dict(t=10, b=0, l=0, r=0))
+        st.plotly_chart(fig_src, use_container_width=True)
+        if not off.empty:
+            _R = 6371000.0
+            _dist = {n: _R * np.hypot(np.radians(v[0] - CENTRALE_LAT),
+                                      np.radians(v[1] - CENTRALE_LON) * np.cos(np.radians(46.15)))
+                     for n, v in AZIENDE_COORD.items()}
+            _rows = []
+            for _n in AZIENDE_COORD:
+                _m = [k for k in _pw.index if str(k).startswith(_n)]
+                if not _m:
+                    continue
+                _rows.append({"Azienda": _n, "Energia periodo (MWh)": round(float(_pw[_m].sum())),
+                              "Distanza dalla centrale (m)": round(_dist[_n])})
+            if _rows:
+                st.dataframe(pd.DataFrame(_rows).sort_values("Energia periodo (MWh)", ascending=False),
+                             use_container_width=True, hide_index=True)
+        st.divider()
+
         if off.empty:
             st.warning("Nessuna fonte selezionata.")
         else:
