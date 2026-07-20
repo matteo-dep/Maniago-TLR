@@ -1260,9 +1260,16 @@ with tab_domanda:
                              .reset_index())
                     _ha = (cella_m / 100.0) ** 2
                     _grid["dens"] = _grid["MWh"] / _ha
+                    # fig_dens = go.Figure(go.Densitymapbox(
+                    #     lat=_grid["lat"], lon=_grid["lon"], z=_grid["dens"],
+                    #     radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.75,
+                    #     colorbar=dict(title="MWh/(ha·a)"),
+                    #     hovertemplate="%{z:.0f} MWh/(ha·a)<extra></extra>"))
+                    _zmax = float(_grid["dens"].quantile(0.90))
                     fig_dens = go.Figure(go.Densitymapbox(
                         lat=_grid["lat"], lon=_grid["lon"], z=_grid["dens"],
-                        radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.75,
+                        radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.8,
+                        zmin=0, zmax=_zmax,
                         colorbar=dict(title="MWh/(ha·a)"),
                         hovertemplate="%{z:.0f} MWh/(ha·a)<extra></extra>"))
                     for _zid, _anelli in carica_zone_confini().items():
