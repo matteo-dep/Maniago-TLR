@@ -862,8 +862,8 @@ with tab_domanda:
       """QM Fig. 12.2: da 10-20 utenze ~95%, oltre 100 ~60%. Interpolazione logaritmica."""
       if n_utenze <= 1: return 1.0
         n = np.clip(n_utenze, 1, 500)
-        return float(np.interp(np.log(n), np.log([1, 10, 20, 100, 500]),
-                                           [1.0, 0.98, 0.95, 0.60, 0.55]))
+      return float(np.interp(np.log(n), np.log([1, 10, 20, 100, 500]),
+                                         [1.0, 0.98, 0.95, 0.60, 0.55]))
     
         # conto utenze privato+condominio nelle zone attive
         n_priv_utenze = int(privati[privati["cluster"].isin(sel_priv_zone)].shape[0]) if sel_priv_zone else 0
