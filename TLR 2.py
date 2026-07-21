@@ -1502,18 +1502,35 @@ with tab_dimensionamento:
     off_all = off_all[off_all["id_flusso"].isin(flussi_dim)].copy()
     soil_temp_arr = soil_temp_monthly(pvgis)[idx_h.month.values - 1]
 
-    def capex_hp_kw(pot_kw):
-        p = max(pot_kw / 1000.0, 0.1); pts = [(1, 340), (3, 300), (10, 220)]
-        if p <= 1: return 340
-        if p >= 10: return 220
-        for (p0, c0), (p1, c1) in zip(pts, pts[1:]):
-            if p0 <= p <= p1:
-                return c0 + (np.log(p) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
-        return 220
-    perdita_func = (lambda v: float(np.interp(np.log(np.clip(v, 500, 5000)), [np.log(500), np.log(5000)], [2.0, 1.0])) if v > 0 else 0.0)
-    _maxp = int(picco_kw) + 1000
+    def capex_hp_kw(pot_kw, tipo="alta_T"):
+    """CAPEX chiavi-in-mano HP (€/kW), da IEA DHC TS5 Fact Sheet F6 Tab.4 (Western Europe).
+    tipo:
+      - 'alta_T': lift alto (evaporatore ~25-30 °C → mandata 80 °C), curva "excess heat 25 °C"
+      - 'bassa_T': lift moderato su cascame, curva "excess heat" scalata
+    Riferimenti F6 Tab.4:
+      HP excess heat 25 °C: 1 MW → 1200 €/kW; 3 MW → 840 €/kW; 10 MW → ~700 €/kW.
+    """
+    p_MW = max(pot_kw / 1000.0, 0.1)
+    if tipo == "alta_T":
+        pts = [(0.5, 1400), (1, 1200), (3, 840), (10, 700)]
+    else:  # bassa_T, lift più modesto, macchine ~15% più economiche
+        pts = [(0.5, 1200), (1, 1000), (3, 720), (10, 600)]
+    if p_MW <= pts[0][0]: return pts[0][1]
+    if p_MW >= pts[-1][0]: return pts[-1][1]
+    for (p0, c0), (p1, c1) in zip(pts, pts[1:]):
+        if p0 <= p_MW <= p1:
+            return c0 + (np.log(p_MW) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
 
-    col_ctrl, col_res = st.columns([1, 3])
+    # CAPEX ground loop separato dalla HP: sonde verticali ~50 W/m termico, ~50 €/m sonda
+    if is_hp_par and P_bassa > 0:
+      # dimensiono il campo sonde sul picco della HP bassa (kW termici sorgente)
+      frac_a_ref = max(1.0 - 1.0/cop_alta_ref, 0)
+      p_ground_kw = P_bassa * frac_a_ref  # calore che serve estrarre dal suolo al picco
+      m_sonde = p_ground_kw / 0.05  # 50 W/m → m di sonda
+      capex_ground = m_sonde * 50   # €/m
+    else:
+        capex_ground = 0.0
+    capex_sistema += capex_ground
 
     # =========================== CONTROLLI (sinistra) ===========================
     with col_ctrl:
