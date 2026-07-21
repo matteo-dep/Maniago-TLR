@@ -1591,11 +1591,11 @@ with tab_dimensionamento:
             )
             st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
 
-        # routing (serve all'ottimizzatore qui sotto)
-        q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
-        q_low_bins_eff = q_low_bins.copy()
-        if solare_on:
-            q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low   # solare → fascia più calda dell'accumulo basso
+          # routing (serve all'ottimizzatore qui sotto)
+          q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
+          q_low_bins_eff = q_low_bins.copy()
+          if solare_on:
+              q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low   # solare → fascia più calda dell'accumulo basso
 
         st.markdown("#### 🔎 Ottimizzazione")
         if st.button("Ottimizza scenario", key="dim_btn_opt", use_container_width=True):
