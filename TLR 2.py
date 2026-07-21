@@ -1540,19 +1540,19 @@ with tab_dimensionamento:
       capex_sistema += capex_ground
 
     # =========================== CONTROLLI (sinistra) ===========================
-    with col_ctrl:
-        st.markdown("#### ⚙️ Parametri")
-        T_int = st.slider("Anello intermedio (°C)", 40, 60, 50, key="dim_tint",
-                          help="La HP alta T solleva sempre da qui a mandata. ~45-50°C è l'ottimo tipico.")
-        st.markdown("**Supporto (parallelo)**")
-        backup_tipo = st.radio("Copre il gap con:", ["HP bassa T", "gas", "biomassa"],
-                               key="dim_backup_tipo",
-                               help="Stessa funzione. Solo la HP bassa T recupera i flussi freddi e il ground loop.")
-        is_hp_par = (backup_tipo == "HP bassa T")
-        eta_hp = st.slider("η 2° principio HP (%)", 30, 60, 50, key="dim_eta") / 100.0
-        prezzo_el = st.slider("Prezzo elettricità (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el")
-        antigelo = st.slider("Floor antigelo ground loop (°C)", -5, 10, 0, key="dim_antigelo",
-                             help="L'evaporatore sul suolo non scende sotto questa soglia.")
+      with col_ctrl:
+          st.markdown("#### ⚙️ Parametri")
+          T_int = st.slider("Anello intermedio (°C)", 40, 60, 50, key="dim_tint",
+                            help="La HP alta T solleva sempre da qui a mandata. ~45-50°C è l'ottimo tipico.")
+          st.markdown("**Supporto (parallelo)**")
+          backup_tipo = st.radio("Copre il gap con:", ["HP bassa T", "gas", "biomassa"],
+                                 key="dim_backup_tipo",
+                                 help="Stessa funzione. Solo la HP bassa T recupera i flussi freddi e il ground loop.")
+          is_hp_par = (backup_tipo == "HP bassa T")
+          eta_hp = st.slider("η 2° principio HP (%)", 30, 60, 50, key="dim_eta") / 100.0
+          prezzo_el = st.slider("Prezzo elettricità (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el")
+          antigelo = st.slider("Floor antigelo ground loop (°C)", -5, 10, 0, key="dim_antigelo",
+                               help="L'evaporatore sul suolo non scende sotto questa soglia.")
         if backup_tipo == "gas":
             rend_gas = st.slider("Rendimento caldaia (%)", 85, 98, 92, key="dim_rend_gas") / 100.0
             prezzo_gas = st.slider("Prezzo gas (€/MWh)", 40, 160, 90, key="dim_prezzo_gas")
