@@ -861,7 +861,7 @@ with tab_domanda:
     def coeff_simultaneita_QM(n_utenze):
       """QM Fig. 12.2: da 10-20 utenze ~95%, oltre 100 ~60%. Interpolazione logaritmica."""
       if n_utenze <= 1: return 1.0
-        n = np.clip(n_utenze, 1, 500)
+      n = np.clip(n_utenze, 1, 500)
       return float(np.interp(np.log(n), np.log([1, 10, 20, 100, 500]),
                                          [1.0, 0.98, 0.95, 0.60, 0.55]))
     
