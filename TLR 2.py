@@ -859,7 +859,7 @@ with tab_domanda:
     dom.loc[is_cond, "MWh_ACS"] = dom.loc[is_cond, "MWh_ACS"] * fatt_c
 
     def coeff_simultaneita_QM(n_utenze):
-    """QM Fig. 12.2: da 10-20 utenze ~95%, oltre 100 ~60%. Interpolazione logaritmica."""
+      """QM Fig. 12.2: da 10-20 utenze ~95%, oltre 100 ~60%. Interpolazione logaritmica."""
       if n_utenze <= 1: return 1.0
         n = np.clip(n_utenze, 1, 500)
         return float(np.interp(np.log(n), np.log([1, 10, 20, 100, 500]),
