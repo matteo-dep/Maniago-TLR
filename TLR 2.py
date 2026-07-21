@@ -1569,19 +1569,19 @@ with tab_dimensionamento:
           costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 1000, step=20, key="dim_costo_m3",
                                help="IEA DHC F1 Tab.3 (Sud Europa, <5000 m³ ≈ 1000 €/m³).")
 
-        solare_on = st.checkbox("☀️ Solare nell'accumulo basso", value=False, key="dim_solare_on")
-        solar_low = np.zeros(len(dom_arr)); capex_solare = 0.0; area_sol = 0
-        if solare_on:
-            acs = dom_dim.groupby("datetime")["MWh_ACS"].sum().reindex(idx_h, fill_value=0)
-            est = idx_h.month.isin([6, 7, 8]); acs_est = float(acs[est].sum())
-            pref = genera_offerta_solare(pvgis, 1000.0, 0.30).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0)
-            pref_est = float(pref[est].sum()); area_base = (acs_est / pref_est * 1000.0) if pref_est > 1e-6 else 2000.0
-            quota = st.slider("Quota solare (% ACS estiva)", 0, 300, 100, step=10, key="dim_quota_sol")
-            eff = st.slider("Efficienza collettori (%)", 15, 50, 30, key="dim_eff_sol") / 100.0
-            capex_mq = st.slider("CAPEX solare (€/m²)", 200, 900, 450, step=20, key="dim_capex_sol")
-            area_sol = int(round(area_base * quota / 100.0 * (0.30 / max(eff, 0.01))))
-            solar_low = genera_offerta_solare(pvgis, area_sol, eff).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0).values
-            capex_solare = area_sol * capex_mq
+          solare_on = st.checkbox("☀️ Solare nell'accumulo basso", value=False, key="dim_solare_on")
+          solar_low = np.zeros(len(dom_arr)); capex_solare = 0.0; area_sol = 0
+          if solare_on:
+              acs = dom_dim.groupby("datetime")["MWh_ACS"].sum().reindex(idx_h, fill_value=0)
+              est = idx_h.month.isin([6, 7, 8]); acs_est = float(acs[est].sum())
+              pref = genera_offerta_solare(pvgis, 1000.0, 0.30).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0)
+              pref_est = float(pref[est].sum()); area_base = (acs_est / pref_est * 1000.0) if pref_est > 1e-6 else 2000.0
+              quota = st.slider("Quota solare (% ACS estiva)", 0, 300, 100, step=10, key="dim_quota_sol")
+              eff = st.slider("Efficienza collettori (%)", 15, 50, 30, key="dim_eff_sol") / 100.0
+              capex_mq = st.slider("CAPEX solare (€/m²)", 200, 900, 450, step=20, key="dim_capex_sol")
+              area_sol = int(round(area_base * quota / 100.0 * (0.30 / max(eff, 0.01))))
+              solar_low = genera_offerta_solare(pvgis, area_sol, eff).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0).values
+              capex_solare = area_sol * capex_mq
             if solare_on and not is_hp_par:
               st.warning(
                   "⚠️ Solare attivo con supporto a combustibile: il calore solare finisce "
