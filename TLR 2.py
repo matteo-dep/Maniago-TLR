@@ -1597,12 +1597,12 @@ with tab_dimensionamento:
           if solare_on:
               q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low   # solare → fascia più calda dell'accumulo basso
 
-        st.markdown("#### 🔎 Ottimizzazione")
-        if st.button("Ottimizza scenario", key="dim_btn_opt", use_container_width=True):
-            with st.spinner("LCOH minimo, copertura 100%..."):
-                best = ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
-                                         float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
-                                         backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
+          st.markdown("#### 🔎 Ottimizzazione")
+          if st.button("Ottimizza scenario", key="dim_btn_opt", use_container_width=True):
+              with st.spinner("LCOH minimo, copertura 100%..."):
+                  best = ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
+                                           float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
+                                           backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
                                          prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func, float(antigelo))
             if best:
                 st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
