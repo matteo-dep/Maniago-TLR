@@ -1519,7 +1519,7 @@ with tab_dimensionamento:
     if p_MW >= pts[-1][0]: return pts[-1][1]
     for (p0, c0), (p1, c1) in zip(pts, pts[1:]):
         if p0 <= p_MW <= p1:
-      return c0 + (np.log(p_MW) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
+    return c0 + (np.log(p_MW) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
 
     # CAPEX ground loop separato dalla HP: sonde verticali ~50 W/m termico, ~50 €/m sonda
     if is_hp_par and P_bassa > 0:
