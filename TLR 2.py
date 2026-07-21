@@ -858,6 +858,24 @@ with tab_domanda:
     dom.loc[is_cond, "MWh_riscaldamento"] = dom.loc[is_cond, "MWh_riscaldamento"] * fatt_c
     dom.loc[is_cond, "MWh_ACS"] = dom.loc[is_cond, "MWh_ACS"] * fatt_c
 
+    def coeff_simultaneita_QM(n_utenze):
+    """QM Fig. 12.2: da 10-20 utenze ~95%, oltre 100 ~60%. Interpolazione logaritmica."""
+    if n_utenze <= 1: return 1.0
+    n = np.clip(n_utenze, 1, 500)
+    return float(np.interp(np.log(n), np.log([1, 10, 20, 100, 500]),
+                                       [1.0, 0.98, 0.95, 0.60, 0.55]))
+
+    # conto utenze privato+condominio nelle zone attive
+    n_priv_utenze = int(privati[privati["cluster"].isin(sel_priv_zone)].shape[0]) if sel_priv_zone else 0
+    n_cond_utenze = int(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum()) if sel_cond_zone else 0
+    n_privati_tot = n_priv_utenze + n_cond_utenze
+    
+    f_sim = coeff_simultaneita_QM(n_privati_tot) if n_privati_tot > 0 else 1.0
+    
+    # la contemporaneità agisce sul PICCO (energia annua invariata): equivale a "smussare"
+    # la punta ridistribuendo una piccola quota di energia sulle ore adiacenti.
+    # Approssimazione operativa: applico f_sim al carico privato solo nelle ore sopra il 90° percentile.
+
     with col_contenuto:
         if dom.empty or not (show_risc or show_acs):
             st.warning("Nessun dato da mostrare: controlla i filtri a sinistra.")
