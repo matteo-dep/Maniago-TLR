@@ -1604,15 +1604,15 @@ with tab_dimensionamento:
                                            float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
                                            backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
                                          prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func, float(antigelo))
-            if best:
-                st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
-                st.session_state["dim_p_bassa"] = int(round(best["P_bassa"] / 100) * 100)
-                st.session_state["dim_p_bk"] = int(round(best["P_bk"] / 100) * 100)
-                st.session_state["dim_v_hot"] = int(round(best["v_hot"] / 50) * 50)
-                st.session_state["dim_v_int"] = int(round(best["v_int"] / 50) * 50)
-                st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
-                st.session_state["_opt_casc"] = best
-                st.rerun()
+          if best:
+              st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
+              st.session_state["dim_p_bassa"] = int(round(best["P_bassa"] / 100) * 100)
+              st.session_state["dim_p_bk"] = int(round(best["P_bk"] / 100) * 100)
+              st.session_state["dim_v_hot"] = int(round(best["v_hot"] / 50) * 50)
+              st.session_state["dim_v_int"] = int(round(best["v_int"] / 50) * 50)
+              st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
+              st.session_state["_opt_casc"] = best
+              st.rerun()
 
         st.markdown("**Taglie** (dall'ottimo, ritoccabili)")
         for k, dv in [("dim_p_alta", int(picco_kw)), ("dim_p_bassa", int(picco_kw * 0.8)), ("dim_p_bk", int(picco_kw))]:
