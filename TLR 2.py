@@ -1614,20 +1614,20 @@ with tab_dimensionamento:
               st.session_state["_opt_casc"] = best
               st.rerun()
 
-        st.markdown("**Taglie** (dall'ottimo, ritoccabili)")
-        for k, dv in [("dim_p_alta", int(picco_kw)), ("dim_p_bassa", int(picco_kw * 0.8)), ("dim_p_bk", int(picco_kw))]:
-            st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), _maxp))
-        for k, dv in [("dim_v_hot", 0), ("dim_v_int", 800), ("dim_v_low", 400)]:
-            st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), 4000))
-        P_alta = st.slider("HP alta T (kW)", 0, _maxp, step=100, key="dim_p_alta")
-        if is_hp_par:
-            P_bassa = st.slider("HP bassa T (kW)", 0, _maxp, step=100, key="dim_p_bassa"); P_bk = 0
-        else:
-            P_bassa = 0
-            P_bk = st.slider(f"Caldaia {backup_tipo} (kW)", 0, _maxp, step=100, key="dim_p_bk")
-        V_hot = st.slider("Accumulo CALDO (m³)", 0, 4000, step=50, key="dim_v_hot")
-        V_int = st.slider("Accumulo INTERMEDIO (m³)", 0, 4000, step=50, key="dim_v_int")
-        V_low = st.slider("Accumulo BASSO (m³)", 0, 4000, step=50, key="dim_v_low")
+          st.markdown("**Taglie** (dall'ottimo, ritoccabili)")
+          for k, dv in [("dim_p_alta", int(picco_kw)), ("dim_p_bassa", int(picco_kw * 0.8)), ("dim_p_bk", int(picco_kw))]:
+              st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), _maxp))
+          for k, dv in [("dim_v_hot", 0), ("dim_v_int", 800), ("dim_v_low", 400)]:
+              st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), 4000))
+          P_alta = st.slider("HP alta T (kW)", 0, _maxp, step=100, key="dim_p_alta")
+          if is_hp_par:
+              P_bassa = st.slider("HP bassa T (kW)", 0, _maxp, step=100, key="dim_p_bassa"); P_bk = 0
+          else:
+              P_bassa = 0
+              P_bk = st.slider(f"Caldaia {backup_tipo} (kW)", 0, _maxp, step=100, key="dim_p_bk")
+          V_hot = st.slider("Accumulo CALDO (m³)", 0, 4000, step=50, key="dim_v_hot")
+          V_int = st.slider("Accumulo INTERMEDIO (m³)", 0, 4000, step=50, key="dim_v_int")
+          V_low = st.slider("Accumulo BASSO (m³)", 0, 4000, step=50, key="dim_v_low")
 
     # =========================== CALCOLO ===========================
     perd = perdita_func(max(V_hot, V_int, V_low))
