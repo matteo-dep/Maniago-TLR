@@ -1503,13 +1503,13 @@ with tab_dimensionamento:
     soil_temp_arr = soil_temp_monthly(pvgis)[idx_h.month.values - 1]
 
     def capex_hp_kw(pot_kw, tipo="alta_T"):
-    """CAPEX chiavi-in-mano HP (€/kW), da IEA DHC TS5 Fact Sheet F6 Tab.4 (Western Europe).
-    tipo:
-      - 'alta_T': lift alto (evaporatore ~25-30 °C → mandata 80 °C), curva "excess heat 25 °C"
-      - 'bassa_T': lift moderato su cascame, curva "excess heat" scalata
-    Riferimenti F6 Tab.4:
-      HP excess heat 25 °C: 1 MW → 1200 €/kW; 3 MW → 840 €/kW; 10 MW → ~700 €/kW.
-    """
+      """CAPEX chiavi-in-mano HP (€/kW), da IEA DHC TS5 Fact Sheet F6 Tab.4 (Western Europe).
+      tipo:
+        - 'alta_T': lift alto (evaporatore ~25-30 °C → mandata 80 °C), curva "excess heat 25 °C"
+        - 'bassa_T': lift moderato su cascame, curva "excess heat" scalata
+      Riferimenti F6 Tab.4:
+        HP excess heat 25 °C: 1 MW → 1200 €/kW; 3 MW → 840 €/kW; 10 MW → ~700 €/kW.
+      """
     p_MW = max(pot_kw / 1000.0, 0.1)
     if tipo == "alta_T":
         pts = [(0.5, 1400), (1, 1200), (3, 840), (10, 700)]
