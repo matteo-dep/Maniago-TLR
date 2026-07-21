@@ -1446,6 +1446,37 @@ with tab_dimensionamento:
     dom_dim_series = dom_dim.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum().sum(axis=1)
     idx_h = dom_dim_series.index
     dom_arr = dom_dim_series.values
+        # --- perdite di rete (QM Handbook Fig. 12.3, digitalizzata) ---
+    _rete = st.session_state.get("_rete_info", {})
+    _dens_lin = _rete.get("densita", 2.0) if _rete else 2.0
+    
+    # T media rete = media tra mandata e ritorno; la Fig. 12.3 dà % perdite in funzione della densità
+    # per due livelli di T rete (~65 °C e ~90 °C). Interpolo linearmente sulla T media.
+    def perdite_pct_rete(densita_MWh_m_a, T_media_rete_C):
+        # punti approssimati dalla Fig. 12.3 QM: (densità, % perdite) a T=65 °C e T=90 °C
+        dens = np.array([0.6, 1.0, 1.5, 2.0, 3.0, 5.0])
+        perd_65 = np.array([22, 15, 11, 8.5, 6, 4])   # %, 65/50 °C circa
+        perd_90 = np.array([32, 22, 16, 12, 8.5, 6])  # %, 90/70 °C circa
+        d = np.clip(densita_MWh_m_a, dens[0], dens[-1])
+        p65 = np.interp(d, dens, perd_65)
+        p90 = np.interp(d, dens, perd_90)
+        # interpolo linearmente sulla T media
+        T = np.clip(T_media_rete_C, 65, 90)
+        return p65 + (p90 - p65) * (T - 65) / (90 - 65)
+    
+    T_media = (T_mandata_ideale + T_ritorno_ideale) / 2
+    perd_pct = perdite_pct_rete(_dens_lin, T_media)
+    fatt_lordo = 1 + perd_pct / 100.0
+    
+    # dom_arr diventa la DOMANDA ALLA CENTRALE (utenti + perdite)
+    dom_arr = dom_arr * fatt_lordo
+    dom_tot = float(dom_arr.sum())
+    picco_kw = float(dom_arr.max()) * 1000.0
+    
+    st.caption(f"📉 Perdite di rete stimate: **{perd_pct:.1f}%** "
+               f"(densità {_dens_lin:.2f} MWh/(m·a), T media {T_media:.0f} °C — QM Fig. 12.3). "
+               f"La domanda alla centrale è **{fatt_lordo:.3f}×** quella alle utenze.")
+########################BLOBBO INSERITO 21/07##################################################  
     dom_tot = float(dom_arr.sum())
     picco_kw = float(dom_arr.max()) * 1000.0
     pinch_dim = st.session_state.get("_off_pinch", 5.0)
