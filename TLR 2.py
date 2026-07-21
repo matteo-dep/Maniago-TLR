@@ -866,11 +866,11 @@ with tab_domanda:
                                          [1.0, 0.98, 0.95, 0.60, 0.55]))
     
         # conto utenze privato+condominio nelle zone attive
-        n_priv_utenze = int(privati[privati["cluster"].isin(sel_priv_zone)].shape[0]) if sel_priv_zone else 0
-        n_cond_utenze = int(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum()) if sel_cond_zone else 0
-        n_privati_tot = n_priv_utenze + n_cond_utenze
+    n_priv_utenze = int(privati[privati["cluster"].isin(sel_priv_zone)].shape[0]) if sel_priv_zone else 0
+    n_cond_utenze = int(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum()) if sel_cond_zone else 0
+    n_privati_tot = n_priv_utenze + n_cond_utenze
         
-        f_sim = coeff_simultaneita_QM(n_privati_tot) if n_privati_tot > 0 else 1.0
+    f_sim = coeff_simultaneita_QM(n_privati_tot) if n_privati_tot > 0 else 1.0
         
         # la contemporaneità agisce sul PICCO (energia annua invariata): equivale a "smussare"
         # la punta ridistribuendo una piccola quota di energia sulle ore adiacenti.
