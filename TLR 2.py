@@ -1582,14 +1582,14 @@ with tab_dimensionamento:
               area_sol = int(round(area_base * quota / 100.0 * (0.30 / max(eff, 0.01))))
               solar_low = genera_offerta_solare(pvgis, area_sol, eff).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0).values
               capex_solare = area_sol * capex_mq
-            if solare_on and not is_hp_par:
-              st.warning(
-                  "⚠️ Solare attivo con supporto a combustibile: il calore solare finisce "
-                  "nella fascia più calda dell'accumulo basso, ma senza HP bassa T resta "
-                  "inutilizzato. Considera se aggiungere HP bassa T o instradare il solare "
-                  "come preriscaldo del ritorno rete (non ancora implementato)."
-              )
-              st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
+          if solare_on and not is_hp_par:
+            st.warning(
+                "⚠️ Solare attivo con supporto a combustibile: il calore solare finisce "
+                "nella fascia più calda dell'accumulo basso, ma senza HP bassa T resta "
+                "inutilizzato. Considera se aggiungere HP bassa T o instradare il solare "
+                "come preriscaldo del ritorno rete (non ancora implementato)."
+            )
+            st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
 
         # routing (serve all'ottimizzatore qui sotto)
         q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
