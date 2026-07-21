@@ -1510,16 +1510,16 @@ with tab_dimensionamento:
       Riferimenti F6 Tab.4:
         HP excess heat 25 °C: 1 MW → 1200 €/kW; 3 MW → 840 €/kW; 10 MW → ~700 €/kW.
       """
-    p_MW = max(pot_kw / 1000.0, 0.1)
-    if tipo == "alta_T":
-        pts = [(0.5, 1400), (1, 1200), (3, 840), (10, 700)]
-    else:  # bassa_T, lift più modesto, macchine ~15% più economiche
-        pts = [(0.5, 1200), (1, 1000), (3, 720), (10, 600)]
-    if p_MW <= pts[0][0]: return pts[0][1]
-    if p_MW >= pts[-1][0]: return pts[-1][1]
-    for (p0, c0), (p1, c1) in zip(pts, pts[1:]):
-        if p0 <= p_MW <= p1:
-          return c0 + (np.log(p_MW) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
+      p_MW = max(pot_kw / 1000.0, 0.1)
+      if tipo == "alta_T":
+          pts = [(0.5, 1400), (1, 1200), (3, 840), (10, 700)]
+      else:  # bassa_T, lift più modesto, macchine ~15% più economiche
+          pts = [(0.5, 1200), (1, 1000), (3, 720), (10, 600)]
+      if p_MW <= pts[0][0]: return pts[0][1]
+      if p_MW >= pts[-1][0]: return pts[-1][1]
+      for (p0, c0), (p1, c1) in zip(pts, pts[1:]):
+          if p0 <= p_MW <= p1:
+            return c0 + (np.log(p_MW) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
 
     # CAPEX ground loop separato dalla HP: sonde verticali ~50 W/m termico, ~50 €/m sonda
     if is_hp_par and P_bassa > 0:
