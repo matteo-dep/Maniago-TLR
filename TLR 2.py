@@ -1528,16 +1528,16 @@ with tab_dimensionamento:
           if p0 <= p_MW <= p1:
             return c0 + (np.log(p_MW) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
 
-    # CAPEX ground loop separato dalla HP: sonde verticali ~50 W/m termico, ~50 €/m sonda
-    if is_hp_par and P_bassa > 0:
-      # dimensiono il campo sonde sul picco della HP bassa (kW termici sorgente)
-      frac_a_ref = max(1.0 - 1.0/cop_alta_ref, 0)
-      p_ground_kw = P_bassa * frac_a_ref  # calore che serve estrarre dal suolo al picco
-      m_sonde = p_ground_kw / 0.05  # 50 W/m → m di sonda
-      capex_ground = m_sonde * 50   # €/m
-    else:
-        capex_ground = 0.0
-    capex_sistema += capex_ground
+      # CAPEX ground loop separato dalla HP: sonde verticali ~50 W/m termico, ~50 €/m sonda
+      if is_hp_par and P_bassa > 0:
+        # dimensiono il campo sonde sul picco della HP bassa (kW termici sorgente)
+        frac_a_ref = max(1.0 - 1.0/cop_alta_ref, 0)
+        p_ground_kw = P_bassa * frac_a_ref  # calore che serve estrarre dal suolo al picco
+        m_sonde = p_ground_kw / 0.05  # 50 W/m → m di sonda
+        capex_ground = m_sonde * 50   # €/m
+      else:
+          capex_ground = 0.0
+      capex_sistema += capex_ground
 
     # =========================== CONTROLLI (sinistra) ===========================
     with col_ctrl:
