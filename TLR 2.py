@@ -233,18 +233,6 @@ def cop_singola(T_src, T_mand, eta):
     Th = float(T_mand) + 273.15
     return eta * Th / np.maximum(Th - Tc, 1.0)
 
-
-def cop_cascata(T_src, T_mand, eta):
-    """COP di una HP a 2 stadi in cascata (sorgente T_src, mandata T_mand, °C).
-    Temperatura intermedia ottima = media geometrica in Kelvin. Array-friendly."""
-    Tc = np.asarray(T_src, dtype=float) + 273.15
-    Th = float(T_mand) + 273.15
-    Ti = np.sqrt(Tc * Th)                        # intermedio ottimo (K)
-    c1 = eta * Ti / np.maximum(Ti - Tc, 1.0)     # stadio basso
-    c2 = eta * Th / np.maximum(Th - Ti, 1.0)     # stadio alto
-    return 1.0 / (1.0 / c2 + (1.0 - 1.0 / c2) / c1)
-
-
 def routing_flussi(off_df, idx_h, mandata, T_int):
     """Instrada ogni flusso-ora per temperatura (ordine di merito):
       T_disp ≥ mandata            → accumulo CALDO (diretto in linea)
@@ -272,6 +260,18 @@ def routing_flussi(off_df, idx_h, mandata, T_int):
         piv = piv.reindex(index=idx_h, columns=range(K), fill_value=0.0).fillna(0.0)
         q_low_bins = piv.values
     return hot.values, intm.values, q_low.values, q_low_bins, bin_T
+
+def cop_singola(T_src, T_mand, eta, lift_min_K=8.0, cop_max=6.5):
+    """COP Carnot × η con lift minimo (mai < lift_min_K) e cap a cop_max.
+    lift_min_K rappresenta il ΔT effettivo minimo del compressore reale
+    (perdite meccaniche, surriscaldamento, sottoraffreddamento).
+    cop_max è la fascia superiore realistica per HP industriali con lift moderato
+    (IEA DHC F6/F10: HP su excess heat 25 °C, lift ~25-40 K, COP 3-5)."""
+    Tc = np.asarray(T_src, dtype=float) + 273.15
+    Th = float(T_mand) + 273.15
+    lift = np.maximum(Th - Tc, lift_min_K)
+    cop = eta * Th / lift
+    return np.minimum(cop, cop_max)
 
 
 def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
@@ -588,6 +588,13 @@ def load_data():
         buildings["lat"] = np.nan; buildings["lon"] = np.nan; buildings["indirizzo"] = ""
     domanda = pd.read_csv("maniago_domanda_oraria_8760h_HDD_reale.csv", parse_dates=["datetime"])
     domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]], on="edificio", how="left")
+  # guardia contro il mismatch calendario domanda vs offerta
+    assert len(HOURS_2024) == 8784, f"HOURS_2024 dovrebbe avere 8784 ore (2024 bisestile), ne ha {len(HOURS_2024)}"
+    if not domanda["datetime"].isin(HOURS_2024).all():
+      n_orfani = (~domanda["datetime"].isin(HOURS_2024)).sum()
+      st.warning(f"⚠️ {n_orfani} timestamp della domanda non trovano riscontro in HOURS_2024: "
+                 f"verranno silenziosamente esclusi dai bilanci. "
+                 f"Rigenerare maniago_domanda_oraria_8760h_HDD_reale.csv su 2024 (8784 ore).")
     flussi = pd.read_csv("maniago_flussi_offerta.csv")
     flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
@@ -719,23 +726,6 @@ def genera_offerta_solare(pvgis_df, area_m2, efficienza):
     df_h["T_disponibile"] = np.nan  # il solare preriscalda il ritorno, non ha una "T disponibile" standalone
     return df_h[["datetime", "fonte", "MWh", "P_kW", "T_disponibile"]]
 
-
-def simula_copertura(dom_s, off_s, capacity_mwh):
-    """Dispatch greedy orario: offerta diretta + carica/scarica accumulo. Ritorna (coperta, sprecata)."""
-    soc, covered, wasted = 0.0, 0.0, 0.0
-    for o, d in zip(off_s.values, dom_s.values):
-        direct = min(o, d)
-        covered += direct
-        d_res, o_res = d - direct, o - direct
-        charge = min(o_res, capacity_mwh - soc)
-        soc += charge
-        wasted += (o_res - charge)
-        discharge = min(d_res, soc)
-        soc -= discharge
-        covered += discharge
-    return covered, wasted
-
-
 def crf(rate, anni):
     """Capital Recovery Factor: quota annua di ammortamento del CAPEX a tasso r su n anni."""
     if anni <= 0:
@@ -743,334 +733,6 @@ def crf(rate, anni):
     if rate <= 0:
         return 1.0 / anni
     return rate / (1.0 - (1.0 + rate) ** (-anni))
-
-
-def dispatch_orario(dom_arr, solare_arr, cap_accumulo_mwh, tecno_disp, potenze_kw):
-    """
-    Dispatch orario con merit order fisso su ciò che resta DOPO lo scarto industriale.
-      dom_arr:    domanda residua oraria (MWh/h) da coprire — già al netto dello scarto utilizzabile
-      solare_arr: produzione solare oraria (MWh/h), non dispacciabile (0 se solare non attivo)
-      cap_accumulo_mwh: capacità accumulo
-      tecno_disp: lista ordinata di tecnologie dispacciabili attive, es. ["Biomassa","Pompa di calore","Gas"]
-      potenze_kw: dict {tecnologia: potenza installata kW}  (None/assente = illimitata)
-    Ritorna: dict con energia annua per tecnologia, ore non coperte, energia non coperta,
-             solare sprecato, e la serie oraria di produzione per ciascuna (per curve di durata).
-    """
-    n = len(dom_arr)
-    soc = 0.0
-    prod = {t: np.zeros(n) for t in (["Solare", "Accumulo"] + tecno_disp)}
-    non_coperta = np.zeros(n)
-    solare_sprecato = 0.0
-    for i in range(n):
-        residuo = dom_arr[i]
-        # 1) solare (non dispacciabile): copre direttamente, surplus carica accumulo
-        sol = solare_arr[i]
-        uso_sol = min(sol, residuo)
-        prod["Solare"][i] = uso_sol
-        residuo -= uso_sol
-        surplus_sol = sol - uso_sol
-        carica = min(surplus_sol, cap_accumulo_mwh - soc)
-        soc += carica
-        solare_sprecato += (surplus_sol - carica)
-        # 2) accumulo scarica
-        scarica = min(residuo, soc)
-        soc -= scarica
-        prod["Accumulo"][i] = scarica
-        residuo -= scarica
-        # 3) dispacciabili in merit order (costo marginale crescente), con limite di potenza
-        for t in tecno_disp:
-            if residuo <= 0:
-                break
-            pmax = potenze_kw.get(t)
-            erogabile = residuo if pmax is None else min(residuo, pmax / 1000.0)
-            prod[t][i] = erogabile
-            residuo -= erogabile
-        non_coperta[i] = max(residuo, 0)
-    return {
-        "prod": prod,
-        "energia": {t: prod[t].sum() for t in prod},
-        "non_coperta_mwh": non_coperta.sum(),
-        "ore_non_coperte": int((non_coperta > 1e-6).sum()),
-        "solare_sprecato_mwh": solare_sprecato,
-        "serie_non_coperta": non_coperta,
-    }
-
-
-def simula_accumulo_tiepido(dom_arr, scarto_pot_arr, scarto_T_arr, volume_m3,
-                            T_min_acc, T_max_acc, dT_evaporatore,
-                            P_hp_kw, cop_reale, P_gas_kw,
-                            architettura="diretta",
-                            backup_cop=None, backup_arr_max=None,
-                            perdita_sett_pct=0.0, T_amb_acc=15.0,
-                            cop_dinamico=False, T_mandata_cop=None, eta_hp_cop=None,
-                            cop_min=2.0, cop_max=8.0, T_ritorno_rete=None):
-    """
-    Simulazione oraria dell'accumulo termico che disaccoppia scarto e HP.
-
-    Due architetture (parametro `architettura`):
-      - "diretta": accumulo TIEPIDO lato sorgente. La HP pesca dall'accumulo e manda
-        DIRETTAMENTE in rete, seguendo la domanda ora per ora. L'accumulo assorbe la
-        variabilità dello SCARTO. La HP deve avere potenza per seguire la domanda.
-      - "carica_accumulo": la HP lavora VERSO l'accumulo caldo (a T mandata) a potenza
-        piatta finché c'è scarto e capienza; la RETE scarica dall'accumulo. L'accumulo
-        assorbe la variabilità della DOMANDA → la HP lavora più costante.
-
-    Backup (parametro generico):
-      - se backup_cop è None → backup termico puro (gas/biomassa): rende q_backup con
-        potenza P_gas_kw, consumo combustibile = q/rendimento (gestito fuori nei costi)
-      - se backup_cop è un numero → backup elettrico (2ª HP su ambiente): rende q_backup
-        con COP=backup_cop, elettricità = q/backup_cop
-      - backup_arr_max: profilo orario di potenza max backup (MWh/h) per fonti non
-        dispacciabili come il solare; se None il backup è dispacciabile a P_gas_kw
-
-    Ritorna dict con serie orarie ed energie annue aggregate. La chiave 'q_gas' /
-    'E_gas' contiene sempre l'energia del BACKUP (qualunque tecnologia sia).
-    """
-    n = len(dom_arr)
-    C_MWh_per_K = volume_m3 * RHO_CP / 1000.0
-    T_acc = np.zeros(n)
-    q_hp = np.zeros(n)
-    q_gas = np.zeros(n)          # energia del backup (nome storico mantenuto)
-    q_scarto_in = np.zeros(n)
-    non_coperta = np.zeros(n)
-    el_hp = np.zeros(n)
-    el_backup = np.zeros(n)      # elettricità backup se è una 2ª HP
-    scarto_perso = np.zeros(n)
-
-    T = T_min_acc
-    P_hp_mwh = P_hp_kw / 1000.0
-    P_gas_mwh = P_gas_kw / 1000.0
-    frac_da_sorgente = max(1.0 - 1.0 / cop_reale, 0.0) if cop_reale > 0 else 0.0
-    # perdita oraria come frazione dell'energia stoccata (sopra T_amb): da %/settimana a /ora
-    perdita_ora_frac = (perdita_sett_pct / 100.0) / 168.0 if perdita_sett_pct > 0 else 0.0
-    perdite_acc = np.zeros(n)
-    cop_serie = np.zeros(n)  # COP effettivo usato ogni ora
-    Tmand_K = (T_mandata_cop + 273.15) if (cop_dinamico and T_mandata_cop is not None) else None
-
-    for i in range(n):
-        Ts = scarto_T_arr[i]
-        scarto_disp = scarto_pot_arr[i]
-        dom = dom_arr[i]
-        # perdite di standby all'inizio dell'ora: raffreddano l'accumulo verso T_amb
-        if perdita_ora_frac > 0 and C_MWh_per_K > 0 and T > T_amb_acc:
-            persa = perdita_ora_frac * (T - T_amb_acc) * C_MWh_per_K
-            T -= persa / C_MWh_per_K
-            perdite_acc[i] = persa
-
-        # Sorgente HP e COP dell'ora
-        # Schema B (T_ritorno_rete valorizzato): la sorgente è il MIX tra ritorno rete e accumulo.
-        #   Il ritorno rete è sempre disponibile (portata ~ domanda), l'accumulo aggiunge lo scarto.
-        #   Peso: quota accumulo vs quota ritorno, in base a massa accumulo ed energia richiesta.
-        if T_ritorno_rete is not None and (T_ritorno_rete > 0):
-            # peso del ritorno cresce con la domanda dell'ora, quello dell'accumulo con la sua capacità
-            w_ret = min(dom, P_hp_mwh) if P_hp_mwh > 0 else dom
-            w_acc = max((T - T_min_acc) * C_MWh_per_K, 0.0) if C_MWh_per_K > 0 else 0.0
-            wtot = w_ret + w_acc
-            if wtot > 1e-9:
-                T_sorg_base = (T_ritorno_rete * w_ret + T * w_acc) / wtot
-            else:
-                T_sorg_base = T_ritorno_rete
-            # la sorgente non scende comunque sotto il ritorno rete (pavimento garantito)
-            T_sorg_base = max(T_sorg_base, T_ritorno_rete)
-        else:
-            T_sorg_base = T  # schema A: sorgente = solo accumulo
-
-        if cop_dinamico and Tmand_K is not None and eta_hp_cop is not None:
-            T_sorg_i = T_sorg_base - dT_evaporatore
-            cop_i = (Tmand_K / max(Tmand_K - (T_sorg_i + 273.15), 1.0)) * eta_hp_cop
-            cop_i = min(max(cop_i, cop_min), cop_max)
-        else:
-            cop_i = cop_reale
-        frac_i = max(1.0 - 1.0 / cop_i, 0.0) if cop_i > 0 else 0.0
-        cop_serie[i] = cop_i
-
-        if architettura == "carica_accumulo":
-            # 1) la HP carica l'accumulo caldo usando lo scarto come sorgente, a potenza piatta
-            #    finché c'è scarto disponibile e capienza nell'accumulo
-            entrato = 0.0
-            q_hp_i = 0.0
-            if scarto_disp > 0 and not np.isnan(Ts) and P_hp_mwh > 0 and C_MWh_per_K > 0:
-                capienza = max((T_max_acc - T) * C_MWh_per_K, 0.0)
-                # la HP rende fino a P_hp; l'energia dalla sorgente è q*frac, limitata dallo scarto
-                q_max_da_scarto = scarto_disp / frac_i if frac_i > 0 else np.inf
-                q_hp_i = min(P_hp_mwh, capienza, q_max_da_scarto)
-                entrato = q_hp_i * frac_i
-                T += q_hp_i / C_MWh_per_K if C_MWh_per_K > 0 else 0.0  # tutto il calore reso va in accumulo
-            q_scarto_in[i] = entrato
-            scarto_perso[i] = max(scarto_disp - entrato, 0.0)
-            q_hp[i] = q_hp_i
-            el_hp[i] = q_hp_i / cop_i if cop_i > 0 else 0.0
-
-            # 2) la RETE scarica dall'accumulo per coprire la domanda
-            scaricabile = max((T - T_min_acc) * C_MWh_per_K, 0.0)
-            da_accumulo = min(dom, scaricabile)
-            T -= da_accumulo / C_MWh_per_K if C_MWh_per_K > 0 else 0.0
-            residuo = dom - da_accumulo
-        else:
-            # architettura "diretta": accumulo tiepido lato sorgente
-            entrato = 0.0
-            if scarto_disp > 0 and not np.isnan(Ts) and Ts > T and C_MWh_per_K > 0:
-                capienza = max((T_max_acc - T) * C_MWh_per_K, 0.0)
-                entrato = min(scarto_disp, capienza)
-                T += entrato / C_MWh_per_K
-            q_scarto_in[i] = entrato
-            scarto_perso[i] = max(scarto_disp - entrato, 0.0)
-
-            q_hp_i = 0.0
-            if dom > 0 and P_hp_mwh > 0 and cop_i > 0 and C_MWh_per_K > 0:
-                if T_ritorno_rete is not None and T_ritorno_rete > 0:
-                    # Schema B: il ritorno rete è sorgente sempre disponibile -> HP limitata solo dalla potenza.
-                    # L'accumulo contribuisce con lo scarto captato; la HP attinge prima all'accumulo (se caldo),
-                    # poi al ritorno rete per il resto.
-                    q_hp_i = min(dom, P_hp_mwh)
-                    # energia estratta dalla sorgente = q_hp_i * frac_i, prelevata prima dall'accumulo
-                    q_evap_tot = q_hp_i * frac_i
-                    da_accumulo = min(q_evap_tot, max((T - T_min_acc) * C_MWh_per_K, 0.0))
-                    T -= da_accumulo / C_MWh_per_K if C_MWh_per_K > 0 else 0.0
-                    # il resto (q_evap_tot - da_accumulo) viene dal ritorno rete, non tocca l'accumulo
-                else:
-                    # Schema A: sorgente = solo accumulo
-                    estraibile = max((T - T_min_acc) * C_MWh_per_K, 0.0)
-                    q_cond_max = estraibile / frac_i if frac_i > 0 else np.inf
-                    q_hp_i = min(dom, P_hp_mwh, q_cond_max)
-                    T -= q_hp_i * frac_i / C_MWh_per_K if C_MWh_per_K > 0 else 0.0
-            q_hp[i] = q_hp_i
-            el_hp[i] = q_hp_i / cop_i if cop_i > 0 else 0.0
-            residuo = dom - q_hp_i
-
-        # 3) BACKUP copre il residuo, fino alla sua potenza (o al profilo max se non dispacciabile)
-        p_backup = P_gas_mwh
-        if backup_arr_max is not None:
-            p_backup = min(P_gas_mwh, backup_arr_max[i]) if P_gas_mwh > 0 else backup_arr_max[i]
-        q_backup_i = min(max(residuo, 0.0), p_backup) if p_backup > 0 else 0.0
-        q_gas[i] = q_backup_i
-        _bc = backup_cop[i] if hasattr(backup_cop, "__len__") else backup_cop
-        if _bc is not None and _bc > 0:
-            el_backup[i] = q_backup_i / _bc
-        non_coperta[i] = max(residuo - q_backup_i, 0.0)
-        T_acc[i] = T
-
-    # COP medio pesato sull'energia termica resa dalla HP (SCOP di sistema)
-    cop_medio = (q_hp.sum() / el_hp.sum()) if el_hp.sum() > 1e-9 else 0.0
-    return {
-        "T_acc": T_acc, "q_hp": q_hp, "q_gas": q_gas, "q_scarto_in": q_scarto_in,
-        "el_hp": el_hp, "el_backup": el_backup, "non_coperta": non_coperta,
-        "scarto_perso": scarto_perso, "cop_serie": cop_serie, "cop_medio": cop_medio,
-        "E_hp": q_hp.sum(), "E_gas": q_gas.sum(), "E_scarto_captato": q_scarto_in.sum(),
-        "E_el_hp": el_hp.sum(), "E_el_backup": el_backup.sum(),
-        "E_non_coperta": non_coperta.sum(), "E_scarto_perso": scarto_perso.sum(),
-        "E_perdite_acc": perdite_acc.sum(),
-        "ore_non_coperte": int((non_coperta > 1e-6).sum()),
-        "ore_hp_attiva": int((q_hp > 1e-6).sum()),
-        "ore_gas_attivo": int((q_gas > 1e-6).sum()),
-    }
-
-
-def simula_accumulo_alta_T(dom_arr, scarto_alta_arr, volume_m3, T_mandata, T_ritorno,
-                           perdita_sett_pct=1.0):
-    """
-    Accumulo caldo alimentato dai fumi ad alta T (già a T mandata via scambiatore).
-    Copre la domanda DIRETTAMENTE (no HP). Ritorna quanto copre e la domanda residua.
-    Capacità termica = volume × cp × (T_mandata − T_ritorno).
-    """
-    n = len(dom_arr)
-    C_MWh_per_K = volume_m3 * RHO_CP / 1000.0 if volume_m3 > 0 else 0.0
-    cap_max = C_MWh_per_K * max(T_mandata - T_ritorno, 1) if volume_m3 > 0 else 0.0
-    perdita_ora = (perdita_sett_pct/100.0)/168.0 if perdita_sett_pct > 0 else 0.0
-
-    carica = 0.0  # stato di carica (MWh sopra il livello di ritorno)
-    q_diretta = np.zeros(n)   # calore dell'alta T che copre la domanda
-    dom_residua = np.zeros(n)
-    for i in range(n):
-        if perdita_ora > 0 and carica > 0:
-            carica -= perdita_ora * carica
-        carica = min(carica + scarto_alta_arr[i], cap_max) if cap_max > 0 else scarto_alta_arr[i]
-        # copre la domanda con quello che c'è (accumulo + flusso istantaneo se no accumulo)
-        disponibile = carica if cap_max > 0 else scarto_alta_arr[i]
-        coperto = min(dom_arr[i], disponibile)
-        q_diretta[i] = coperto
-        if cap_max > 0:
-            carica -= coperto
-        dom_residua[i] = dom_arr[i] - coperto
-    return q_diretta, dom_residua
-
-
-def ottimizza_scenario(dom_arr, scarto_tiep_arr, scartoT_arr, scarto_alta_arr, solar_avail,
-                       T_mandata, T_ritorno, T_min_acc, dT_evap, eta_hp, prezzo_el,
-                       capex_hp_func, capex_backup_kw, opex_backup_mwh, backup_cop,
-                       costo_m3, capex_solare_fisso, fattore_crf, perdita_func):
-    """
-    Trova P_hp, potenza backup, V_accumulo_tiepido e V_accumulo_altaT che MINIMIZZANO
-    il LCOH di sistema (costo annuo totale / domanda annua), garantendo copertura 100%.
-
-    Strategia: la potenza di backup non è una variabile di griglia — per ogni (P_hp, V_tiepido,
-    V_alta) si simula con backup ILLIMITATO (copertura sempre 100%) e si legge la punta oraria
-    che il backup deve realmente coprire: quella è la potenza di backup minima. Così il vincolo
-    di copertura 100% è sempre soddisfatto e P_backup è il minimo necessario.
-    Ricerca coarse-to-fine; l'accumulo alta T entra solo se c'è scarto alta T.
-    """
-    dom_tot = float(dom_arr.sum())
-    if dom_tot <= 0:
-        return None
-    picco_kw = float(dom_arr.max() * 1000.0)
-    has_alta = float(scarto_alta_arr.sum()) > 1e-6
-
-    # cache dello stadio alta T (dipende solo da V_alta): dom residua dopo alta T + solare
-    _alta_cache = {}
-    def _stadio_alta(v_alta):
-        if v_alta not in _alta_cache:
-            q_alta, dom_res = simula_accumulo_alta_T(dom_arr, scarto_alta_arr, v_alta,
-                                                     T_mandata, T_ritorno, perdita_sett_pct=perdita_func(v_alta))
-            q_sol = np.minimum(dom_res, solar_avail)
-            _alta_cache[v_alta] = (float(q_alta.sum()), dom_res - q_sol, float(q_sol.sum()))
-        return _alta_cache[v_alta]
-
-    def _valuta(p_hp, v_tiep, v_alta):
-        E_alta, dom_after, E_sol = _stadio_alta(v_alta)
-        s = simula_accumulo_tiepido(
-            dom_after, scarto_tiep_arr, scartoT_arr, v_tiep, T_min_acc, T_mandata, dT_evap,
-            p_hp, 4.0, 1e9, architettura="diretta", backup_cop=backup_cop,
-            perdita_sett_pct=perdita_func(v_tiep), cop_dinamico=True,
-            T_mandata_cop=T_mandata, eta_hp_cop=eta_hp, T_ritorno_rete=None)
-        # BACKUP DIMENSIONATO PER FIRMNESS: deve garantire il 100% anche con ZERO scarto (aziende ferme),
-        # quindi la sua potenza = picco della domanda residua da coprire quando manca lo scarto.
-        p_bk = float(dom_arr.max() * 1000.0)
-        capex = (p_hp * capex_hp_func(p_hp) + p_bk * capex_backup_kw
-                 + v_tiep * costo_m3 + v_alta * costo_m3 + capex_solare_fisso)
-        opex = s["E_el_hp"] * prezzo_el + s["E_gas"] * opex_backup_mwh
-        lcoh = (capex * fattore_crf + opex) / dom_tot
-        return {"p_hp_kw": p_hp, "p_bk_kw": p_bk, "v_tiep": v_tiep, "v_alta": v_alta,
-                "lcoh": lcoh, "E_alta": E_alta, "E_sol": E_sol, "E_hp": s["E_hp"], "E_gas": s["E_gas"],
-                "cop_medio": s["cop_medio"],
-                "quota_fer": (E_alta + E_sol + s["E_hp"]) / dom_tot * 100}
-
-    v_alta_cands = [0.0, 500.0, 1000.0, 2000.0] if has_alta else [0.0]
-    p_hp_cands = list(np.linspace(0.2, 1.0, 5) * picco_kw)
-    v_tiep_cands = [0.0, 400.0, 800.0, 1500.0, 2500.0]
-
-    best = None
-    for v_alta in v_alta_cands:
-        for p_hp in p_hp_cands:
-            for v_tiep in v_tiep_cands:
-                r = _valuta(p_hp, v_tiep, v_alta)
-                if best is None or r["lcoh"] < best["lcoh"]:
-                    best = r
-    if best is None:
-        return None
-    # raffino P_hp e V_tiepido intorno al migliore (V_alta tenuto al valore ottimo grezzo)
-    va = best["v_alta"]
-    dph = 0.1 * picco_kw
-    for p_hp in [best["p_hp_kw"] + d for d in (-2*dph, -dph, 0, dph, 2*dph)]:
-        if p_hp <= 0:
-            continue
-        for v_tiep in [best["v_tiep"] + d for d in (-500, -250, 0, 250, 500)]:
-            if v_tiep < 0:
-                continue
-            r = _valuta(p_hp, v_tiep, va)
-            if r["lcoh"] < best["lcoh"]:
-                best = r
-    return best
-
 
 buildings, domanda, flussi, pvgis, privati, condomini = load_data()
 
@@ -1404,7 +1066,6 @@ with tab_domanda:
                        "MWh/anno per metro di rete. È l'indicatore chiave di fattibilità del TLR: "
                        "sotto ~1,2 MWh/(m·a) la rete fatica a ripagarsi, sopra ~2 è buona.")
             cD1, cD2 = st.columns(2)
-            tasso_all = fattore_correzione
             costo_m_rete = cD1.slider("Costo rete (€/m di trincea)", 200, 1500, 600, step=50,
                                       key="dom_costo_rete",
                                       help="Posa di tubazione preisolata in trincea, valore tipico per centro urbano.")
@@ -1418,7 +1079,7 @@ with tab_domanda:
                     if _s.empty:
                         continue
                     _L = stima_lunghezza_rete(_s["lat"].values, _s["lon"].values)
-                    _E = _s["consumo_annuo_MWh"].sum() * (tasso_all / 100.0) * (fattore_correzione / 100.0)
+                    _E = _s["consumo_annuo_MWh"].sum() * (fattore_correzione / 100.0)
                     if _L < 1:
                         continue
                     righe_d.append({"Zona": _z, "Livello": _l, "Edifici": len(_s),
@@ -1848,6 +1509,13 @@ with tab_dimensionamento:
             area_sol = int(round(area_base * quota / 100.0 * (0.30 / max(eff, 0.01))))
             solar_low = genera_offerta_solare(pvgis, area_sol, eff).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0).values
             capex_solare = area_sol * capex_mq
+            if solare_on and not is_hp_par:
+    st.warning(
+        "⚠️ Solare attivo con supporto a combustibile: il calore solare finisce "
+        "nella fascia più calda dell'accumulo basso, ma senza HP bassa T resta "
+        "inutilizzato. Considera se aggiungere HP bassa T o instradare il solare "
+        "come preriscaldo del ritorno rete (non ancora implementato)."
+    )
             st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
 
         # routing (serve all'ottimizzatore qui sotto)
