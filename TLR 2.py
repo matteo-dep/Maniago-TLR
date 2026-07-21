@@ -1553,21 +1553,21 @@ with tab_dimensionamento:
           prezzo_el = st.slider("Prezzo elettricità (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el")
           antigelo = st.slider("Floor antigelo ground loop (°C)", -5, 10, 0, key="dim_antigelo",
                                help="L'evaporatore sul suolo non scende sotto questa soglia.")
-        if backup_tipo == "gas":
-            rend_gas = st.slider("Rendimento caldaia (%)", 85, 98, 92, key="dim_rend_gas") / 100.0
-            prezzo_gas = st.slider("Prezzo gas (€/MWh)", 40, 160, 90, key="dim_prezzo_gas")
-            capex_kw_bk = st.slider("CAPEX caldaia (€/kW)", 60, 300, 120, step=10, key="dim_capex_gas")
-            opex_bk_mwh = prezzo_gas / rend_gas
-        elif backup_tipo == "biomassa":
-            rend_bio = st.slider("Rendimento caldaia (%)", 75, 92, 85, key="dim_rend_bio") / 100.0
-            costo_cip = st.slider("Costo cippato (€/MWh)", 20, 60, 35, key="dim_costo_bio")
-            capex_kw_bk = st.slider("CAPEX caldaia (€/kW)", 300, 900, 550, step=25, key="dim_capex_bio")
-            opex_bk_mwh = costo_cip / rend_bio
-        else:
-            capex_kw_bk = 700.0; opex_bk_mwh = 0.0
-        backup_cop = None
-        costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 1000, step=20, key="dim_costo_m3",
-                             help="IEA DHC F1 Tab.3 (Sud Europa, <5000 m³ ≈ 1000 €/m³).")
+          if backup_tipo == "gas":
+              rend_gas = st.slider("Rendimento caldaia (%)", 85, 98, 92, key="dim_rend_gas") / 100.0
+              prezzo_gas = st.slider("Prezzo gas (€/MWh)", 40, 160, 90, key="dim_prezzo_gas")
+              capex_kw_bk = st.slider("CAPEX caldaia (€/kW)", 60, 300, 120, step=10, key="dim_capex_gas")
+              opex_bk_mwh = prezzo_gas / rend_gas
+          elif backup_tipo == "biomassa":
+              rend_bio = st.slider("Rendimento caldaia (%)", 75, 92, 85, key="dim_rend_bio") / 100.0
+              costo_cip = st.slider("Costo cippato (€/MWh)", 20, 60, 35, key="dim_costo_bio")
+              capex_kw_bk = st.slider("CAPEX caldaia (€/kW)", 300, 900, 550, step=25, key="dim_capex_bio")
+              opex_bk_mwh = costo_cip / rend_bio
+          else:
+              capex_kw_bk = 700.0; opex_bk_mwh = 0.0
+          backup_cop = None
+          costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 1000, step=20, key="dim_costo_m3",
+                               help="IEA DHC F1 Tab.3 (Sud Europa, <5000 m³ ≈ 1000 €/m³).")
 
         solare_on = st.checkbox("☀️ Solare nell'accumulo basso", value=False, key="dim_solare_on")
         solar_low = np.zeros(len(dom_arr)); capex_solare = 0.0; area_sol = 0
