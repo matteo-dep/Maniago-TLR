@@ -470,7 +470,14 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
         lcoh = (capex * fattore_crf + opex) / dom_tot
         # consegnato in rete = caldo diretto + HP alta + backup (E_hp_bassa è interno all'intermedio).
         # rinnovabile = caldo diretto + HP alta (include il recupero via HP bassa) + biomassa.
-        E_fer = r["E_hot_diretto"] + r["E_hp_alta"] + (r["E_backup"] if parallelo == "biomassa" else 0.0)
+        # DOPO — separo scarto recuperato, ambiente rinnovabile, elettricità di rete, biomassa
+        E_scarto_recuperato = E_hot + E_scarto_via_hp        # calore recuperato (non FER RED)
+        E_ambiente = E_ground                                 # FER RED
+        E_biomassa = E_bk if backup_tipo == "biomassa" else 0.0  # FER
+        E_el_rete = sim["E_el_tot"]                          # FER solo pro quota mix elettrico
+        # per la KPI HEAT35, ha senso mostrare il totale "efficient DH-compatibile":
+        E_low_carbon = E_scarto_recuperato + E_ambiente + E_biomassa
+        quota_low_carbon = E_low_carbon / dom_tot * 100
         fer = E_fer / dom_tot * 100
         return {"v_hot": v_hot, "v_int": v_int, "v_low": v_low, "P_alta": P_alta, "P_bassa": P_bassa,
                 "P_bk": P_bk, "lcoh": lcoh, "quota_fer": fer,
