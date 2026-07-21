@@ -1516,7 +1516,7 @@ with tab_dimensionamento:
                   "inutilizzato. Considera se aggiungere HP bassa T o instradare il solare "
                   "come preriscaldo del ritorno rete (non ancora implementato)."
               )
-                        st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
+              st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
 
         # routing (serve all'ottimizzatore qui sotto)
         q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
