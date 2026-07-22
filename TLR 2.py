@@ -50,14 +50,13 @@ st.set_page_config(page_title="Maniago TLR | HEAT35 - APE FVG", layout="wide", p
 # RIFERIMENTI DI PROGETTO
 # -----------------------------------------------------------------------------
 PROGETTO_HTML = (
-    "Sviluppato all'interno del progetto **INTERREG HEAT 35** "
-    "([scheda progetto](https://www.interreg-central.eu/projects/heat-35/)) "
-    "da **Matteo De Piccoli** "
-    "([LinkedIn](https://www.linkedin.com/in/matteo-de-piccoli-2a17a5163)) - "
-    "[APE FVG](https://www.ape.fvg.it/)"
+    "Sviluppato all'interno del progetto "
+    "**[INTERREG HEAT 35](https://www.interreg-central.eu/projects/heat-35/)** "
+    "da **[Matteo De Piccoli](https://www.linkedin.com/in/matteo-de-piccoli-2a17a5163)** "
+    "\u2014 [APE FVG](https://www.ape.fvg.it/)"
 )
 FOOTER_HTML = (
-    "\U0001F310 Progetto: [Interreg HEAT35](https://www.interreg-central.eu/projects/heat-35/) "
+    "\U0001F310 Progetto: [Interreg HEAT 35](https://www.interreg-central.eu/projects/heat-35/) "
     "&nbsp;|&nbsp; \U0001F3E0 Sito Ente: [APE FVG](https://www.ape.fvg.it/) "
     "&nbsp;|&nbsp; \U0001F4E7 Contatto: [matteo.depiccoli@ape.fvg.it](mailto:matteo.depiccoli@ape.fvg.it)"
 )
@@ -99,7 +98,6 @@ COLOR_BACKUP = "#FF9F1C"
 COLOR_NONCOP = "#9AA0A6"
 COLOR_DOMANDA = "#FFFFFF"
 COLOR_GROUND = "#8C6D46"
-COLOR_FORNI = "#FF7043"
 
 ZONE_NOMI = {
     1: "Zona 1 - Comune NE",
@@ -131,104 +129,6 @@ AZIENDE_COORD = {
     "Inossman": (46.1501, 12.7145),
 }
 CENTRALE_LAT, CENTRALE_LON = 46.1479, 12.7151
-
-# =============================================================================
-# P8 - FORNI DI FORGIATURA PIETRO ROSA T.B.M.
-# =============================================================================
-# Misure Ecol Studio SpA del 14/07/2025 - rapporti di prova 25LF24167 (E1),
-# 25LF24168 (E4), 25LF24169 (E5), 25LF24170 (E6).
-# Prelievi in condizioni di massimo regime.
-# Tutti i camini presentano O2 = 20.9 % vol: i fumi sono fortemente diluiti
-# con aria ambiente per effetto del tiraggio naturale (confermato dal
-# riscontro aziendale: 400 C in bocca forno, 220-240 C sulla lamiera del
-# camino, ~100 C da termografia).
-# Il calore recuperabile e quindi calore SENSIBILE su portate d'aria elevate.
-#
-#   punto  impianto                              Te [K]   T [C]   qv,e [m3/h]  qv,r [Nm3/h]
-#   E1     Forni da riscaldo MAGLIO MAS10000      321      48      2117         1772
-#   E4     Forni da riscaldo MAGLIO 3000          417     144     13400         8722
-#   E5     Forni da riscaldo                      357      84      1361         1035
-#   E6     Forni da riscaldo                      323      50      1936         1628
-#
-# Calore specifico volumetrico dei fumi (assimilabili ad aria secca, H2O < 1 %):
-#   cp ~ 1.30 kJ/(Nm3*K) = 3.61e-4 kWh/(Nm3*K)
-CP_FUMI_KWH_NM3_K = 3.61e-4
-
-FORNI_PIETRO_ROSA = [
-    # (punto, descrizione, T_misurata_C, portata_Nm3h, T_scarico_default_C)
-    ("E4", "Forni da riscaldo MAGLIO 3000",      144.0, 8722.0, 60.0),
-    ("E5", "Forni da riscaldo (linea E5)",        84.0, 1035.0, 45.0),
-    ("E6", "Forni da riscaldo (linea E6)",        50.0, 1628.0, 40.0),
-    ("E1", "Forni da riscaldo MAGLIO MAS10000",   48.0, 1772.0, 40.0),
-]
-
-# Regime di esercizio dichiarato dall'azienda: ciclo continuo 24/24, 7/7.
-# Fermate: due settimane centrali di agosto; festivita "normali" (1 gennaio,
-# 6 gennaio, Pasquetta, 25 aprile, 1 maggio, 2 giugno, 1 novembre, 8 dicembre).
-# A Natale i forni restano tendenzialmente accesi -> nessuna fermata natalizia.
-FERMATE_FORNI = (
-    [pd.Timestamp(d) for d in pd.date_range("2024-08-05", "2024-08-18")] +
-    [pd.Timestamp(x) for x in
-     ["2024-01-01", "2024-01-06", "2024-04-01", "2024-04-25",
-      "2024-05-01", "2024-06-02", "2024-11-01", "2024-12-08"]]
-)
-
-
-def potenza_forno_kw(portata_nm3h, T_fumi_C, T_scarico_C):
-    """Potenza termica sensibile recuperabile da un camino (kW)."""
-    return max(portata_nm3h * CP_FUMI_KWH_NM3_K * (T_fumi_C - T_scarico_C), 0.0)
-
-
-def genera_flussi_forni(T_e4_C=144.0, delta_altri=0.0, T_scarico_shift=0.0, pinch=5.0):
-    """Serie orarie dei 4 camini Pietro Rosa, ciclo continuo con fermate.
-
-    T_e4_C          temperatura di progetto del camino E4 (sensitivita 100-180 C)
-    delta_altri     scostamento applicato agli altri tre camini (C)
-    T_scarico_shift scostamento sulla T di scarico post-recupero (C)
-    """
-    fermi = set(pd.Timestamp(d).normalize() for d in FERMATE_FORNI)
-    attivo = ~pd.Series(HOURS_2024.normalize()).isin(fermi).values
-    frames = []
-    for punto, descr, T_mis, portata, T_out0 in FORNI_PIETRO_ROSA:
-        T_f = T_e4_C if punto == "E4" else max(T_mis + delta_altri, 20.0)
-        T_out = max(T_out0 + T_scarico_shift, 30.0)
-        P_kw = potenza_forno_kw(portata, T_f, T_out)
-        T_disp = T_f - pinch
-        P = np.where(attivo, P_kw, 0.0)
-        Td = np.where(attivo, T_disp, np.nan)
-        frames.append(pd.DataFrame({
-            "datetime": HOURS_2024,
-            "id_flusso": f"Pietro Rosa \u00b7 {punto} {descr}",
-            "azienda": "Pietro Rosa",
-            "flusso": f"{punto} - {descr}",
-            "destinazione": "alta_T" if T_disp >= 80 else "bassa_T",
-            "fonte": "Pietro Rosa",
-            "MWh": P / 1000.0,
-            "P_kW": P,
-            "T_disponibile": Td,
-        }))
-    return pd.concat(frames, ignore_index=True)
-
-
-def tabella_forni(T_e4_C=144.0, delta_altri=0.0, T_scarico_shift=0.0):
-    """Riepilogo tabellare dei 4 camini con potenze ed energie annue."""
-    ore_attive = int(len(HOURS_2024) - len(set(pd.Timestamp(d).normalize() for d in FERMATE_FORNI)) * 24)
-    righe = []
-    for punto, descr, T_mis, portata, T_out0 in FORNI_PIETRO_ROSA:
-        T_f = T_e4_C if punto == "E4" else max(T_mis + delta_altri, 20.0)
-        T_out = max(T_out0 + T_scarico_shift, 30.0)
-        P_kw = potenza_forno_kw(portata, T_f, T_out)
-        righe.append({
-            "Punto": punto,
-            "Impianto": descr,
-            "T misurata (\u00b0C)": T_mis,
-            "T di progetto (\u00b0C)": round(T_f, 1),
-            "Portata (Nm\u00b3/h)": int(portata),
-            "T scarico (\u00b0C)": round(T_out, 1),
-            "Potenza recuperabile (kW)": round(P_kw, 1),
-            "Energia (MWh/a)": round(P_kw * ore_attive / 1000.0, 1),
-        })
-    return pd.DataFrame(righe), ore_attive
 
 
 # =============================================================================
@@ -946,17 +846,6 @@ def genera_offerta_flussi(flussi_df, pinch):
 
 
 @st.cache_data
-def genera_offerta_completa(flussi_df, pinch, T_e4, delta_altri, T_scarico_shift, forni_on):
-    """Flussi da CSV + camini forni Pietro Rosa (P8)."""
-    base = genera_offerta_flussi(flussi_df, pinch)
-    if not forni_on:
-        return base
-    forni = genera_flussi_forni(T_e4_C=T_e4, delta_altri=delta_altri,
-                                T_scarico_shift=T_scarico_shift, pinch=pinch)
-    return pd.concat([base, forni], ignore_index=True)
-
-
-@st.cache_data
 def genera_offerta_solare(pvgis_df, area_m2, efficienza):
     pvgis_df = pvgis_df.copy()
     pvgis_df["hour"] = pvgis_df["datetime"].dt.hour
@@ -1483,33 +1372,11 @@ with tab_offerta:
         st.caption(f"T ritorno rete: **{T_ritorno_ideale}\u00b0C** (impostata in scheda Domanda)")
         pinch = st.slider("Pinch scambiatore (\u00b0C)", 2, 10, 5, key="off_pinch")
 
-        # ---------------------------------------------------------------------
-        # P8 - Forni di forgiatura Pietro Rosa (misure Ecol Studio 14/07/2025)
-        # ---------------------------------------------------------------------
-        st.markdown("#### \U0001F525 Forni di forgiatura Pietro Rosa")
-        forni_on = st.checkbox("Includi i camini dei forni", value=True, key="off_forni_on",
-                               help="Misure Ecol Studio 14/07/2025 - rapporti 25LF24167/168/169/170")
-        T_e4 = 144.0
-        delta_altri = 0.0
-        T_scarico_shift = 0.0
-        if forni_on:
-            T_e4 = st.slider("T di progetto camino E4 (\u00b0C)", 100, 180, 144, step=2, key="off_te4",
-                             help="Misurato 144 \u00b0C (417 K). L'azienda suggerisce "
-                                  "cautelativamente 120-180 \u00b0C: in bocca forno 400 \u00b0C, "
-                                  "sulla lamiera del camino 220-240 \u00b0C, ~100 \u00b0C da termografia. "
-                                  "La forte diluizione (O2 = 20,9 %) abbassa la T ma alza la portata.")
-            delta_altri = st.slider("Scostamento sugli altri camini (\u00b0C)", -20, 40, 0, step=5,
-                                    key="off_dforni")
-            T_scarico_shift = st.slider("Scostamento T di scarico post-recupero (\u00b0C)",
-                                        -10, 30, 0, step=5, key="off_tsc",
-                                        help="Alzare la T di scarico riduce il recupero ma "
-                                             "protegge dalla condensa acida (qui poco rilevante: "
-                                             "CO2 = 0,04 %, H2O < 1 %).")
-
         st.markdown("#### Fonti \u2014 selezione per flusso")
-        st.caption("Da `maniago_flussi_offerta.csv`. Di default sono spuntati i flussi pi\u00f9 certi.")
+        st.caption("Da `maniago_flussi_offerta.csv`. Spunta le aziende e i singoli flussi "
+                   "di calore di scarto da includere. Di default sono attivi i pi\u00f9 certi.")
 
-        offerta = genera_offerta_completa(flussi, pinch, T_e4, delta_altri, T_scarico_shift, forni_on)
+        offerta = genera_offerta_flussi(flussi, pinch)
 
         FONTI_CERTE = {"Pandolfo", "ZML", "Pietro Rosa"}
 
@@ -1523,57 +1390,34 @@ with tab_offerta:
             az_on = st.checkbox(f"**{az}**", value=az_ha_certi, key=f"off_az_{az}")
             for _, fr in flussi_az.iterrows():
                 icona = "\U0001F534" if fr["destinazione"] == "alta_T" else "\U0001F535"
-                label = f"{icona} {fr['flusso']} ({fr['P_kW'] / 1000:.1f} MW, {fr['T_alta_C']:.0f}\u00b0C)"
+                label = f"{icona} {fr['flusso']} ({fr['P_kW'] / 1000:.2f} MW, {fr['T_alta_C']:.0f}\u00b0C)"
                 fl_on = st.checkbox(label, value=_flusso_e_certo(az, fr["flusso"]),
                                     key=f"off_fl_{fr['id_flusso']}", disabled=not az_on)
                 if az_on and fl_on:
                     selected_flussi.append(fr["id_flusso"])
-
-        if forni_on:
-            st.markdown("**Camini forni (misurati)**")
-            _tab_f, _ore_f = tabella_forni(T_e4, delta_altri, T_scarico_shift)
-            for _, _r in _tab_f.iterrows():
-                _id = f"Pietro Rosa \u00b7 {_r['Punto']} " + \
-                      [d for p, d, _, _, _ in FORNI_PIETRO_ROSA if p == _r["Punto"]][0]
-                _icona = "\U0001F534" if (_r["T di progetto (\u00b0C)"] - pinch) >= 80 else "\U0001F7E0"
-                if st.checkbox(f"{_icona} {_r['Punto']} \u2014 {_r['Potenza recuperabile (kW)']:.0f} kW "
-                               f"@ {_r['T di progetto (\u00b0C)']:.0f}\u00b0C",
-                               value=(_r["Potenza recuperabile (kW)"] > 10),
-                               key=f"off_forno_{_r['Punto']}"):
-                    selected_flussi.append(_id)
 
         selected_fonti = sorted(set(
             offerta.loc[offerta["id_flusso"].isin(selected_flussi), "azienda"]))
         st.session_state["_off_flussi"] = selected_flussi
         st.session_state["_off_fonti"] = selected_fonti
         st.session_state["_off_pinch"] = pinch
-        st.session_state["_off_forni"] = {"on": forni_on, "T_e4": T_e4,
-                                          "delta": delta_altri, "shift": T_scarico_shift}
         month_range_o = st.select_slider(
             "Mesi", options=list(range(1, 13)), value=(1, 12),
             format_func=lambda m: MONTH_NAMES[m - 1], key="off_mesi")
 
-    # -------------------------------------------------------------------------
-    if forni_on:
-        with st.expander("\U0001F4CB Camini forni Pietro Rosa \u2014 dati di misura e recupero", expanded=True):
-            _tab_f, _ore_f = tabella_forni(T_e4, delta_altri, T_scarico_shift)
-            st.dataframe(_tab_f, use_container_width=True, hide_index=True)
-            f1, f2, f3 = st.columns(3)
-            f1.metric("Potenza recuperabile totale",
-                      f"{_tab_f['Potenza recuperabile (kW)'].sum():.0f} kW")
-            f2.metric("Energia annua", f"{_tab_f['Energia (MWh/a)'].sum():,.0f} MWh/a".replace(",", "."))
-            f3.metric("Ore di esercizio", f"{_ore_f:,} h/a".replace(",", "."),
-                      help="Ciclo continuo 24/24 7/7. Fermate: due settimane centrali di agosto "
-                           "e festivit\u00e0 ordinarie. A Natale i forni restano accesi.")
-            st.caption(
-                "Fonte: **Ecol Studio SpA**, rapporti di prova 25LF24167 (E1), 25LF24168 (E4), "
-                "25LF24169 (E5), 25LF24170 (E6) del 14/07/2025, prelievi in condizioni di massimo "
-                "regime. Calore sensibile calcolato con cp = 1,30 kJ/(Nm\u00b3\u00b7K). "
-                "Tutti i camini hanno O\u2082 = 20,9 % vol: i fumi sono fortemente diluiti con aria "
-                "ambiente per il tiraggio naturale, quindi la temperatura e bassa ma la portata "
-                "elevata. **Il camino E4 (MAGLIO 3000) vale da solo oltre il 90 % del recuperabile "
-                "e, a 144 \u00b0C, e sopra la temperatura di mandata della rete: alimenta "
-                "direttamente l'anello caldo, senza pompa di calore.**")
+        # ---------------------------------------------------------------------
+        # Prezzo di acquisto del calore di scarto, differenziato per azienda
+        # ---------------------------------------------------------------------
+        st.markdown("#### \U0001F4B6 Prezzo del calore di scarto")
+        st.caption("Costo di acquisto del calore riconosciuto a ciascuna azienda "
+                   "(\u20ac/MWh termico ceduto alla rete). Confluisce nei flussi di cassa "
+                   "della scheda *Analisi economica*.")
+        _prezzi_scarto = {}
+        for az in selected_fonti:
+            _prezzi_scarto[az] = st.slider(
+                f"{az} (\u20ac/MWh)", 0, 60, 10, step=1, key=f"off_prezzo_{az}",
+                help="0 = calore ceduto gratuitamente; valori tipici 5-20 \u20ac/MWh.")
+        st.session_state["_off_prezzi_scarto"] = _prezzi_scarto
 
     with st.expander("\U0001F4CB Dettaglio flussi da CSV (dati grezzi)"):
         st.dataframe(flussi[["azienda", "flusso", "destinazione", "fluido", "T_alta_C",
@@ -1734,9 +1578,7 @@ with tab_dimensionamento:
 
     # -------------------------------------------------------------------------
     pinch_dim = st.session_state.get("_off_pinch", 5.0)
-    _fo = st.session_state.get("_off_forni", {"on": True, "T_e4": 144.0, "delta": 0.0, "shift": 0.0})
-    off_all = genera_offerta_completa(flussi, pinch_dim, _fo["T_e4"], _fo["delta"],
-                                      _fo["shift"], _fo["on"])
+    off_all = genera_offerta_flussi(flussi, pinch_dim)
     off_all = off_all[off_all["id_flusso"].isin(flussi_dim)].copy()
     soil_temp_arr = soil_temp_monthly(pvgis)[idx_h.month.values - 1]
 
@@ -1904,6 +1746,17 @@ with tab_dimensionamento:
     E_el = float(el_hp.sum())
     E_scarto_tot = E_hot + E_scarto_via_hp
 
+    # --- indicatori richiesti ---
+    # % di calore di scarto industriale utilizzato rispetto alla domanda totale
+    pct_scarto_su_domanda = E_scarto_tot / dom_tot * 100 if dom_tot > 0 else 0.0
+    # % di calore rinnovabile/recuperato sul totale effettivamente fornito:
+    #   scarto industriale recuperato + calore ambiente (suolo) + biomassa.
+    #   NON conta l'elettricita di rete delle HP ne il gas fossile.
+    E_fornito = E_hot + E_alta + E_bassa + E_bk
+    E_rinnovabile = (E_scarto_tot + E_ground
+                     + (E_bk if backup_tipo == "biomassa" else 0.0))
+    pct_rinnovabile = E_rinnovabile / E_fornito * 100 if E_fornito > 0 else 0.0
+
     with col_res:
         if eredita_ok:
             st.caption(f"**{len(edifici_dim)} edifici** (zone: {', '.join(zone_dim) if zone_dim else '\u2014'}) "
@@ -2028,6 +1881,21 @@ with tab_dimensionamento:
         else:
             st.success("\u2705 Copertura 100 % in tutte le ore.")
 
+        # --- indicatori chiave richiesti ---
+        st.markdown("##### \U0001F331 Indicatori chiave di sostenibilit\u00e0")
+        ind1, ind2, ind3 = st.columns(3)
+        ind1.metric("Scarto industriale utilizzato / domanda",
+                    f"{pct_scarto_su_domanda:.0f}%",
+                    help="Quota della domanda alla centrale coperta con calore di scarto "
+                         "recuperato dalle aziende (uso diretto + risollevato dalle HP), "
+                         "al netto dell'elettricit\u00e0 dei compressori e del suolo.")
+        ind2.metric("Calore rinnovabile / totale fornito",
+                    f"{pct_rinnovabile:.0f}%",
+                    help="Scarto recuperato + calore ambiente dal suolo + biomassa, sul totale "
+                         "effettivamente fornito. Esclude l'elettricit\u00e0 di rete e il gas fossile.")
+        ind3.metric("Quota FER (dimensionamento)", f"{quota_fer:.0f}%",
+                    help="Definizione dello scenario (scarto diretto + HP alta T + biomassa).")
+
         st.markdown("**Da dove arriva l'energia** (fonti, sull'anno)")
         fig_mix = go.Figure()
         voci = [("Scarto diretto", E_hot, COLOR_ALTA_T),
@@ -2136,6 +2004,42 @@ with tab_dimensionamento:
         s4.metric("Quota FER", f"{quota_fer:.0f}%")
 
     # ---------------------------------------------------------------------
+    # COSTO DEL CALORE DI SCARTO ACQUISTATO (per azienda) + CO2 EVITATA
+    # ---------------------------------------------------------------------
+    # Il calore di scarto realmente valorizzato e E_scarto_tot (diretto +
+    # risollevato dalle HP). Lo ripartisco tra le aziende in proporzione
+    # all'energia che ciascuna mette a disposizione tra i flussi selezionati.
+    _prezzi_scarto = st.session_state.get("_off_prezzi_scarto", {})
+    _en_per_azienda = (off_all.groupby("azienda")["MWh"].sum()
+                       if not off_all.empty else pd.Series(dtype=float))
+    _en_scarto_disp = float(_en_per_azienda.sum())
+    costo_calore_acq = 0.0
+    _righe_acq = []
+    if _en_scarto_disp > 1e-6:
+        for _az, _en in _en_per_azienda.items():
+            _quota = _en / _en_scarto_disp
+            _mwh_valorizzati = E_scarto_tot * _quota
+            _pz = float(_prezzi_scarto.get(_az, 0))
+            _costo = _mwh_valorizzati * _pz
+            costo_calore_acq += _costo
+            _righe_acq.append({"azienda": _az, "MWh valorizzati": round(_mwh_valorizzati),
+                               "\u20ac/MWh": _pz, "costo (\u20ac/a)": round(_costo)})
+
+    # CO2 evitata rispetto alla baseline gas.
+    # Baseline: le utenze si scaldano da sole con caldaie a gas che producono
+    # esattamente il calore VENDUTO alle utenze (E_venduto = dom_tot_utenze).
+    # Il TLR invece produce E_fornito in centrale (= E_venduto + perdite rete)
+    # e le sue emissioni sono elettricita HP (mix) + eventuale gas fossile.
+    FATTORE_GAS_TCO2_MWH = 0.20   # t CO2 / MWh termico (gas naturale, ISPRA)
+    RENDIMENTO_GAS_RIF = 0.90     # caldaia a gas di riferimento (baseline)
+    FATTORE_EL_TCO2_MWH = 0.28    # mix elettrico IT ~2023-2024
+    co2_baseline_gas = dom_tot_utenze / RENDIMENTO_GAS_RIF * FATTORE_GAS_TCO2_MWH
+    E_da_gas = E_bk if backup_tipo == "gas" else 0.0
+    co2_sistema = (E_el * FATTORE_EL_TCO2_MWH
+                   + E_da_gas / RENDIMENTO_GAS_RIF * FATTORE_GAS_TCO2_MWH)
+    co2_evitata = co2_baseline_gas - co2_sistema
+
+    # ---------------------------------------------------------------------
     # SNAPSHOT PER CONFRONTO / ECONOMIA
     # ---------------------------------------------------------------------
     st.session_state["_dim_snapshot"] = {
@@ -2166,6 +2070,11 @@ with tab_dimensionamento:
         "cop_alta": round(sim["cop_alta_medio"], 2), "cop_bassa": round(sim["cop_bassa_medio"], 2),
         "spf_sistema": round(_spf, 2),
         "quota_fer_pct": round(quota_fer, 1),
+        "pct_scarto_su_domanda": round(pct_scarto_su_domanda, 1),
+        "pct_rinnovabile": round(pct_rinnovabile, 1),
+        "co2_evitata_t": round(co2_evitata, 1),
+        "co2_sistema_t": round(co2_sistema, 1),
+        "costo_calore_acquistato": round(costo_calore_acq),
         "capex_sistema": round(capex_sistema),
         "capex_rete": round(float(_rete_info.get("capex_rete", 0.0))),
         "lunghezza_rete_m": round(float(_rete_info.get("lunghezza_m", 0.0))),
@@ -2254,9 +2163,14 @@ with tab_confronto:
             ("cop_alta", "COP medio HP alta T"),
             ("spf_sistema", "SPF di sistema"),
             ("quota_fer_pct", "Quota FER (%)"),
+            ("pct_scarto_su_domanda", "Scarto utilizzato / domanda (%)"),
+            ("pct_rinnovabile", "Rinnovabile / fornito (%)"),
+            ("co2_evitata_t", "CO\u2082 evitata (t/a)"),
+            ("co2_sistema_t", "CO\u2082 residua sistema (t/a)"),
             ("ore_non_coperte", "Ore non coperte"),
             ("capex_sistema", "CAPEX centrale (\u20ac)"),
             ("capex_rete", "CAPEX rete (\u20ac)"),
+            ("costo_calore_acquistato", "Acquisto calore scarto (\u20ac/a)"),
             ("opex_annuo", "OPEX (\u20ac/a)"),
             ("costo_annuo", "Costo annuo equivalente (\u20ac/a)"),
             ("lcoh", "LCOH di sistema (\u20ac/MWh)"),
@@ -2293,6 +2207,29 @@ with tab_confronto:
             fig_f.update_layout(height=340, yaxis_title="%", margin=dict(t=20, b=10),
                                 xaxis_tickangle=-20, yaxis_range=[0, 105])
             st.plotly_chart(fig_f, use_container_width=True)
+
+        gg3, gg4 = st.columns(2)
+        with gg3:
+            st.markdown("**CO\u2082 evitata rispetto al gas**")
+            _v = [_scen[n].get("co2_evitata_t", 0) for n in nomi]
+            fig_co2 = go.Figure(go.Bar(x=nomi, y=_v, marker_color="#2E7D32",
+                                       text=[f"{x:,.0f}".replace(",", ".") for x in _v],
+                                       textposition="outside"))
+            fig_co2.update_layout(height=340, yaxis_title="t CO\u2082 / anno",
+                                  margin=dict(t=20, b=10), xaxis_tickangle=-20)
+            st.plotly_chart(fig_co2, use_container_width=True)
+        with gg4:
+            st.markdown("**Scarto utilizzato e rinnovabile**")
+            fig_pct = go.Figure()
+            fig_pct.add_trace(go.Bar(x=nomi, y=[_scen[n].get("pct_scarto_su_domanda", 0) for n in nomi],
+                                     name="Scarto / domanda", marker_color=COLOR_ALTA_T))
+            fig_pct.add_trace(go.Bar(x=nomi, y=[_scen[n].get("pct_rinnovabile", 0) for n in nomi],
+                                     name="Rinnovabile / fornito", marker_color=COLOR_OFFERTA))
+            fig_pct.update_layout(barmode="group", height=340, yaxis_title="%",
+                                  margin=dict(t=20, b=10), xaxis_tickangle=-20,
+                                  legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                  yaxis_range=[0, 105])
+            st.plotly_chart(fig_pct, use_container_width=True)
 
         st.markdown("**Mix di produzione per scenario**")
         fig_mixs = go.Figure()
@@ -2347,11 +2284,18 @@ with tab_economia:
         ec1, ec2, ec3 = st.columns(3)
         with ec1:
             st.markdown("**Ricavi**")
-            prezzo_calore = st.slider("Prezzo di vendita del calore (\u20ac/MWh)", 40, 180, 95, step=5,
-                                      key="eco_prezzo",
-                                      help="Si applica al calore VENDUTO alle utenze, non a quello "
-                                           "prodotto in centrale: le perdite di rete sono a carico "
-                                           "del gestore.")
+            _unita_prezzo = st.radio("Unit\u00e0 del prezzo di vendita", ["\u20ac/MWh", "\u20ac/kWh"],
+                                     horizontal=True, key="eco_unita_prezzo")
+            if _unita_prezzo == "\u20ac/MWh":
+                prezzo_calore = st.slider("Prezzo di vendita del calore (\u20ac/MWh)", 40, 180, 95,
+                                          step=5, key="eco_prezzo",
+                                          help="Si applica al calore VENDUTO alle utenze, non a "
+                                               "quello prodotto in centrale: le perdite di rete "
+                                               "sono a carico del gestore.")
+            else:
+                prezzo_calore = st.slider("Prezzo di vendita del calore (\u20ac/kWh)", 0.040, 0.180,
+                                          0.095, step=0.005, format="%.3f", key="eco_prezzo_kwh",
+                                          help="Si applica al calore VENDUTO alle utenze.") * 1000.0
             quota_fissa = st.slider("Quota fissa per utenza (\u20ac/a)", 0, 800, 250, step=25,
                                     key="eco_quotafissa")
             n_utenze_eco = st.number_input("Numero di utenze contrattualizzate", min_value=0,
@@ -2362,6 +2306,17 @@ with tab_economia:
         with ec2:
             st.markdown("**Costi**")
             st.caption(f"OPEX energia dallo scenario: **{_snap['opex_annuo']:,} \u20ac/a**".replace(",", "."))
+            # costo di acquisto del calore di scarto dalle aziende (gia calcolato
+            # in Dimensionamento a partire dai prezzi per-azienda impostati in Offerta)
+            _costo_scarto_base = float(_snap.get("costo_calore_acquistato", 0))
+            st.caption(f"Calore di scarto acquistato dalle aziende (dai prezzi impostati in "
+                       f"*Offerta*): **{_costo_scarto_base:,.0f} \u20ac/a**".replace(",", "."))
+            _scarto_mult = st.slider("Correttivo sul costo del calore di scarto (\u00d7)",
+                                     0.0, 3.0, 1.0, step=0.1, key="eco_scarto_mult",
+                                     help="Moltiplicatore rapido per testare scenari di prezzo "
+                                          "del cascame senza tornare in Offerta. 1.0 = prezzi "
+                                          "impostati per azienda.")
+            costo_scarto = _costo_scarto_base * _scarto_mult
             om_pct = st.slider("O&M in % del CAPEX totale (\u20ac/a)", 0.5, 5.0, 2.0, step=0.25,
                                key="eco_om")
             pompaggio_kwh_mwh = st.slider("Elettricit\u00e0 di pompaggio (kWh el / MWh distribuito)",
@@ -2404,13 +2359,15 @@ with tab_economia:
         costo_pompaggio_0 = E_prodotto * pompaggio_kwh_mwh / 1000.0 * float(_snap["prezzo_el"])
         om_0 = capex_tot * om_pct / 100.0
         costi_fissi_0 = personale + assicuraz
+        # il calore di scarto acquistato dalle aziende segue l'escalation energia
+        costo_scarto_0 = float(costo_scarto)
 
         # --- flussi di cassa ---
         flussi_cassa = [-(capex_netto) + incasso_allacci]
         dettaglio = []
         for t in range(1, orizzonte + 1):
             ric = ricavi_0 * (1 + esc_ricavi) ** (t - 1)
-            c_en = (opex_energia_0 + costo_pompaggio_0) * (1 + esc_costi) ** (t - 1)
+            c_en = (opex_energia_0 + costo_pompaggio_0 + costo_scarto_0) * (1 + esc_costi) ** (t - 1)
             c_om = (om_0 + costi_fissi_0) * (1 + esc_om) ** (t - 1)
             netto = ric - c_en - c_om
             flussi_cassa.append(netto)
@@ -2427,7 +2384,7 @@ with tab_economia:
         # LCOH completo: include rete, O&M, pompaggio; riferito al calore VENDUTO
         _crf_eco = crf(wacc, orizzonte)
         costo_annuo_completo = (capex_netto * _crf_eco + opex_energia_0 + costo_pompaggio_0
-                                + om_0 + costi_fissi_0)
+                                + costo_scarto_0 + om_0 + costi_fissi_0)
         lcoh_completo = costo_annuo_completo / E_venduto if E_venduto > 0 else np.nan
 
         st.divider()
@@ -2480,6 +2437,7 @@ with tab_economia:
 
         st.markdown("#### Struttura dei costi annui (anno 1)")
         _voci_c = [("Energia (elettricit\u00e0 HP + combustibile)", opex_energia_0, COLOR_HP),
+                   ("Acquisto calore di scarto", costo_scarto_0, COLOR_OFFERTA),
                    ("Pompaggio di rete", costo_pompaggio_0, "#4C6EF5"),
                    ("O&M impianti e rete", om_0, COLOR_ACCUMULO),
                    ("Personale e gestione", personale, "#F4A259"),
@@ -2509,7 +2467,7 @@ with tab_economia:
                 _fc = [-_cn + incasso_allacci]
                 for t in range(1, orizzonte + 1):
                     _fc.append(_r0 * (1 + esc_ricavi) ** (t - 1)
-                               - (opex_energia_0 + costo_pompaggio_0) * (1 + esc_costi) ** (t - 1)
+                               - (opex_energia_0 + costo_pompaggio_0 + costo_scarto_0) * (1 + esc_costi) ** (t - 1)
                                - (om_0 + costi_fissi_0) * (1 + esc_om) ** (t - 1))
                 Z[i, j] = van(_fc, wacc) / 1e6
         fig_sens = go.Figure(go.Heatmap(
@@ -2519,6 +2477,49 @@ with tab_economia:
         fig_sens.update_layout(height=400, xaxis_title="Prezzo di vendita (\u20ac/MWh)",
                                yaxis_title="Contributo a fondo perduto", margin=dict(t=30, b=10))
         st.plotly_chart(fig_sens, use_container_width=True)
+
+        # --- sensitivita sul prezzo del calore di scarto acquistato ---
+        if _costo_scarto_base > 0:
+            st.markdown("#### Sensitivit\u00e0 al prezzo del calore di scarto")
+            st.caption("VAN al variare del correttivo sul costo del cascame acquistato dalle "
+                       "aziende e del prezzo di vendita del calore, a parit\u00e0 del resto.")
+            _mult_range = np.arange(0.0, 3.01, 0.5)
+            _prezzi2 = np.arange(max(prezzo_calore - 40, 30), prezzo_calore + 45, 10)
+            Z2 = np.zeros((len(_mult_range), len(_prezzi2)))
+            for i, mu in enumerate(_mult_range):
+                _cs = _costo_scarto_base * mu
+                for j, pz in enumerate(_prezzi2):
+                    _r0 = E_venduto * pz + ricavo_fisso_0
+                    _fc = [-capex_netto + incasso_allacci]
+                    for t in range(1, orizzonte + 1):
+                        _fc.append(_r0 * (1 + esc_ricavi) ** (t - 1)
+                                   - (opex_energia_0 + costo_pompaggio_0 + _cs) * (1 + esc_costi) ** (t - 1)
+                                   - (om_0 + costi_fissi_0) * (1 + esc_om) ** (t - 1))
+                    Z2[i, j] = van(_fc, wacc) / 1e6
+            fig_sens2 = go.Figure(go.Heatmap(
+                z=Z2, x=[f"{p:.0f}" for p in _prezzi2],
+                y=[f"\u00d7{m:.1f}" for m in _mult_range],
+                colorscale="RdYlGn", zmid=0, colorbar=dict(title="VAN (M\u20ac)"),
+                hovertemplate="vendita %{x} \u20ac/MWh<br>scarto %{y}<br>VAN %{z:.2f} M\u20ac<extra></extra>"))
+            fig_sens2.update_layout(height=360, xaxis_title="Prezzo di vendita (\u20ac/MWh)",
+                                    yaxis_title="Correttivo costo scarto",
+                                    margin=dict(t=30, b=10))
+            st.plotly_chart(fig_sens2, use_container_width=True)
+
+        # --- indicatori ambientali ---
+        st.markdown("#### \U0001F30D Impatto ambientale")
+        amb1, amb2, amb3 = st.columns(3)
+        amb1.metric("CO\u2082 evitata / anno", f"{_snap.get('co2_evitata_t', 0):,.0f} t/a".replace(",", "."),
+                    help="Rispetto a una caldaia a gas equivalente (0,20 tCO\u2082/MWh, rendimento "
+                         "90 %), al netto delle emissioni residue del sistema.")
+        amb2.metric("CO\u2082 evitata nell'orizzonte",
+                    f"{_snap.get('co2_evitata_t', 0) * orizzonte / 1000:,.1f} kt".replace(",", "."),
+                    help=f"su {orizzonte} anni")
+        _val_co2 = st.slider("Valore della CO\u2082 (\u20ac/t) per stima ETS", 0, 200, 80, step=10,
+                             key="eco_valco2")
+        amb3.metric("Valore CO\u2082 evitata / anno",
+                    f"{_snap.get('co2_evitata_t', 0) * _val_co2 / 1000:,.0f} k\u20ac/a".replace(",", "."),
+                    help="Beneficio economico potenziale (non incluso nel VAN sopra).")
 
         with st.expander("\U0001F4C4 Dettaglio dei flussi di cassa anno per anno"):
             df_det = pd.DataFrame(dettaglio)
