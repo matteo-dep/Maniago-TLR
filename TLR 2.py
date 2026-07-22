@@ -1,25 +1,41 @@
 """
-Maniago TLR - Domanda, Offerta, Dimensionamento e Confronto Scenari
-========================================================================
-Avvio: streamlit run provaTLRManiago.py
+=============================================================================
+ MANIAGO TLR - Studio di fattibilita rete di teleriscaldamento
+=============================================================================
+ Sviluppato all'interno del progetto INTERREG HEAT 35
+ https://www.interreg-central.eu/projects/heat-35/
+ da Matteo De Piccoli - APE FVG
+ www.linkedin.com/in/matteo-de-piccoli-2a17a5163
+ matteo.depiccoli@ape.fvg.it | https://www.ape.fvg.it/
+=============================================================================
+ Avvio:  streamlit run "TLR 2.py"
 
-Revisione con patch:
-  Patch 1 - Densità lineare: rimosso doppio fattore di allacciamento
-  Patch 2 - COP HP con lift minimo e cap realistico (IEA F6/F10)
-  Patch 3 - Warning solare quando backup è a combustibile
-  Patch 4 - Guardia anno bisestile su HOURS_2024
-  Patch 5 - Contemporaneità QM applicata solo al picco di dimensionamento
-  Patch 6 - Perdite di rete QM (Fig. 12.3 Verenum Handbook, digitalizzata)
+ REVISIONE - patch applicate
+ ---------------------------
+ P1  Densita lineare: rimosso il doppio fattore di allacciamento
+ P2  COP HP con lift minimo (8 K) e cap realistico (6.5) - IEA DHC F6/F10
+ P3  Warning se solare attivo con supporto a combustibile
+ P4  Guardia anno bisestile su HOURS_2024 (8784 h)
+ P5  Contemporaneita QM (Fig. 12.2) applicata SOLO al picco di dimensionamento
+ P6  Perdite di rete QM (Fig. 12.3 Verenum) sulla domanda alla centrale
+ P7  MERIT ORDER: uso diretto dei flussi nell'ora corrente (l'accumulo non e
+     piu un collo di bottiglia). La HP alta T ha SEMPRE precedenza sul
+     combustibile: il gas/biomassa entra solo sul residuo.
+ P8  Forni di forgiatura Pietro Rosa da misure Ecol Studio 14/07/2025
+     (rapporti 25LF24167/168/169/170 - punti E1, E4, E5, E6)
+ P9  Scenari salvati rimovibili singolarmente
 
-File richiesti nella stessa cartella (DATI GREZZI, stabili):
-  - maniago_domanda_edifici.csv                  anagrafica edifici pubblici + zone private
-  - maniago_domanda_oraria_8760h_HDD_reale.csv   domanda oraria (MWh_riscaldamento, MWh_ACS)
-  - maniago_aziende_offerta.csv                  tabella generica aziende (potenza/T/portata/profilo)
-  - pvgis_maniago_pulito.csv                     irraggiamento solare reale orario (PVGIS 2005-2023)
-  - maniago_temperatura_giornaliera_tipo.csv     T_mean/HDD per giorno (anno tipo)
-  - maniago_mappa_utenze.csv                     coordinate edifici/condomini/aziende per la mappa
-  - maniago_condomini_con_domanda.csv            dettaglio condomini (via, zona, domanda stimata)
-  - maniago_densita_lineare_per_cluster.csv      risultato calcolo densità lineare
+ File dati richiesti nella stessa cartella:
+   maniago_domanda_edifici.csv
+   maniago_domanda_oraria_8760h_HDD_reale.csv
+   maniago_flussi_offerta.csv
+   pvgis_maniago_pulito.csv
+   maniago_mappa_utenze.csv          (opzionale)
+   maniago_condomini.csv             (opzionale)
+   maniago_privati_edifici.csv       (opzionale)
+   edifici_pubblici_coordinate.csv   (opzionale)
+   TLR_zones_borders.geojson
+=============================================================================
 """
 import streamlit as st
 import pandas as pd
@@ -28,21 +44,46 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
-st.set_page_config(page_title="Maniago TLR", layout="wide", page_icon="🔥")
+st.set_page_config(page_title="Maniago TLR | HEAT35 - APE FVG", layout="wide", page_icon="\U0001F525")
+
+# -----------------------------------------------------------------------------
+# RIFERIMENTI DI PROGETTO
+# -----------------------------------------------------------------------------
+PROGETTO_HTML = (
+    "Sviluppato all'interno del progetto **INTERREG HEAT 35** "
+    "([scheda progetto](https://www.interreg-central.eu/projects/heat-35/)) "
+    "da **Matteo De Piccoli** "
+    "([LinkedIn](https://www.linkedin.com/in/matteo-de-piccoli-2a17a5163)) - "
+    "[APE FVG](https://www.ape.fvg.it/)"
+)
+FOOTER_HTML = (
+    "\U0001F310 Progetto: [Interreg HEAT35](https://www.interreg-central.eu/projects/heat-35/) "
+    "&nbsp;|&nbsp; \U0001F3E0 Sito Ente: [APE FVG](https://www.ape.fvg.it/) "
+    "&nbsp;|&nbsp; \U0001F4E7 Contatto: [matteo.depiccoli@ape.fvg.it](mailto:matteo.depiccoli@ape.fvg.it)"
+)
 
 # --- default degli slider forzati al primo avvio ---
 DEFAULTS_SLIDER = {
     "dom_t_mandata": 80,
     "dom_t_ritorno": 50,
 }
+
+
 def applica_default_slider(force=False):
     for k, v in DEFAULTS_SLIDER.items():
         if force or k not in st.session_state:
             st.session_state[k] = v
+
+
 if "_init_done" not in st.session_state:
     applica_default_slider(force=True)
     st.session_state["_init_done"] = True
+if "_scenari" not in st.session_state:
+    st.session_state["_scenari"] = {}
 
+# -----------------------------------------------------------------------------
+# PALETTE
+# -----------------------------------------------------------------------------
 COLOR_RISCALDAMENTO = "#C0522D"
 COLOR_ACS = "#2D7DC0"
 COLOR_OFFERTA = "#3FA34D"
@@ -50,15 +91,15 @@ COLOR_ACCUMULO = "#8E5FC2"
 COLOR_HP = "#22C3DD"
 COLOR_CALDAIA = "#B0413E"
 COLOR_EX_BIOMAN = "#E63946"
-
-COLOR_ALTA_T   = "#FF4B4B"
-COLOR_HP_ALTA  = COLOR_HP
+COLOR_ALTA_T = "#FF4B4B"
+COLOR_HP_ALTA = COLOR_HP
 COLOR_HP_BASSA = "#B57EDC"
-COLOR_SOLARE   = "#F5C518"
-COLOR_BACKUP   = "#FF9F1C"
-COLOR_NONCOP   = "#9AA0A6"
-COLOR_DOMANDA  = "#FFFFFF"
-
+COLOR_SOLARE = "#F5C518"
+COLOR_BACKUP = "#FF9F1C"
+COLOR_NONCOP = "#9AA0A6"
+COLOR_DOMANDA = "#FFFFFF"
+COLOR_GROUND = "#8C6D46"
+COLOR_FORNI = "#FF7043"
 
 ZONE_NOMI = {
     1: "Zona 1 - Comune NE",
@@ -71,13 +112,128 @@ ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Ex Bioman"]
 ZONA_COLORI = {
     "Zona 1 - Comune NE": "#2D7DC0",
     "Zona 2 - Ex Bioman": "#E63946",
-    "Zona 3 - Sud":       "#E9C46A",
-    "Zona 4 - Centro":    "#9B5DE5",
-    "Zona 5 - Ovest":     "#3FA34D",
+    "Zona 3 - Sud": "#E9C46A",
+    "Zona 4 - Centro": "#9B5DE5",
+    "Zona 5 - Ovest": "#3FA34D",
 }
 CAMPAGNA_LON_MIN = 12.73
 
+MONTH_NAMES = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
+RHO_CP = 1.163          # kWh/(m3*K)
+MWH_PER_UNITA = 9.0
+HOURS_2024 = pd.date_range("2024-01-01", "2024-12-31 23:00", freq="h")
+DAYS_2024 = pd.date_range("2024-01-01", "2024-12-31", freq="D")
 
+AZIENDE_COORD = {
+    "ZML": (46.1478, 12.7139),
+    "Pietro Rosa": (46.1432, 12.7215),
+    "Pandolfo": (46.1485, 12.7160),
+    "Inossman": (46.1501, 12.7145),
+}
+CENTRALE_LAT, CENTRALE_LON = 46.1479, 12.7151
+
+# =============================================================================
+# P8 - FORNI DI FORGIATURA PIETRO ROSA T.B.M.
+# =============================================================================
+# Misure Ecol Studio SpA del 14/07/2025 - rapporti di prova 25LF24167 (E1),
+# 25LF24168 (E4), 25LF24169 (E5), 25LF24170 (E6).
+# Prelievi in condizioni di massimo regime.
+# Tutti i camini presentano O2 = 20.9 % vol: i fumi sono fortemente diluiti
+# con aria ambiente per effetto del tiraggio naturale (confermato dal
+# riscontro aziendale: 400 C in bocca forno, 220-240 C sulla lamiera del
+# camino, ~100 C da termografia).
+# Il calore recuperabile e quindi calore SENSIBILE su portate d'aria elevate.
+#
+#   punto  impianto                              Te [K]   T [C]   qv,e [m3/h]  qv,r [Nm3/h]
+#   E1     Forni da riscaldo MAGLIO MAS10000      321      48      2117         1772
+#   E4     Forni da riscaldo MAGLIO 3000          417     144     13400         8722
+#   E5     Forni da riscaldo                      357      84      1361         1035
+#   E6     Forni da riscaldo                      323      50      1936         1628
+#
+# Calore specifico volumetrico dei fumi (assimilabili ad aria secca, H2O < 1 %):
+#   cp ~ 1.30 kJ/(Nm3*K) = 3.61e-4 kWh/(Nm3*K)
+CP_FUMI_KWH_NM3_K = 3.61e-4
+
+FORNI_PIETRO_ROSA = [
+    # (punto, descrizione, T_misurata_C, portata_Nm3h, T_scarico_default_C)
+    ("E4", "Forni da riscaldo MAGLIO 3000",      144.0, 8722.0, 60.0),
+    ("E5", "Forni da riscaldo (linea E5)",        84.0, 1035.0, 45.0),
+    ("E6", "Forni da riscaldo (linea E6)",        50.0, 1628.0, 40.0),
+    ("E1", "Forni da riscaldo MAGLIO MAS10000",   48.0, 1772.0, 40.0),
+]
+
+# Regime di esercizio dichiarato dall'azienda: ciclo continuo 24/24, 7/7.
+# Fermate: due settimane centrali di agosto; festivita "normali" (1 gennaio,
+# 6 gennaio, Pasquetta, 25 aprile, 1 maggio, 2 giugno, 1 novembre, 8 dicembre).
+# A Natale i forni restano tendenzialmente accesi -> nessuna fermata natalizia.
+FERMATE_FORNI = (
+    [pd.Timestamp(d) for d in pd.date_range("2024-08-05", "2024-08-18")] +
+    [pd.Timestamp(x) for x in
+     ["2024-01-01", "2024-01-06", "2024-04-01", "2024-04-25",
+      "2024-05-01", "2024-06-02", "2024-11-01", "2024-12-08"]]
+)
+
+
+def potenza_forno_kw(portata_nm3h, T_fumi_C, T_scarico_C):
+    """Potenza termica sensibile recuperabile da un camino (kW)."""
+    return max(portata_nm3h * CP_FUMI_KWH_NM3_K * (T_fumi_C - T_scarico_C), 0.0)
+
+
+def genera_flussi_forni(T_e4_C=144.0, delta_altri=0.0, T_scarico_shift=0.0, pinch=5.0):
+    """Serie orarie dei 4 camini Pietro Rosa, ciclo continuo con fermate.
+
+    T_e4_C          temperatura di progetto del camino E4 (sensitivita 100-180 C)
+    delta_altri     scostamento applicato agli altri tre camini (C)
+    T_scarico_shift scostamento sulla T di scarico post-recupero (C)
+    """
+    fermi = set(pd.Timestamp(d).normalize() for d in FERMATE_FORNI)
+    attivo = ~pd.Series(HOURS_2024.normalize()).isin(fermi).values
+    frames = []
+    for punto, descr, T_mis, portata, T_out0 in FORNI_PIETRO_ROSA:
+        T_f = T_e4_C if punto == "E4" else max(T_mis + delta_altri, 20.0)
+        T_out = max(T_out0 + T_scarico_shift, 30.0)
+        P_kw = potenza_forno_kw(portata, T_f, T_out)
+        T_disp = T_f - pinch
+        P = np.where(attivo, P_kw, 0.0)
+        Td = np.where(attivo, T_disp, np.nan)
+        frames.append(pd.DataFrame({
+            "datetime": HOURS_2024,
+            "id_flusso": f"Pietro Rosa \u00b7 {punto} {descr}",
+            "azienda": "Pietro Rosa",
+            "flusso": f"{punto} - {descr}",
+            "destinazione": "alta_T" if T_disp >= 80 else "bassa_T",
+            "fonte": "Pietro Rosa",
+            "MWh": P / 1000.0,
+            "P_kW": P,
+            "T_disponibile": Td,
+        }))
+    return pd.concat(frames, ignore_index=True)
+
+
+def tabella_forni(T_e4_C=144.0, delta_altri=0.0, T_scarico_shift=0.0):
+    """Riepilogo tabellare dei 4 camini con potenze ed energie annue."""
+    ore_attive = int(len(HOURS_2024) - len(set(pd.Timestamp(d).normalize() for d in FERMATE_FORNI)) * 24)
+    righe = []
+    for punto, descr, T_mis, portata, T_out0 in FORNI_PIETRO_ROSA:
+        T_f = T_e4_C if punto == "E4" else max(T_mis + delta_altri, 20.0)
+        T_out = max(T_out0 + T_scarico_shift, 30.0)
+        P_kw = potenza_forno_kw(portata, T_f, T_out)
+        righe.append({
+            "Punto": punto,
+            "Impianto": descr,
+            "T misurata (\u00b0C)": T_mis,
+            "T di progetto (\u00b0C)": round(T_f, 1),
+            "Portata (Nm\u00b3/h)": int(portata),
+            "T scarico (\u00b0C)": round(T_out, 1),
+            "Potenza recuperabile (kW)": round(P_kw, 1),
+            "Energia (MWh/a)": round(P_kw * ore_attive / 1000.0, 1),
+        })
+    return pd.DataFrame(righe), ore_attive
+
+
+# =============================================================================
+# GEOMETRIE E ZONE
+# =============================================================================
 def _anelli_zona(geom):
     polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
     return [np.asarray(p[0], dtype=float) for p in polys]
@@ -94,7 +250,9 @@ def carica_zone_confini(path="TLR_zones_borders.geojson"):
 
 def _punto_in_anello(lon, lat, ring):
     x, y = ring[:, 0], ring[:, 1]
-    n = len(x); dentro = False; j = n - 1
+    n = len(x)
+    dentro = False
+    j = n - 1
     for i in range(n):
         if ((y[i] > lat) != (y[j] > lat)) and \
            (lon < (x[j] - x[i]) * (lat - y[i]) / (y[j] - y[i] + 1e-15) + x[i]):
@@ -115,59 +273,66 @@ def zona_da_coordinate(lat, lon, zone_poly):
     return None
 
 
-AZIENDE_COORD = {
-    "ZML":         (46.1478, 12.7139),
-    "Pietro Rosa": (46.1432, 12.7215),
-    "Pandolfo":    (46.1485, 12.7160),
-    "Inossman":    (46.1501, 12.7145),
-}
-CENTRALE_LAT, CENTRALE_LON = 46.1479, 12.7151
-
-
 def mst_archi(lat, lon, radice=None):
-    lat = np.asarray(lat, dtype=float); lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
     ok = np.isfinite(lat) & np.isfinite(lon)
     lat, lon = lat[ok], lon[ok]
     if radice is not None:
-        lat = np.insert(lat, 0, radice[0]); lon = np.insert(lon, 0, radice[1])
+        lat = np.insert(lat, 0, radice[0])
+        lon = np.insert(lon, 0, radice[1])
     n = len(lat)
     if n < 2:
         return [], 0.0
     R = 6371000.0
-    la = np.radians(lat); lo = np.radians(lon)
-    x = R * lo * np.cos(la.mean()); y = R * la
-    dentro = np.zeros(n, dtype=bool); dentro[0] = True
+    la = np.radians(lat)
+    lo = np.radians(lon)
+    x = R * lo * np.cos(la.mean())
+    y = R * la
+    dentro = np.zeros(n, dtype=bool)
+    dentro[0] = True
     dist = np.hypot(x - x[0], y - y[0])
     padre = np.zeros(n, dtype=int)
-    archi = []; tot = 0.0
+    archi = []
+    tot = 0.0
     for _ in range(n - 1):
         d2 = np.where(dentro, np.inf, dist)
         j = int(np.argmin(d2))
         if not np.isfinite(d2[j]):
             break
-        p = int(padre[j]); tot += float(dist[j]); dentro[j] = True
+        p = int(padre[j])
+        tot += float(dist[j])
+        dentro[j] = True
         archi.append(((lat[p], lon[p]), (lat[j], lon[j]), float(dist[j])))
         nd = np.hypot(x - x[j], y - y[j])
         agg = nd < dist
-        padre[agg] = j; dist = np.minimum(dist, nd)
+        padre[agg] = j
+        dist = np.minimum(dist, nd)
     return archi, tot
 
 
 def stima_lunghezza_rete(lat, lon, fattore_tortuosita=1.35):
-    lat = np.asarray(lat, dtype=float); lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
     ok = np.isfinite(lat) & np.isfinite(lon)
     lat, lon = lat[ok], lon[ok]
     n = len(lat)
     if n < 2:
         return 0.0
     R = 6371000.0
-    la = np.radians(lat); lo = np.radians(lon)
-    x = R * lo * np.cos(la.mean()); y = R * la
-    in_albero = np.zeros(n, dtype=bool); in_albero[0] = True
-    dist = np.hypot(x - x[0], y - y[0]); tot = 0.0
+    la = np.radians(lat)
+    lo = np.radians(lon)
+    x = R * lo * np.cos(la.mean())
+    y = R * la
+    in_albero = np.zeros(n, dtype=bool)
+    in_albero[0] = True
+    dist = np.hypot(x - x[0], y - y[0])
+    tot = 0.0
     for _ in range(n - 1):
         dist[in_albero] = np.inf
-        j = int(np.argmin(dist)); tot += float(dist[j]); in_albero[j] = True
+        j = int(np.argmin(dist))
+        tot += float(dist[j])
+        in_albero[j] = True
         dist = np.minimum(dist, np.hypot(x - x[j], y - y[j]))
     return tot * fattore_tortuosita
 
@@ -187,38 +352,37 @@ def hex_to_rgba(color, alpha=0.85):
     return f"rgba({r},{g},{b},{alpha})"
 
 
-MONTH_NAMES = ["Gen","Feb","Mar","Apr","Mag","Giu","Lug","Ago","Set","Ott","Nov","Dic"]
-RHO_CP = 1.163  # kWh/(m3*K)
-MWH_PER_UNITA = 9.0
-HOURS_2024 = pd.date_range('2024-01-01', '2024-12-31 23:00', freq='h')
-DAYS_2024 = pd.date_range('2024-01-01', '2024-12-31', freq='D')
-
-
 def soil_temp_monthly(pvgis_df, depth_m=1.5, alpha=0.6e-6):
-    """Temperatura del terreno (°C) per mese alla profondità data."""
+    """Temperatura del terreno (C) per mese alla profondita data."""
     T = pvgis_df["T2m"].astype(float).values
     doy = pvgis_df["datetime"].dt.dayofyear.values.astype(float)
     w = 2 * np.pi / 365.25
     X = np.column_stack([np.ones_like(doy), np.cos(w * doy), np.sin(w * doy)])
     coef, *_ = np.linalg.lstsq(X, T, rcond=None)
-    Tm = float(coef[0]); A = float(np.hypot(coef[1], coef[2]))
+    Tm = float(coef[0])
+    A = float(np.hypot(coef[1], coef[2]))
     t_peak = float((np.arctan2(coef[2], coef[1]) / w) % 365.25)
     P = 365.25 * 86400.0
     d = np.sqrt(alpha * P / np.pi)
-    damp = np.exp(-depth_m / d); lag = (depth_m / d) / w
+    damp = np.exp(-depth_m / d)
+    lag = (depth_m / d) / w
     return np.array([Tm + A * damp * np.cos(w * (pd.Timestamp(2024, m, 15).dayofyear - t_peak - lag))
                      for m in range(1, 13)])
 
 
 # =============================================================================
-# PATCH 2 - COP HP con vincoli fisici realistici
+# P2 - COP con vincoli fisici realistici (IEA DHC TS5 F6/F10)
 # =============================================================================
 def cop_singola(T_src, T_mand, eta, lift_min_K=8.0, cop_max=6.5):
-    """COP a stadio singolo (Carnot × η) con vincoli fisici realistici:
-    - lift_min_K: ΔT effettivo minimo del compressore (perdite meccaniche,
-      surriscaldamento, sottoraffreddamento). Evita COP → ∞ quando T_src ≈ T_mand.
-    - cop_max: soglia superiore realistica per HP industriali (IEA DHC F6/F10).
-    Funziona anche su array numpy."""
+    """COP a stadio singolo (Carnot x eta) con vincoli realistici.
+
+    lift_min_K  delta T effettivo minimo del compressore reale (perdite
+                meccaniche, surriscaldamento, sottoraffreddamento). Impedisce
+                COP -> infinito quando la sorgente e quasi alla T di mandata.
+    cop_max     tetto realistico per HP industriali (IEA DHC F6/F10:
+                excess heat 25 C, lift 25-40 K -> COP 3-5).
+    Funziona anche su array numpy.
+    """
     Tc = np.asarray(T_src, dtype=float) + 273.15
     Th = float(T_mand) + 273.15
     lift = np.maximum(Th - Tc, lift_min_K)
@@ -226,8 +390,65 @@ def cop_singola(T_src, T_mand, eta, lift_min_K=8.0, cop_max=6.5):
     return np.minimum(cop, cop_max)
 
 
+def crf(rate, anni):
+    """Capital Recovery Factor."""
+    if anni <= 0:
+        return 1.0
+    if rate <= 0:
+        return 1.0 / anni
+    return rate / (1.0 - (1.0 + rate) ** (-anni))
+
+
+# =============================================================================
+# P5 - Contemporaneita QM (Handbook Fig. 12.2)
+# =============================================================================
+def coeff_simultaneita_QM(n_utenze):
+    """Coefficiente di contemporaneita secondo QM Handbook Fig. 12.2.
+
+    10-20 utenze -> ~0.95 ; oltre 100 utenze -> ~0.60. Interpolazione log.
+    Si applica al PICCO di dimensionamento, non all'energia annua.
+    """
+    if n_utenze <= 1:
+        return 1.0
+    n = np.clip(n_utenze, 1, 500)
+    return float(np.interp(np.log(n),
+                           np.log([1, 10, 20, 100, 500]),
+                           [1.0, 0.98, 0.95, 0.60, 0.55]))
+
+
+# =============================================================================
+# P6 - Perdite di rete QM (Handbook Fig. 12.3 / Verenum cap. 7.1 - 12.2.8)
+# =============================================================================
+def perdite_pct_QM(densita_MWh_m_a, T_media_rete_C=65, classe_isolante=2):
+    """Perdite di distribuzione in % del calore venduto.
+
+    Digitalizzata dal Verenum Planungshandbuch Fernwarme.
+    Ancoraggio: densita 2.0 MWh/(m*a), T media 65 C, classe isolante 2 -> 10.5 %
+    (benchmark QM: 1 MW connesso, 1 km di rete, target <= 10 %).
+    La perdita specifica in W/m e circa costante: la percentuale scala come
+    1/densita, mentre la vendita per metro cresce linearmente con la densita.
+      classe_isolante  1 = minima, 2 = media (default), 3 = alta (target QM)
+    """
+    W_per_m_65 = 24.0
+    fattore_classe = {1: 1.4, 2: 1.0, 3: 0.8}.get(classe_isolante, 1.0)
+    T_terreno = 13.0
+    fattore_T = (T_media_rete_C - T_terreno) / (65 - T_terreno)
+    # perdita specifica annua per metro, in MWh/(m*a):
+    #   W/m * 8760 h = Wh/(m*a); /1e6 -> MWh/(m*a)
+    perdite_MWh_m_a = W_per_m_65 * fattore_classe * fattore_T * 8760 / 1e6
+    return perdite_MWh_m_a / max(densita_MWh_m_a, 0.1) * 100
+
+
+# =============================================================================
+# ROUTING DEI FLUSSI PER TEMPERATURA
+# =============================================================================
 def routing_flussi(off_df, idx_h, mandata, T_int):
-    """Instrada ogni flusso-ora per temperatura."""
+    """Instrada ogni flusso-ora sul livello termico corretto.
+
+    >= mandata            -> anello CALDO (uso diretto, nessuna HP)
+    tra T_int e mandata   -> anello INTERMEDIO (evaporatore della HP alta T)
+    <  T_int              -> anello BASSO, suddiviso in bin da 5 K
+    """
     o = off_df[off_df["MWh"] > 0].copy()
     o["T"] = o["T_disponibile"]
     hot = o[o["T"] >= mandata].groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0.0)
@@ -248,13 +469,30 @@ def routing_flussi(off_df, idx_h, mandata, T_int):
     return hot.values, intm.values, q_low.values, q_low_bins, bin_T
 
 
+# =============================================================================
+# P7 - DISPATCH A CASCATA CON MERIT ORDER
+# =============================================================================
 def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                      mandata, ritorno, T_int, dT_evap, eta_hp,
                      V_hot, V_int, V_low,
                      P_hp_alta_kw, P_hp_bassa_kw,
                      parallelo="HP bassa T", P_backup_kw=0.0, backup_cop=None,
                      antigelo=0.0, perdita_sett_pct=1.0):
-    """Dispatch orario dello schema a cascata con 3 accumuli stratificati."""
+    """Dispatch orario dello schema a cascata con 3 accumuli stratificati.
+
+    MERIT ORDER (P7) - ordine di merito rigido, indipendente dai prezzi:
+      1. calore di scarto >= mandata, usato DIRETTAMENTE
+      2. HP alta T, che solleva dal livello intermedio alla mandata
+      3. HP bassa T (se prevista), che ricarica il livello intermedio
+      4. caldaia a combustibile, SOLO sul residuo non coperto dai punti 1-3
+
+    Differenza chiave rispetto alla versione precedente: i flussi disponibili
+    nell'ora corrente sono utilizzabili SUBITO, senza dover transitare per
+    l'accumulo. In precedenza, con V_int = 0 la capacita era nulla e tutto il
+    calore intermedio veniva scartato: la HP alta T non partiva mai e il gas
+    copriva il 100 % della domanda. Gli accumuli ora servono solo a spostare
+    energia nel tempo, come nella realta.
+    """
     n = len(dom_arr)
     swing = max(mandata - ritorno, 1.0)
     C_hot = V_hot * RHO_CP * swing / 1000.0
@@ -267,98 +505,144 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
     P_bassa = P_hp_bassa_kw / 1000.0
     P_bk = P_backup_kw / 1000.0
 
-    q_hot_direct = np.zeros(n); q_alta = np.zeros(n); q_bassa = np.zeros(n)
-    q_backup = np.zeros(n); el_alta = np.zeros(n); el_bassa = np.zeros(n)
+    q_hot_direct = np.zeros(n)
+    q_alta = np.zeros(n)
+    q_bassa = np.zeros(n)
+    q_backup = np.zeros(n)
+    el_alta = np.zeros(n)
+    el_bassa = np.zeros(n)
     q_ground = np.zeros(n)
-    non_cop = np.zeros(n); scarto_perso = np.zeros(n)
-    cop_alta_s = np.zeros(n); cop_bassa_s = np.full(n, np.nan)
+    non_cop = np.zeros(n)
+    scarto_perso = np.zeros(n)
+    cop_alta_s = np.full(n, np.nan)
+    cop_bassa_s = np.full(n, np.nan)
     ore_ground = 0
 
-    soc_hot = soc_int = 0.0
+    soc_hot = 0.0
+    soc_int = 0.0
     soc_low_bins = np.zeros(len(bin_T))
-    for i in range(n):
-        if perdita_ora > 0:
-            soc_hot -= soc_hot * perdita_ora; soc_int -= soc_int * perdita_ora
-            soc_low_bins *= (1.0 - perdita_ora)
 
-        ch = min(q_hot_arr[i], C_hot - soc_hot); soc_hot += ch
-        scarto_perso[i] += max(q_hot_arr[i] - ch, 0.0)
-        ci = min(q_int_arr[i], C_int - soc_int); soc_int += ci
-        scarto_perso[i] += max(q_int_arr[i] - ci, 0.0)
-        q_low_h = q_low_bins[i]
-        if is_hp:
-            soc_low_bins = soc_low_bins + q_low_h
-            over = soc_low_bins.sum() - C_low
-            if over > 1e-12:
-                scarto_perso[i] += over
-                for k in range(len(soc_low_bins)):
-                    drop = min(soc_low_bins[k], over)
-                    soc_low_bins[k] -= drop; over -= drop
-                    if over <= 1e-12:
-                        break
-        else:
-            scarto_perso[i] += float(q_low_h.sum())
+    for i in range(n):
+        # --- dispersioni degli accumuli ---
+        if perdita_ora > 0:
+            soc_hot -= soc_hot * perdita_ora
+            soc_int -= soc_int * perdita_ora
+            soc_low_bins = soc_low_bins * (1.0 - perdita_ora)
+
+        # --- pool disponibili nell'ora: stock + flusso in ingresso (P7) ---
+        pool_hot = soc_hot + q_hot_arr[i]
+        pool_int = soc_int + q_int_arr[i]
+        pool_low_bins = soc_low_bins + q_low_bins[i]
+        if not is_hp:
+            # senza HP bassa T il livello basso non ha utilizzatori
+            scarto_perso[i] += float(pool_low_bins.sum())
+            pool_low_bins = np.zeros_like(pool_low_bins)
 
         dom = dom_arr[i]
-        d_hot = min(dom, soc_hot); soc_hot -= d_hot; q_hot_direct[i] = d_hot
+
+        # --- MERIT 1: scarto >= mandata, uso diretto ---
+        d_hot = min(dom, pool_hot)
+        pool_hot -= d_hot
+        q_hot_direct[i] = d_hot
         residuo = dom - d_hot
 
-        cop_a = cop_singola(T_int - dT_evap, mandata, eta_hp)
-        cop_alta_s[i] = cop_a
+        # --- MERIT 2: HP alta T (precede SEMPRE il combustibile) ---
+        cop_a = float(cop_singola(T_int - dT_evap, mandata, eta_hp))
         if residuo > 1e-9 and P_alta > 0 and cop_a > 1:
+            cop_alta_s[i] = cop_a
             q_a_want = min(residuo, P_alta)
-            E_a_want = q_a_want * (1.0 - 1.0 / cop_a)
+            frac_evap = 1.0 - 1.0 / cop_a          # quota di calore presa all'evaporatore
+            E_a_want = q_a_want * frac_evap
+            # energia disponibile all'evaporatore: livello intermedio + eventuale
+            # ricarica in tempo reale dalla HP bassa T
             extra_bassa = P_bassa if is_hp else 0.0
-            E_a = min(E_a_want, soc_int + extra_bassa)
-            q_a = E_a / (1.0 - 1.0 / cop_a)
-            from_int = min(E_a, soc_int); soc_int -= from_int
-            from_bassa = E_a - from_int
-            if from_bassa > 1e-12 and is_hp and P_bassa > 0:
-                soc_tot = soc_low_bins.sum()
-                g_T = max(soil_arr[i], antigelo)
-                if soc_tot > 1e-9:
-                    need = from_bassa; e_acc = 0.0; wt = 0.0
-                    for k in range(len(bin_T) - 1, -1, -1):
-                        take = min(soc_low_bins[k], need)
-                        e_acc += take; wt += take * bin_T[k]; need -= take
+            E_a = min(E_a_want, pool_int + extra_bassa)
+            if E_a > 1e-12:
+                q_a = E_a / frac_evap
+                from_int = min(E_a, pool_int)
+                pool_int -= from_int
+                from_bassa = E_a - from_int
+
+                # --- MERIT 3: HP bassa T, ricarica il livello intermedio ---
+                if from_bassa > 1e-12 and is_hp and P_bassa > 0:
+                    g_T = max(soil_arr[i], antigelo)
+                    soc_tot = float(pool_low_bins.sum())
+                    if soc_tot > 1e-9:
+                        need = from_bassa
+                        e_acc = 0.0
+                        wt = 0.0
+                        for k in range(len(bin_T) - 1, -1, -1):
+                            take = min(pool_low_bins[k], need)
+                            e_acc += take
+                            wt += take * bin_T[k]
+                            need -= take
+                            if need <= 1e-12:
+                                break
+                        if need > 1e-12:
+                            wt += need * g_T
+                            e_acc += need
+                        src_T = wt / e_acc if e_acc > 0 else g_T
+                        src_is_ground = False
+                    else:
+                        src_T = g_T
+                        src_is_ground = True
+                    cop_b = float(cop_singola(src_T - dT_evap, T_int, eta_hp))
+                    cop_bassa_s[i] = cop_b
+                    q_b = from_bassa
+                    E_b = q_b * (1.0 - 1.0 / cop_b) if cop_b > 1 else q_b
+                    need = E_b
+                    for k in range(len(pool_low_bins) - 1, -1, -1):
+                        take = min(pool_low_bins[k], need)
+                        pool_low_bins[k] -= take
+                        need -= take
                         if need <= 1e-12:
                             break
-                    if need > 1e-12:
-                        wt += need * g_T; e_acc += need
-                    src_T = wt / e_acc if e_acc > 0 else g_T
-                    src_is_ground = False
-                else:
-                    src_T = g_T; src_is_ground = True
-                cop_b = cop_singola(src_T - dT_evap, T_int, eta_hp)
-                cop_bassa_s[i] = cop_b
-                q_b = from_bassa
-                E_b = q_b * (1.0 - 1.0 / cop_b) if cop_b > 1 else q_b
-                need = E_b
-                for k in range(len(soc_low_bins) - 1, -1, -1):
-                    take = min(soc_low_bins[k], need)
-                    soc_low_bins[k] -= take; need -= take
-                    if need <= 1e-12:
-                        break
-                q_ground[i] = max(need, 0.0)
-                if src_is_ground or q_ground[i] > 1e-9:
-                    ore_ground += 1
-                q_bassa[i] = q_b
-                el_bassa[i] = q_b / cop_b if cop_b > 0 else 0.0
-            el_alta[i] = q_a / cop_a
-            q_alta[i] = q_a
-            residuo -= q_a
+                    q_ground[i] = max(need, 0.0)
+                    if src_is_ground or q_ground[i] > 1e-9:
+                        ore_ground += 1
+                    q_bassa[i] = q_b
+                    el_bassa[i] = q_b / cop_b if cop_b > 0 else 0.0
 
-        if not is_hp and residuo > 1e-9 and P_bk > 0:
+                el_alta[i] = q_a / cop_a
+                q_alta[i] = q_a
+                residuo -= q_a
+
+        # --- MERIT 4: combustibile, solo sul residuo ---
+        if (not is_hp) and residuo > 1e-9 and P_bk > 0:
             q_k = min(residuo, P_bk)
             q_backup[i] = q_k
             if backup_cop is not None and backup_cop > 0:
-                el_bassa[i] = q_k / backup_cop
+                el_bassa[i] += q_k / backup_cop
             residuo -= q_k
+
         non_cop[i] = max(residuo, 0.0)
 
-    E_hot = float(q_hot_direct.sum()); E_alta = float(q_alta.sum())
-    E_bassa = float(q_bassa.sum()); E_bk = float(q_backup.sum())
-    E_el_alta = float(el_alta.sum()); E_el_bassa = float(el_bassa.sum())
+        # --- fine ora: quel che avanza va in accumulo, il resto e perso ---
+        soc_hot = min(pool_hot, C_hot)
+        scarto_perso[i] += max(pool_hot - C_hot, 0.0)
+        soc_int = min(pool_int, C_int)
+        scarto_perso[i] += max(pool_int - C_int, 0.0)
+        if is_hp:
+            tot_low = float(pool_low_bins.sum())
+            if tot_low > C_low:
+                over = tot_low - C_low
+                scarto_perso[i] += over
+                for k in range(len(pool_low_bins)):
+                    drop = min(pool_low_bins[k], over)
+                    pool_low_bins[k] -= drop
+                    over -= drop
+                    if over <= 1e-12:
+                        break
+            soc_low_bins = pool_low_bins
+        else:
+            soc_low_bins = np.zeros(len(bin_T))
+
+    E_hot = float(q_hot_direct.sum())
+    E_alta = float(q_alta.sum())
+    E_bassa = float(q_bassa.sum())
+    E_bk = float(q_backup.sum())
+    E_el_alta = float(el_alta.sum())
+    E_el_bassa = float(el_bassa.sum())
     cop_alta_medio = E_alta / E_el_alta if E_el_alta > 1e-9 else 0.0
     cop_bassa_medio = E_bassa / E_el_bassa if E_el_bassa > 1e-9 else 0.0
     return {
@@ -377,18 +661,25 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
 def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                       mandata, ritorno, T_int, dT_evap, eta_hp, parallelo,
                       capex_hp_func, capex_backup_kw, opex_backup_mwh, backup_cop,
-                      prezzo_el, costo_m3, capex_solare_fisso, fattore_crf, perdita_func, antigelo,
-                      **kwargs):
-    """Dimensiona P_hp_alta, P_hp_bassa, V_hot, V_int, V_low a LCOH minimo."""
+                      prezzo_el, costo_m3, capex_solare_fisso, fattore_crf,
+                      perdita_func, antigelo, **kwargs):
+    """Dimensiona P_hp_alta, P_hp_bassa, V_hot, V_int, V_low a LCOH minimo.
+
+    Vincolo: copertura 100 % delle ore (backup firm sul picco).
+    picco_kw_override: picco di dimensionamento gia corretto con la
+    contemporaneita QM (P5).
+    """
     dom_tot = float(dom_arr.sum())
     if dom_tot <= 0:
         return None
-    # PATCH 5: usa il picco realistico (con contemporaneità QM) se passato
     picco_kw = kwargs.get("picco_kw_override") or float(dom_arr.max()) * 1000.0
     is_hp = (parallelo == "HP bassa T")
     cop_a_ref = float(cop_singola(T_int - dT_evap, mandata, eta_hp))
     frac_a = max(1.0 - 1.0 / cop_a_ref, 0.0)
 
+    # La HP alta T e sempre dimensionata sul picco: e la macchina di base del
+    # sistema (merit order), non un'opzione. Il combustibile resta firm come
+    # ridondanza, ma nel dispatch entra solo sul residuo.
     P_alta = picco_kw
     if is_hp:
         P_bassa = picco_kw * frac_a * 1.1
@@ -407,7 +698,8 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
                              mandata, ritorno, T_int, dT_evap, eta_hp,
                              v_hot, v_int, v_low, P_alta, P_bassa,
                              parallelo=parallelo, P_backup_kw=P_bk, backup_cop=backup_cop,
-                             antigelo=antigelo, perdita_sett_pct=perdita_func(max(v_int, v_low, v_hot)))
+                             antigelo=antigelo,
+                             perdita_sett_pct=perdita_func(max(v_int, v_low, v_hot)))
         capex = (P_alta * capex_hp_func(P_alta)
                  + (P_bassa * capex_hp_func(P_bassa) if is_hp else P_bk * capex_backup_kw)
                  + (v_hot + v_int + v_low) * costo_m3 + capex_solare_fisso)
@@ -439,13 +731,16 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
     return best
 
 
+# =============================================================================
+# GENERAZIONE PROFILI DI OFFERTA
+# =============================================================================
 def _giorni_chiusura_set(giorni_chiusura_annui, seed):
     if not giorni_chiusura_annui or giorni_chiusura_annui <= 0:
         return set()
     rng = np.random.default_rng(seed)
     n = int(giorni_chiusura_annui)
-    natale = pd.date_range('2024-12-20', '2024-12-31')
-    agosto = pd.date_range('2024-08-05', '2024-08-25')
+    natale = pd.date_range("2024-12-20", "2024-12-31")
+    agosto = pd.date_range("2024-08-05", "2024-08-25")
     n_natale = min(n // 2, len(natale))
     n_agosto = min(n - n_natale, len(agosto))
     chiusi = list(natale[:n_natale]) + list(agosto[:n_agosto])
@@ -459,11 +754,11 @@ def _giorni_chiusura_set(giorni_chiusura_annui, seed):
 
 def genera_flusso(row, pinch=5.0, seed=0):
     rng = np.random.default_rng(seed)
-    P_nom = row['P_kW'] / 1000.0
-    T_disp = row['T_alta_C'] - pinch
-    profilo = row['profilo']
-    giorni_sett = int(row['giorni_sett']) if not pd.isna(row.get('giorni_sett')) else 7
-    chiusi = _giorni_chiusura_set(row.get('chiusura_gg', 0), seed)
+    P_nom = row["P_kW"] / 1000.0
+    T_disp = row["T_alta_C"] - pinch
+    profilo = row["profilo"]
+    giorni_sett = int(row["giorni_sett"]) if not pd.isna(row.get("giorni_sett")) else 7
+    chiusi = _giorni_chiusura_set(row.get("chiusura_gg", 0), seed)
 
     P = np.zeros(len(HOURS_2024))
     Td = np.full(len(HOURS_2024), np.nan)
@@ -475,22 +770,27 @@ def genera_flusso(row, pinch=5.0, seed=0):
             continue
         mg = (giorno_di == d)
 
-        if profilo == 'continuo':
-            P[mg] = P_nom; Td[mg] = T_disp
-        elif profilo == 'notturno_18_08':
+        if profilo == "continuo":
+            P[mg] = P_nom
+            Td[mg] = T_disp
+        elif profilo == "notturno_18_08":
             notte = mg & ((ora_di >= 18) | (ora_di < 8))
-            P[notte] = P_nom; Td[notte] = T_disp
-        elif profilo.startswith('ore_giorno_'):
-            n_ore = int(profilo.split('_')[-1]); start = 6
+            P[notte] = P_nom
+            Td[notte] = T_disp
+        elif profilo.startswith("ore_giorno_"):
+            n_ore = int(profilo.split("_")[-1])
+            start = 6
             fascia = mg & (ora_di >= start) & (ora_di < start + n_ore)
-            P[fascia] = P_nom; Td[fascia] = T_disp
-        elif profilo == 'cf_random':
-            cf = float(row['cf']) if not pd.isna(row.get('cf')) else 0.3
+            P[fascia] = P_nom
+            Td[fascia] = T_disp
+        elif profilo == "cf_random":
+            cf = float(row["cf"]) if not pd.isna(row.get("cf")) else 0.3
             idx_g = np.where(mg)[0]
             attive = rng.random(len(idx_g)) < cf
-            P[idx_g[attive]] = P_nom; Td[idx_g[attive]] = T_disp
-        elif profilo == 'ciclico_colate':
-            n_cicli = int(rng.integers(int(row['cicli_min']), int(row['cicli_max']) + 1))
+            P[idx_g[attive]] = P_nom
+            Td[idx_g[attive]] = T_disp
+        elif profilo == "ciclico_colate":
+            n_cicli = int(rng.integers(int(row["cicli_min"]), int(row["cicli_max"]) + 1))
             idx_g = np.where(mg)[0]
             if len(idx_g) == 0:
                 continue
@@ -501,15 +801,16 @@ def genera_flusso(row, pinch=5.0, seed=0):
                     continue
                 gi = idx_g[h_local]
                 fase = ((h_local - start) % per_ciclo) / per_ciclo
-                T_ist = row['T_alta_C'] - fase * (row['T_alta_C'] - row['T_out_C'])
-                dT_ist = max(T_ist - row['T_out_C'], 0)
-                dT_max = max(row['T_alta_C'] - row['T_out_C'], 1)
+                T_ist = row["T_alta_C"] - fase * (row["T_alta_C"] - row["T_out_C"])
+                dT_ist = max(T_ist - row["T_out_C"], 0)
+                dT_max = max(row["T_alta_C"] - row["T_out_C"], 1)
                 P[gi] = P_nom * (dT_ist / dT_max)
                 Td[gi] = T_ist - pinch
         else:
-            P[mg] = P_nom; Td[mg] = T_disp
+            P[mg] = P_nom
+            Td[mg] = T_disp
 
-    return pd.DataFrame({'datetime': HOURS_2024, 'MWh': P, 'P_kW': P * 1000, 'T_disponibile': Td})
+    return pd.DataFrame({"datetime": HOURS_2024, "MWh": P, "P_kW": P * 1000, "T_disponibile": Td})
 
 
 @st.cache_data
@@ -519,24 +820,31 @@ def load_data():
         _coord = pd.read_csv("edifici_pubblici_coordinate.csv")[["edificio", "lat", "lon", "indirizzo"]]
         buildings = buildings.merge(_coord, on="edificio", how="left")
     except Exception:
-        buildings["lat"] = np.nan; buildings["lon"] = np.nan; buildings["indirizzo"] = ""
+        buildings["lat"] = np.nan
+        buildings["lon"] = np.nan
+        buildings["indirizzo"] = ""
     domanda = pd.read_csv("maniago_domanda_oraria_8760h_HDD_reale.csv", parse_dates=["datetime"])
 
-    # PATCH 4 - Guardia anno bisestile
+    # --- P4: guardia anno bisestile (2024 ha 8784 ore, non 8760) ---
     if not domanda["datetime"].isin(HOURS_2024).all():
         _n_orfani = int((~domanda["datetime"].isin(HOURS_2024)).sum())
-        st.warning(f"⚠️ {_n_orfani} timestamp della domanda non trovano riscontro in HOURS_2024 "
-                   f"(2024 bisestile, 8784 ore attese): verranno silenziosamente esclusi. "
-                   f"Rigenera maniago_domanda_oraria_8760h_HDD_reale.csv sul calendario 2024.")
+        st.warning(
+            f"\u26a0\ufe0f {_n_orfani} timestamp della domanda non trovano riscontro in HOURS_2024 "
+            f"(il 2024 e bisestile: 8784 ore attese, non 8760). Queste ore vengono escluse "
+            f"in silenzio da tutti i bilanci. Rigenera "
+            f"`maniago_domanda_oraria_8760h_HDD_reale.csv` sul calendario 2024 completo."
+        )
 
-    domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]], on="edificio", how="left")
+    domanda = domanda.merge(buildings[["edificio", "cluster", "tipologia", "tipo_utenza"]],
+                            on="edificio", how="left")
     flussi = pd.read_csv("maniago_flussi_offerta.csv")
-    flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
+    flussi["id_flusso"] = flussi["azienda"] + " \u00b7 " + flussi["flusso"]
     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
     buildings = buildings[~buildings["edificio"].str.startswith("Residenziale Zona")].copy()
+
     _zp = carica_zone_confini()
     if not _zp:
-        st.error("⚠️ File **TLR_zones_borders.geojson** non trovato: le zone restano quelle vecchie.")
+        st.error("\u26a0\ufe0f File **TLR_zones_borders.geojson** non trovato: le zone restano quelle vecchie.")
     if _zp:
         _centri = {ZONE_NOMI[z]: (np.mean([r[:, 1].mean() for r in a]), np.mean([r[:, 0].mean() for r in a]))
                    for z, a in _zp.items()}
@@ -575,7 +883,7 @@ def load_data():
         _agg = priv.groupby(["cluster", "anello"])[["MWh_SH", "MWh_ACS"]].sum().reset_index()
         _righe = []
         for r in _agg.itertuples():
-            _nome = f"Privati {r.cluster} · est.{int(r.anello)}"
+            _nome = f"Privati {r.cluster} \u00b7 est.{int(r.anello)}"
             _righe.append(pd.DataFrame({
                 "datetime": _idx, "edificio": _nome,
                 "MWh_riscaldamento": _f_sh * r.MWh_SH, "MWh_ACS": _f_acs * r.MWh_ACS,
@@ -586,6 +894,7 @@ def load_data():
                 "consumo_annuo_MWh": r.MWh_SH + r.MWh_ACS, "tipo_utenza": "Privato (potenziale)",
                 "anello": int(r.anello), "lat": np.nan, "lon": np.nan}])], ignore_index=True)
         domanda = pd.concat([domanda] + _righe, ignore_index=True)
+
     try:
         cond = pd.read_csv("maniago_condomini.csv")
     except Exception:
@@ -613,6 +922,7 @@ def load_data():
                 "consumo_annuo_MWh": _e, "tipo_utenza": "Condominio", "anello": 0,
                 "unita": _u, "lat": np.nan, "lon": np.nan}])], ignore_index=True)
         domanda = pd.concat([domanda] + _righe_c, ignore_index=True)
+
     buildings["anello"] = buildings.get("anello", pd.Series(index=buildings.index, dtype=float)).fillna(0).astype(int)
     return buildings, domanda, flussi, pvgis, priv, cond
 
@@ -627,8 +937,23 @@ def genera_offerta_flussi(flussi_df, pinch):
         prof["flusso"] = row["flusso"]
         prof["destinazione"] = row["destinazione"]
         prof["fonte"] = row["azienda"]
-        frames.append(prof[["datetime", "id_flusso", "azienda", "flusso", "destinazione", "fonte", "MWh", "P_kW", "T_disponibile"]])
+        frames.append(prof[["datetime", "id_flusso", "azienda", "flusso", "destinazione",
+                            "fonte", "MWh", "P_kW", "T_disponibile"]])
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "id_flusso", "azienda", "flusso", "destinazione",
+                                     "fonte", "MWh", "P_kW", "T_disponibile"])
     return pd.concat(frames, ignore_index=True)
+
+
+@st.cache_data
+def genera_offerta_completa(flussi_df, pinch, T_e4, delta_altri, T_scarico_shift, forni_on):
+    """Flussi da CSV + camini forni Pietro Rosa (P8)."""
+    base = genera_offerta_flussi(flussi_df, pinch)
+    if not forni_on:
+        return base
+    forni = genera_flussi_forni(T_e4_C=T_e4, delta_altri=delta_altri,
+                                T_scarico_shift=T_scarico_shift, pinch=pinch)
+    return pd.concat([base, forni], ignore_index=True)
 
 
 @st.cache_data
@@ -647,58 +972,63 @@ def genera_offerta_solare(pvgis_df, area_m2, efficienza):
     return df_h[["datetime", "fonte", "MWh", "P_kW", "T_disponibile"]]
 
 
-def crf(rate, anni):
-    """Capital Recovery Factor."""
-    if anni <= 0:
-        return 1.0
-    if rate <= 0:
-        return 1.0 / anni
-    return rate / (1.0 - (1.0 + rate) ** (-anni))
+# =============================================================================
+# ECONOMIA
+# =============================================================================
+def van(flussi_cassa, tasso):
+    """Valore Attuale Netto. flussi_cassa[0] e l'investimento (negativo)."""
+    return float(sum(f / (1.0 + tasso) ** t for t, f in enumerate(flussi_cassa)))
+
+
+def tir(flussi_cassa, lo=-0.95, hi=1.5, tol=1e-7, itmax=300):
+    """Tasso Interno di Rendimento per bisezione. None se non esiste."""
+    f_lo = van(flussi_cassa, lo)
+    f_hi = van(flussi_cassa, hi)
+    if f_lo * f_hi > 0:
+        return None
+    for _ in range(itmax):
+        mid = (lo + hi) / 2.0
+        f_mid = van(flussi_cassa, mid)
+        if abs(f_mid) < tol:
+            return mid
+        if f_lo * f_mid < 0:
+            hi = mid
+        else:
+            lo, f_lo = mid, f_mid
+    return (lo + hi) / 2.0
+
+
+def payback_semplice(flussi_cassa):
+    """Tempo di ritorno semplice (non attualizzato), in anni. None se mai."""
+    cum = 0.0
+    for t, f in enumerate(flussi_cassa):
+        prev = cum
+        cum += f
+        if t > 0 and prev < 0 <= cum:
+            return t - 1 + (-prev / f if f != 0 else 0)
+    return None
 
 
 # =============================================================================
-# PATCH 5 - Contemporaneità QM (Fig. 12.2 Handbook)
+# CARICAMENTO
 # =============================================================================
-def coeff_simultaneita_QM(n_utenze):
-    """Coefficiente di contemporaneità secondo QM Handbook Fig. 12.2:
-    10-20 utenze → ~0.95; ≥100 utenze → ~0.60. Interpolazione log."""
-    if n_utenze <= 1:
-        return 1.0
-    n = np.clip(n_utenze, 1, 500)
-    return float(np.interp(np.log(n),
-                           np.log([1, 10, 20, 100, 500]),
-                           [1.0, 0.98, 0.95, 0.60, 0.55]))
-
-
-# =============================================================================
-# PATCH 6 - Perdite di rete QM (Fig. 12.3 Verenum Handbook)
-# =============================================================================
-def perdite_pct_QM(densita_MWh_m_a, T_media_rete_C=65, classe_isolante=2):
-    """Perdite % rispetto al calore venduto, secondo Fig. 12.3 QM Handbook
-    (digitalizzata dal Verenum Planungshandbuch, cap. 7.1 - 12.2.8).
-    Ancoraggio: densità 2.0 MWh/(m·a), T media 65°C, classe isolante 2 → 10.5%.
-    Scaling: perdita specifica (W/m) ~ costante; % = W/m / vendita per metro.
-    - classe_isolante: 1 (minima), 2 (media, default), 3 (alta, target QM ≤10%)."""
-    W_per_m_65 = 24.0
-    fattore_classe = {1: 1.4, 2: 1.0, 3: 0.8}.get(classe_isolante, 1.0)
-    T_terreno = 13.0
-    fattore_T = (T_media_rete_C - T_terreno) / (65 - T_terreno)
-    perdite_kWh_m_a = W_per_m_65 * fattore_classe * fattore_T * 8760 / 1000
-    return perdite_kWh_m_a / max(densita_MWh_m_a, 0.1) * 100
-
-
 buildings, domanda, flussi, pvgis, privati, condomini = load_data()
 
-st.title("🔥 Maniago TLR — Domanda, Offerta, Dimensionamento")
+st.title("\U0001F525 Maniago TLR \u2014 Domanda, Offerta, Dimensionamento")
+st.markdown(PROGETTO_HTML)
 st.caption(
-    "Anno tipo (calendario 2024) · Domanda: temperatura calibrata su dati reali stazione Vivaro "
-    "(anno 2011, corretto verso i 2.850 GG ufficiali di Maniago) · Tutto calcolato live, un solo file. "
-    "**Revisione con patch QM (perdite di rete Fig. 12.3, contemporaneità Fig. 12.2, cap COP realistico).**"
+    "Anno tipo (calendario 2024, 8784 ore) \u00b7 Domanda: temperatura calibrata su dati reali "
+    "stazione Vivaro (2011, corretta verso i 2.850 GG ufficiali di Maniago) \u00b7 "
+    "Offerta: flussi da CSV + camini forni Pietro Rosa da misure Ecol Studio 14/07/2025. "
+    "Metodologia: **QM Holzheizwerke Planning Handbook** (perdite di rete Fig. 12.3, "
+    "contemporaneit\u00e0 Fig. 12.2) e **IEA DHC TS5** (COP e CAPEX pompe di calore, accumuli)."
 )
 
 tab_domanda, tab_offerta, tab_dimensionamento, tab_confronto, tab_economia = st.tabs(
-    ["🏠 Domanda", "♻️ Offerta", "🧮 Dimensionamento", "📊 Confronto scenari", "💶 Analisi economica"]
+    ["\U0001F3E0 Domanda", "\u267B\ufe0f Offerta", "\U0001F9EE Dimensionamento",
+     "\U0001F4CA Confronto scenari", "\U0001F4B6 Analisi economica"]
 )
+
 
 # =============================================================================
 # TAB 1 - DOMANDA
@@ -707,13 +1037,13 @@ with tab_domanda:
     col_filtri, col_contenuto = st.columns([1, 3])
 
     with col_filtri:
-        st.markdown("#### 🌡️ Linea ideale di rete")
-        T_mandata_ideale = st.slider("Mandata (°C)", 35, 95, key="dom_t_mandata",
-                                      help="Temperatura obiettivo di mandata alla rete")
-        T_ritorno_ideale = st.slider("Ritorno (°C)", 20, 60, key="dom_t_ritorno",
-                                      help="Temperatura di ritorno rete")
+        st.markdown("#### \U0001F321\ufe0f Linea ideale di rete")
+        T_mandata_ideale = st.slider("Mandata (\u00b0C)", 35, 95, key="dom_t_mandata",
+                                     help="Temperatura obiettivo di mandata alla rete")
+        T_ritorno_ideale = st.slider("Ritorno (\u00b0C)", 20, 60, key="dom_t_ritorno",
+                                     help="Temperatura di ritorno rete")
         st.caption("Questi due valori guidano anche i calcoli in Offerta e Dimensionamento.")
-        if st.button("↺ Ripristina default", key="btn_reset_default"):
+        if st.button("\u21ba Ripristina default", key="btn_reset_default"):
             applica_default_slider(force=True)
             st.rerun()
 
@@ -736,8 +1066,8 @@ with tab_domanda:
         _conf = sorted(set(sel_priv_zone) & set(sel_cond_zone))
         if _conf:
             sel_cond_zone = [z for z in sel_cond_zone if z not in _conf]
-            st.caption("⚠️ In " + ", ".join(z.split(" - ")[0] for z in _conf) +
-                       " i condomini sono già dentro i privati GIS: conto solo i privati.")
+            st.caption("\u26a0\ufe0f In " + ", ".join(z.split(" - ")[0] for z in _conf) +
+                       " i condomini sono gi\u00e0 dentro i privati GIS: conto solo i privati.")
 
         st.markdown("**Utenza pubblica**")
         pub_on = st.checkbox("Includi edifici pubblici", value=True, key="dom_tu_pub")
@@ -746,12 +1076,13 @@ with tab_domanda:
         if sel_priv_zone:
             fattore_correzione = st.slider(
                 "Tasso di allacciamento privati (%)", 10, 100, 60, step=5, key="dom_priv_fattore",
-                help="Quota di privati che si allaccia davvero.")
+                help="Quota di privati che si allaccia davvero. QM: 50-80 % tipico.")
         mwh_unita = MWH_PER_UNITA
         tasso_cond = 100
         if sel_cond_zone:
-            mwh_unita = st.slider("Consumo per unità abitativa (MWh/a)", 5.0, 15.0, MWH_PER_UNITA, step=0.5,
-                                  key="dom_mwh_unita", help="Appartamento tipo esistente in FVG: 7-11 MWh/a.")
+            mwh_unita = st.slider("Consumo per unit\u00e0 abitativa (MWh/a)", 5.0, 15.0, MWH_PER_UNITA,
+                                  step=0.5, key="dom_mwh_unita",
+                                  help="Appartamento tipo esistente in FVG: 7-11 MWh/a.")
             tasso_cond = st.slider("Tasso di adesione condomini (%)", 10, 100, 80, step=5,
                                    key="dom_cond_tasso")
 
@@ -764,7 +1095,7 @@ with tab_domanda:
                                               & (buildings["cluster"].isin(sel_cond_zone)), "edificio"].tolist()
         liv_est = 6 if sel_priv_zone else 0
 
-        # PATCH 5: conta utenze private/condominiali reali per la contemporaneità QM
+        # --- P5: conteggio utenze private/condominiali per la contemporaneita QM ---
         _n_priv_reale = 0
         if sel_priv_zone and not privati.empty:
             _n_priv_reale += int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
@@ -773,8 +1104,9 @@ with tab_domanda:
         st.session_state["_dom_n_privati"] = _n_priv_reale
         if _n_priv_reale > 1:
             _f_sim_ui = coeff_simultaneita_QM(_n_priv_reale)
-            st.caption(f"👥 Utenze private/condominiali: **{_n_priv_reale}** · "
-                       f"coefficiente contemporaneità QM: **{_f_sim_ui:.2f}**")
+            st.caption(f"\U0001F465 Utenze private/condominiali: **{_n_priv_reale}** \u00b7 "
+                       f"contemporaneit\u00e0 QM: **{_f_sim_ui:.2f}** (agisce sul picco, "
+                       f"non sull'energia annua)")
 
         st.markdown("**Componente**")
         show_risc = st.checkbox("Riscaldamento ambienti", value=True, key="dom_risc")
@@ -784,12 +1116,11 @@ with tab_domanda:
             tipologie = sorted(buildings["tipologia"].unique())
             select_all_tip = st.checkbox("Tutte", value=True, key="dom_all_tip")
             selected_tip = st.multiselect("Filtra", tipologie, default=tipologie if select_all_tip else [],
-                                           key="dom_tip", label_visibility="collapsed")
+                                          key="dom_tip", label_visibility="collapsed")
 
         month_range = st.select_slider(
             "Mesi", options=list(range(1, 13)), value=(1, 12),
-            format_func=lambda m: MONTH_NAMES[m-1], key="dom_mesi"
-        )
+            format_func=lambda m: MONTH_NAMES[m - 1], key="dom_mesi")
 
     mask_building = (buildings["cluster"].isin(selected_clusters)
                      & (((buildings["tipo_utenza"] == "Pubblico") & pub_on
@@ -837,15 +1168,16 @@ with tab_domanda:
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Energia nel periodo", f"{tot:,.0f} MWh".replace(",", "."))
             k2.metric("Picco orario", f"{picco:.3f} MW", help=f"il {ora_picco.strftime('%d/%m alle %H:00')}")
-            k3.metric("Quota ACS", f"{(acs_tot/tot*100 if tot else 0):.0f}%",
+            k3.metric("Quota ACS", f"{(acs_tot / tot * 100 if tot else 0):.0f}%",
                       help=f"{acs_tot:,.0f} MWh ACS su {tot:,.0f} MWh totali".replace(",", "."))
-            k4.metric("Fattore di carico", f"{load_factor*100:.1f}%")
+            k4.metric("Fattore di carico", f"{load_factor * 100:.1f}%")
 
             bsel = buildings[buildings["edificio"].isin(selected_buildings)].copy()
             bsel_all = buildings[buildings["tipo_utenza"] == "Pubblico"].copy()
             bmap = bsel.dropna(subset=["lat", "lon"]) if "lat" in bsel.columns else bsel.iloc[0:0]
+
             if not bmap.empty:
-                st.markdown("##### 🗺️ Mappa degli edifici serviti")
+                st.markdown("##### \U0001F5FA\ufe0f Mappa degli edifici serviti")
                 fig_map = go.Figure()
                 for _zid, _anelli in carica_zone_confini().items():
                     _nome = ZONE_NOMI.get(_zid, f"Zona {_zid}")
@@ -876,13 +1208,15 @@ with tab_domanda:
                             lat=_pv["lat"], lon=_pv["lon"], mode="markers",
                             name=f"Privati: {len(_pv)}",
                             marker=dict(size=6, color="#B57EDC", opacity=0.75),
-                            text=(_pv["nome"].fillna("").astype(str) + "<br>" + _pv["via"].fillna("").astype(str)
-                                  + "<br>est." + _pv["anello"].astype(str) + " · "
+                            text=(_pv["nome"].fillna("").astype(str) + "<br>"
+                                  + _pv["via"].fillna("").astype(str)
+                                  + "<br>est." + _pv["anello"].astype(str) + " \u00b7 "
                                   + _pv["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a"),
                             hoverinfo="text"))
                 fig_map.update_layout(
                     mapbox=dict(style="open-street-map",
-                                center=dict(lat=float(bmap["lat"].mean()), lon=float(bmap["lon"].mean())), zoom=13),
+                                center=dict(lat=float(bmap["lat"].mean()), lon=float(bmap["lon"].mean())),
+                                zoom=13),
                     height=430, margin=dict(t=10, b=0, l=0, r=0),
                     legend=dict(orientation="h", yanchor="bottom", y=1.01))
                 st.plotly_chart(fig_map, use_container_width=True)
@@ -890,12 +1224,13 @@ with tab_domanda:
                 if _senza > 0:
                     st.caption(f"{_senza} edifici senza coordinate non mostrati.")
 
-                st.markdown("##### 🔥 Densità della domanda termica")
+                st.markdown("##### \U0001F525 Densit\u00e0 della domanda termica")
                 dc1, dc2 = st.columns([2, 1])
                 vista_dens = dc1.radio("Cosa mostrare",
                                        ["Potenziale totale (tutti gli edifici)", "Solo selezionati"],
                                        horizontal=True, key="dom_dens_vista")
-                cella_m = dc2.select_slider("Cella (m)", options=[100, 150, 200], value=150, key="dom_dens_cella")
+                cella_m = dc2.select_slider("Cella (m)", options=[100, 150, 200], value=150,
+                                            key="dom_dens_cella")
                 _pts = []
                 if vista_dens.startswith("Potenziale"):
                     if not privati.empty:
@@ -925,8 +1260,8 @@ with tab_domanda:
                     fig_dens = go.Figure(go.Densitymapbox(
                         lat=_grid["lat"], lon=_grid["lon"], z=_grid["dens"],
                         radius=max(18, int(cella_m / 6)), colorscale="Turbo", opacity=0.75,
-                        colorbar=dict(title="MWh/(ha·a)"),
-                        hovertemplate="%{z:.0f} MWh/(ha·a)<extra></extra>"))
+                        colorbar=dict(title="MWh/(ha\u00b7a)"),
+                        hovertemplate="%{z:.0f} MWh/(ha\u00b7a)<extra></extra>"))
                     for _zid, _anelli in carica_zone_confini().items():
                         _nm = ZONE_NOMI.get(_zid, "")
                         for _r in _anelli:
@@ -940,12 +1275,12 @@ with tab_domanda:
                         height=460, margin=dict(t=10, b=0, l=0, r=0))
                     st.plotly_chart(fig_dens, use_container_width=True)
                     m1, m2, m3 = st.columns(3)
-                    m1.metric("Densità mediana", f"{_grid['dens'].median():.0f} MWh/(ha·a)")
-                    m2.metric("Celle sopra 300", f"{(_grid['dens'] > 300).mean()*100:.0f}%",
-                              help="Sopra ~300 MWh/(ha·a) il TLR è generalmente favorevole")
-                    m3.metric("Energia nelle celle dense", f"{_grid.loc[_grid['dens'] > 300, 'MWh'].sum()/_grid['MWh'].sum()*100:.0f}%")
+                    m1.metric("Densit\u00e0 mediana", f"{_grid['dens'].median():.0f} MWh/(ha\u00b7a)")
+                    m2.metric("Celle sopra 300", f"{(_grid['dens'] > 300).mean() * 100:.0f}%",
+                              help="Sopra ~300 MWh/(ha\u00b7a) il TLR e generalmente favorevole")
+                    m3.metric("Energia nelle celle dense",
+                              f"{_grid.loc[_grid['dens'] > 300, 'MWh'].sum() / _grid['MWh'].sum() * 100:.0f}%")
                     st.caption(f"Griglia da {cella_m} m ({_ha:.2f} ha per cella).")
-
 
             fig = go.Figure()
             cluster_nel_grafico = [c for c in selected_clusters if c in agg_cluster["cluster"].unique()]
@@ -953,15 +1288,15 @@ with tab_domanda:
                 sub = agg_cluster[agg_cluster["cluster"] == cl]
                 colore = CLUSTER_COLORS.get(cl, "#888888")
                 fig.add_trace(go.Scatter(x=sub["datetime"], y=sub["MWh_sel"], mode="lines",
-                                          name=cl, stackgroup="one",
-                                          line=dict(width=0.6, color=colore),
-                                          fillcolor=hex_to_rgba(colore, 0.85)))
-            fig.update_layout(height=420, yaxis_title="MWh/h (≈ MW)", xaxis_title="",
-                               legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                                         name=cl, stackgroup="one",
+                                         line=dict(width=0.6, color=colore),
+                                         fillcolor=hex_to_rgba(colore, 0.85)))
+            fig.update_layout(height=420, yaxis_title="MWh/h (\u2248 MW)", xaxis_title="",
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02))
             st.plotly_chart(fig, use_container_width=True)
 
             view_mode = st.radio("Bilancio mensile per:", ["Cluster di rete", "Componente (risc./ACS)"],
-                                  horizontal=True, key="dom_view")
+                                 horizontal=True, key="dom_view")
 
             st.markdown("**Curva di durata**")
             durata = agg_total.sort_values("MWh_sel", ascending=False).reset_index(drop=True)
@@ -973,7 +1308,7 @@ with tab_domanda:
 
             st.markdown("**Bilancio mensile**")
             monthly_dom = dom.copy()
-            monthly_dom["mese"] = monthly_dom["datetime"].dt.month.map(lambda m: MONTH_NAMES[m-1])
+            monthly_dom["mese"] = monthly_dom["datetime"].dt.month.map(lambda m: MONTH_NAMES[m - 1])
             fig_m = go.Figure()
             if view_mode == "Cluster di rete":
                 monthly_cl = monthly_dom.groupby(["mese", "cluster"])["MWh_sel"].sum().reset_index()
@@ -982,17 +1317,17 @@ with tab_domanda:
                 for cl in selected_clusters:
                     sub = monthly_cl[monthly_cl["cluster"] == cl]
                     fig_m.add_trace(go.Bar(x=sub["mese"], y=sub["MWh_sel"], name=cl,
-                                            marker_color=CLUSTER_COLORS[cl]))
+                                           marker_color=CLUSTER_COLORS[cl]))
             else:
                 monthly_agg = monthly_dom.groupby("mese")[["MWh_riscaldamento", "MWh_ACS"]].sum().reset_index()
                 monthly_agg["mese"] = pd.Categorical(monthly_agg["mese"], categories=MONTH_NAMES, ordered=True)
                 monthly_agg = monthly_agg.sort_values("mese")
                 if show_risc:
                     fig_m.add_trace(go.Bar(x=monthly_agg["mese"], y=monthly_agg["MWh_riscaldamento"],
-                                            name="Riscaldamento", marker_color=COLOR_RISCALDAMENTO))
+                                           name="Riscaldamento", marker_color=COLOR_RISCALDAMENTO))
                 if show_acs:
                     fig_m.add_trace(go.Bar(x=monthly_agg["mese"], y=monthly_agg["MWh_ACS"],
-                                            name="ACS", marker_color=COLOR_ACS))
+                                           name="ACS", marker_color=COLOR_ACS))
             fig_m.update_layout(barmode="stack", height=320, yaxis_title="MWh", xaxis_title="")
             st.plotly_chart(fig_m, use_container_width=True)
 
@@ -1002,16 +1337,19 @@ with tab_domanda:
                 detail = detail.rename(columns={"MWh_riscaldamento": "Riscaldamento MWh", "MWh_ACS": "ACS MWh"})
                 detail = detail.sort_values("Totale MWh", ascending=False).reset_index()
                 st.dataframe(detail, use_container_width=True, hide_index=True)
+
         st.divider()
 
-        # --- Densità termica lineare (PATCH 1: doppio fattore rimosso) ---
+        # ---------------------------------------------------------------------
+        # P1 - Densita termica lineare (doppio fattore di allacciamento rimosso)
+        # ---------------------------------------------------------------------
         if not privati.empty:
-            st.markdown("##### 📏 Densità termica lineare (quanto rende il tubo)")
+            st.markdown("##### \U0001F4CF Densit\u00e0 termica lineare (quanto rende il tubo)")
             st.caption("Per ogni zona e livello di estensione: lunghezza indicativa della rete "
-                       "e **densità lineare** = MWh/anno per metro di rete. "
-                       "Sotto ~1,2 MWh/(m·a) la rete fatica a ripagarsi, sopra ~2 è buona (QM).")
+                       "e **densit\u00e0 lineare** = MWh/anno per metro di rete. "
+                       "QM: sotto ~1,2 MWh/(m\u00b7a) la rete fatica a ripagarsi, sopra ~2,0 e buona.")
             cD1, cD2 = st.columns(2)
-            costo_m_rete = cD1.slider("Costo rete (€/m di trincea)", 200, 1500, 600, step=50,
+            costo_m_rete = cD1.slider("Costo rete (\u20ac/m di trincea)", 200, 1500, 600, step=50,
                                       key="dom_costo_rete")
             righe_d = []
             for _z in (sel_priv_zone or selected_clusters):
@@ -1023,56 +1361,57 @@ with tab_domanda:
                     if _s.empty:
                         continue
                     _L = stima_lunghezza_rete(_s["lat"].values, _s["lon"].values)
-                    # PATCH 1: applico UN SOLO fattore di allacciamento
+                    # P1: il fattore di allacciamento si applica UNA SOLA VOLTA
                     _E = _s["consumo_annuo_MWh"].sum() * (fattore_correzione / 100.0)
                     if _L < 1:
                         continue
                     righe_d.append({"Zona": _z, "Livello": _l, "Edifici": len(_s),
                                     "Domanda (MWh/a)": round(_E), "Rete (m)": round(_L),
-                                    "Densità (MWh/m·a)": round(_E / _L, 2),
-                                    "CAPEX rete (€)": round(_L * costo_m_rete)})
+                                    "Densit\u00e0 (MWh/m\u00b7a)": round(_E / _L, 2),
+                                    "CAPEX rete (\u20ac)": round(_L * costo_m_rete)})
             if righe_d:
                 df_d = pd.DataFrame(righe_d)
-                fig_d = go.Figure()
+                fig_dl = go.Figure()
                 for _z in df_d["Zona"].unique():
                     _sub = df_d[df_d["Zona"] == _z]
-                    fig_d.add_trace(go.Scatter(x=_sub["Livello"], y=_sub["Densità (MWh/m·a)"],
-                                               mode="lines+markers", name=_z,
-                                               line=dict(color=CLUSTER_COLORS.get(_z, "#888"), width=2.5),
-                                               marker=dict(size=9)))
-                fig_d.add_hline(y=2.0, line_dash="dot", line_color="#3FA34D",
-                                annotation_text="buona (2,0)", annotation_position="top left")
-                fig_d.add_hline(y=1.2, line_dash="dot", line_color="#E63946",
-                                annotation_text="soglia critica (1,2)", annotation_position="bottom left")
-                fig_d.update_layout(height=350, xaxis_title="Livello di estensione",
-                                    yaxis_title="Densità lineare (MWh per metro di rete, anno)",
-                                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
-                                    margin=dict(t=30, b=10))
-                st.plotly_chart(fig_d, use_container_width=True)
+                    fig_dl.add_trace(go.Scatter(x=_sub["Livello"], y=_sub["Densit\u00e0 (MWh/m\u00b7a)"],
+                                                mode="lines+markers", name=_z,
+                                                line=dict(color=CLUSTER_COLORS.get(_z, "#888"), width=2.5),
+                                                marker=dict(size=9)))
+                fig_dl.add_hline(y=2.0, line_dash="dot", line_color="#3FA34D",
+                                 annotation_text="buona (2,0)", annotation_position="top left")
+                fig_dl.add_hline(y=1.2, line_dash="dot", line_color="#E63946",
+                                 annotation_text="soglia critica (1,2)", annotation_position="bottom left")
+                fig_dl.update_layout(height=350, xaxis_title="Livello di estensione",
+                                     yaxis_title="Densit\u00e0 lineare (MWh per metro di rete, anno)",
+                                     legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                                     margin=dict(t=30, b=10))
+                st.plotly_chart(fig_dl, use_container_width=True)
                 st.dataframe(df_d, use_container_width=True, hide_index=True)
                 _tot_L = df_d[df_d["Livello"] == max(liv_est, 1)]["Rete (m)"].sum()
                 if liv_est > 0 and _tot_L > 0:
-                    st.caption(f"Al livello **{liv_est}** nelle zone attive: rete ≈ **{_tot_L:,.0f} m**, "
-                               f"CAPEX rete ≈ **{_tot_L*costo_m_rete:,.0f} €**.".replace(",", "."))
+                    st.caption(f"Al livello **{liv_est}** nelle zone attive: rete \u2248 **{_tot_L:,.0f} m**, "
+                               f"CAPEX rete \u2248 **{_tot_L * costo_m_rete:,.0f} \u20ac**.".replace(",", "."))
 
         if sel_cond_zone and not condomini.empty:
             st.divider()
-            st.markdown("##### 🏢 Condomini censiti nelle zone selezionate")
+            st.markdown("##### \U0001F3E2 Condomini censiti nelle zone selezionate")
             _cs = condomini[condomini["cluster"].isin(sel_cond_zone)].copy()
             _cs["MWh/a stimati"] = (_cs["unita"] * mwh_unita * tasso_cond / 100.0).round(1)
             cq1, cq2, cq3 = st.columns(3)
             cq1.metric("Condomini", f"{len(_cs)}")
-            cq2.metric("Unità abitative", f"{_cs['unita'].sum():,.0f}".replace(",", "."))
+            cq2.metric("Unit\u00e0 abitative", f"{_cs['unita'].sum():,.0f}".replace(",", "."))
             cq3.metric("Domanda stimata", f"{_cs['MWh/a stimati'].sum():,.0f} MWh/a".replace(",", "."),
-                       help=f"{mwh_unita} MWh per unità · adesione {tasso_cond}%")
+                       help=f"{mwh_unita} MWh per unit\u00e0 \u00b7 adesione {tasso_cond}%")
             _tab = _cs[["cluster", "via", "civico", "denominazione", "amministratore", "unita", "MWh/a stimati"]]
             _tab = _tab.rename(columns={"cluster": "Zona", "via": "Via", "civico": "Civico",
                                         "denominazione": "Denominazione", "amministratore": "Amministratore",
-                                        "unita": "Unità"}).sort_values(["Zona", "Unità"], ascending=[True, False])
+                                        "unita": "Unit\u00e0"}).sort_values(["Zona", "Unit\u00e0"],
+                                                                            ascending=[True, False])
             st.dataframe(_tab, use_container_width=True, hide_index=True)
 
         st.divider()
-        st.markdown("##### 🛤️ Ipotesi di tracciato della rete")
+        st.markdown("##### \U0001F6E4\ufe0f Ipotesi di tracciato della rete")
         st.caption(f"Rete ad albero minimo che parte dalla **sottocentrale** "
                    f"({CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}) e raggiunge le utenze selezionate.")
         _tr = []
@@ -1085,14 +1424,15 @@ with tab_domanda:
             st.info("Seleziona almeno un'utenza georeferenziata per vedere il tracciato.")
         else:
             tc1, tc2 = st.columns(2)
-            tort = tc1.slider("Fattore di tortuosità", 1.0, 2.0, 1.35, step=0.05, key="dom_tort")
-            costo_m_tr = tc2.slider("Costo rete (€/m)", 200, 1500, 600, step=50, key="dom_costo_tr")
+            tort = tc1.slider("Fattore di tortuosit\u00e0", 1.0, 2.0, 1.35, step=0.05, key="dom_tort")
+            costo_m_tr = tc2.slider("Costo rete (\u20ac/m)", 200, 1500, 600, step=50, key="dom_costo_tr")
             _archi, _len = mst_archi(_tr["lat"].values, _tr["lon"].values,
                                      radice=(CENTRALE_LAT, CENTRALE_LON))
             _len_t = _len * tort
             _lat_l, _lon_l = [], []
             for (a, b, _d) in _archi:
-                _lat_l += [a[0], b[0], None]; _lon_l += [a[1], b[1], None]
+                _lat_l += [a[0], b[0], None]
+                _lon_l += [a[1], b[1], None]
             fig_tr = go.Figure()
             fig_tr.add_trace(go.Scattermapbox(lat=_lat_l, lon=_lon_l, mode="lines",
                                               line=dict(width=2, color="#FF4B4B"),
@@ -1118,11 +1458,12 @@ with tab_domanda:
             st.plotly_chart(fig_tr, use_container_width=True)
             _dom_tr = float(_tr["consumo_annuo_MWh"].sum())
             t1, t2, t3, t4 = st.columns(4)
-            t1.metric("Lunghezza rete", f"{_len_t/1000:.1f} km", help=f"{_len_t:,.0f} m con tortuosità {tort}".replace(",", "."))
+            t1.metric("Lunghezza rete", f"{_len_t / 1000:.1f} km",
+                      help=f"{_len_t:,.0f} m con tortuosit\u00e0 {tort}".replace(",", "."))
             t2.metric("Utenze collegate", f"{len(_tr):,}".replace(",", "."))
-            t3.metric("CAPEX rete", f"{_len_t*costo_m_tr/1e6:.1f} M€")
-            t4.metric("Densità lineare", f"{_dom_tr/_len_t:.2f} MWh/(m·a)",
-                      help="sotto ~1,2 la rete fatica a ripagarsi; sopra ~2 è buona")
+            t3.metric("CAPEX rete", f"{_len_t * costo_m_tr / 1e6:.1f} M\u20ac")
+            t4.metric("Densit\u00e0 lineare", f"{_dom_tr / _len_t:.2f} MWh/(m\u00b7a)",
+                      help="sotto ~1,2 la rete fatica a ripagarsi; sopra ~2 e buona (QM)")
             st.session_state["_rete_info"] = {
                 "lunghezza_m": float(_len_t), "capex_rete": float(_len_t * costo_m_tr),
                 "densita": float(_dom_tr / _len_t), "n_utenze": int(len(_tr)),
@@ -1136,16 +1477,42 @@ with tab_domanda:
 # =============================================================================
 with tab_offerta:
     col_filtri2, col_contenuto2 = st.columns([1, 3])
+
     with col_filtri2:
         st.markdown("#### Parametri scambio")
-        st.caption(f"T ritorno rete: **{T_ritorno_ideale}°C** (impostata in scheda Domanda)")
-        pinch = st.slider("Pinch scambiatore (°C)", 2, 10, 5, key="off_pinch")
+        st.caption(f"T ritorno rete: **{T_ritorno_ideale}\u00b0C** (impostata in scheda Domanda)")
+        pinch = st.slider("Pinch scambiatore (\u00b0C)", 2, 10, 5, key="off_pinch")
 
-        st.markdown("#### Fonti — selezione per flusso")
-        st.caption("Da `maniago_flussi_offerta.csv`. Di default sono spuntati i flussi più certi.")
-        offerta = genera_offerta_flussi(flussi, pinch)
+        # ---------------------------------------------------------------------
+        # P8 - Forni di forgiatura Pietro Rosa (misure Ecol Studio 14/07/2025)
+        # ---------------------------------------------------------------------
+        st.markdown("#### \U0001F525 Forni di forgiatura Pietro Rosa")
+        forni_on = st.checkbox("Includi i camini dei forni", value=True, key="off_forni_on",
+                               help="Misure Ecol Studio 14/07/2025 - rapporti 25LF24167/168/169/170")
+        T_e4 = 144.0
+        delta_altri = 0.0
+        T_scarico_shift = 0.0
+        if forni_on:
+            T_e4 = st.slider("T di progetto camino E4 (\u00b0C)", 100, 180, 144, step=2, key="off_te4",
+                             help="Misurato 144 \u00b0C (417 K). L'azienda suggerisce "
+                                  "cautelativamente 120-180 \u00b0C: in bocca forno 400 \u00b0C, "
+                                  "sulla lamiera del camino 220-240 \u00b0C, ~100 \u00b0C da termografia. "
+                                  "La forte diluizione (O2 = 20,9 %) abbassa la T ma alza la portata.")
+            delta_altri = st.slider("Scostamento sugli altri camini (\u00b0C)", -20, 40, 0, step=5,
+                                    key="off_dforni")
+            T_scarico_shift = st.slider("Scostamento T di scarico post-recupero (\u00b0C)",
+                                        -10, 30, 0, step=5, key="off_tsc",
+                                        help="Alzare la T di scarico riduce il recupero ma "
+                                             "protegge dalla condensa acida (qui poco rilevante: "
+                                             "CO2 = 0,04 %, H2O < 1 %).")
+
+        st.markdown("#### Fonti \u2014 selezione per flusso")
+        st.caption("Da `maniago_flussi_offerta.csv`. Di default sono spuntati i flussi pi\u00f9 certi.")
+
+        offerta = genera_offerta_completa(flussi, pinch, T_e4, delta_altri, T_scarico_shift, forni_on)
 
         FONTI_CERTE = {"Pandolfo", "ZML", "Pietro Rosa"}
+
         def _flusso_e_certo(azienda, flusso):
             return (azienda in FONTI_CERTE) and ("torr" in str(flusso).lower())
 
@@ -1155,25 +1522,60 @@ with tab_offerta:
             az_ha_certi = any(_flusso_e_certo(az, fr["flusso"]) for _, fr in flussi_az.iterrows())
             az_on = st.checkbox(f"**{az}**", value=az_ha_certi, key=f"off_az_{az}")
             for _, fr in flussi_az.iterrows():
-                icona = "🔴" if fr["destinazione"] == "alta_T" else "🔵"
-                label = f"{icona} {fr['flusso']} ({fr['P_kW']/1000:.1f} MW, {fr['T_alta_C']:.0f}°C)"
+                icona = "\U0001F534" if fr["destinazione"] == "alta_T" else "\U0001F535"
+                label = f"{icona} {fr['flusso']} ({fr['P_kW'] / 1000:.1f} MW, {fr['T_alta_C']:.0f}\u00b0C)"
                 fl_on = st.checkbox(label, value=_flusso_e_certo(az, fr["flusso"]),
                                     key=f"off_fl_{fr['id_flusso']}", disabled=not az_on)
                 if az_on and fl_on:
                     selected_flussi.append(fr["id_flusso"])
 
+        if forni_on:
+            st.markdown("**Camini forni (misurati)**")
+            _tab_f, _ore_f = tabella_forni(T_e4, delta_altri, T_scarico_shift)
+            for _, _r in _tab_f.iterrows():
+                _id = f"Pietro Rosa \u00b7 {_r['Punto']} " + \
+                      [d for p, d, _, _, _ in FORNI_PIETRO_ROSA if p == _r["Punto"]][0]
+                _icona = "\U0001F534" if (_r["T di progetto (\u00b0C)"] - pinch) >= 80 else "\U0001F7E0"
+                if st.checkbox(f"{_icona} {_r['Punto']} \u2014 {_r['Potenza recuperabile (kW)']:.0f} kW "
+                               f"@ {_r['T di progetto (\u00b0C)']:.0f}\u00b0C",
+                               value=(_r["Potenza recuperabile (kW)"] > 10),
+                               key=f"off_forno_{_r['Punto']}"):
+                    selected_flussi.append(_id)
+
         selected_fonti = sorted(set(
-            flussi.loc[flussi["id_flusso"].isin(selected_flussi), "azienda"]
-        ))
+            offerta.loc[offerta["id_flusso"].isin(selected_flussi), "azienda"]))
         st.session_state["_off_flussi"] = selected_flussi
         st.session_state["_off_fonti"] = selected_fonti
         st.session_state["_off_pinch"] = pinch
+        st.session_state["_off_forni"] = {"on": forni_on, "T_e4": T_e4,
+                                          "delta": delta_altri, "shift": T_scarico_shift}
         month_range_o = st.select_slider(
             "Mesi", options=list(range(1, 13)), value=(1, 12),
-            format_func=lambda m: MONTH_NAMES[m-1], key="off_mesi"
-        )
+            format_func=lambda m: MONTH_NAMES[m - 1], key="off_mesi")
 
-    with st.expander("📋 Dettaglio flussi (dati grezzi)"):
+    # -------------------------------------------------------------------------
+    if forni_on:
+        with st.expander("\U0001F4CB Camini forni Pietro Rosa \u2014 dati di misura e recupero", expanded=True):
+            _tab_f, _ore_f = tabella_forni(T_e4, delta_altri, T_scarico_shift)
+            st.dataframe(_tab_f, use_container_width=True, hide_index=True)
+            f1, f2, f3 = st.columns(3)
+            f1.metric("Potenza recuperabile totale",
+                      f"{_tab_f['Potenza recuperabile (kW)'].sum():.0f} kW")
+            f2.metric("Energia annua", f"{_tab_f['Energia (MWh/a)'].sum():,.0f} MWh/a".replace(",", "."))
+            f3.metric("Ore di esercizio", f"{_ore_f:,} h/a".replace(",", "."),
+                      help="Ciclo continuo 24/24 7/7. Fermate: due settimane centrali di agosto "
+                           "e festivit\u00e0 ordinarie. A Natale i forni restano accesi.")
+            st.caption(
+                "Fonte: **Ecol Studio SpA**, rapporti di prova 25LF24167 (E1), 25LF24168 (E4), "
+                "25LF24169 (E5), 25LF24170 (E6) del 14/07/2025, prelievi in condizioni di massimo "
+                "regime. Calore sensibile calcolato con cp = 1,30 kJ/(Nm\u00b3\u00b7K). "
+                "Tutti i camini hanno O\u2082 = 20,9 % vol: i fumi sono fortemente diluiti con aria "
+                "ambiente per il tiraggio naturale, quindi la temperatura e bassa ma la portata "
+                "elevata. **Il camino E4 (MAGLIO 3000) vale da solo oltre il 90 % del recuperabile "
+                "e, a 144 \u00b0C, e sopra la temperatura di mandata della rete: alimenta "
+                "direttamente l'anello caldo, senza pompa di calore.**")
+
+    with st.expander("\U0001F4CB Dettaglio flussi da CSV (dati grezzi)"):
         st.dataframe(flussi[["azienda", "flusso", "destinazione", "fluido", "T_alta_C",
                              "T_out_C", "P_kW", "profilo"]],
                      use_container_width=True, hide_index=True)
@@ -1183,7 +1585,7 @@ with tab_offerta:
     off = off[(off["month"] >= month_range_o[0]) & (off["month"] <= month_range_o[1])]
 
     with col_contenuto2:
-        st.markdown("#### 🏭 Sorgenti di scarto e sottocentrale")
+        st.markdown("#### \U0001F3ED Sorgenti di scarto e sottocentrale")
         _pw = (off.groupby("azienda")["MWh"].sum() if not off.empty else pd.Series(dtype=float))
         fig_src = go.Figure()
         for _n, (_la, _lo) in AZIENDE_COORD.items():
@@ -1230,20 +1632,20 @@ with tab_offerta:
 
             k1, k2, k3 = st.columns(3)
             k1.metric("Energia disponibile nel periodo", f"{tot_o:,.0f} MWh".replace(",", "."))
-            k2.metric("Picco orario (media)", f"{picco_o:.3f} MW")
-            k3.metric("Ore/anno con disponibilità", f"{ore_disp:,}".replace(",", "."))
+            k2.metric("Picco orario", f"{picco_o:.3f} MW")
+            k3.metric("Ore/anno con disponibilit\u00e0", f"{ore_disp:,}".replace(",", "."))
 
             fig_o = go.Figure()
-            for f in selected_fonti:
+            for f in sorted(agg_off_fonte["fonte"].unique()):
                 sub = agg_off_fonte[agg_off_fonte["fonte"] == f]
                 fig_o.add_trace(go.Scatter(x=sub["datetime"], y=sub["MWh"], mode="lines",
-                                            name=f, stackgroup="one", line=dict(width=0.5)))
-            fig_o.update_layout(height=420, yaxis_title="MWh/h (≈ MW)", xaxis_title="",
-                                 legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                                           name=f, stackgroup="one", line=dict(width=0.5)))
+            fig_o.update_layout(height=420, yaxis_title="MWh/h (\u2248 MW)", xaxis_title="",
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02))
             st.plotly_chart(fig_o, use_container_width=True)
 
     st.divider()
-    st.markdown("#### 🌡️ Curva composita: energia disponibile per soglia di temperatura, per azienda")
+    st.markdown("#### \U0001F321\ufe0f Curva composita: energia disponibile per soglia di temperatura")
     off_temp = off[off["T_disponibile"].notna() & (off["P_kW"] > 0)]
     if not off_temp.empty:
         fig_comp = go.Figure()
@@ -1256,27 +1658,29 @@ with tab_offerta:
             T_vals = sub["T_disponibile"].values
             dest = sub["destinazione"].iloc[0]
             nome = sub["flusso"].iloc[0]
-            fig_comp.add_trace(go.Scatter(x=cum_mwh, y=T_vals, mode="lines",
-                                           name=f"{'🔴' if dest=='alta_T' else '🔵'} {nome[:22]}",
-                                           line=dict(width=2.0, shape="hv")))
+            _ic = "\U0001F534" if dest == "alta_T" else "\U0001F535"
+            fig_comp.add_trace(go.Scatter(
+                x=cum_mwh, y=T_vals, mode="lines",
+                name=f"{_ic} {nome[:26]}",
+                line=dict(width=2.0, shape="hv")))
             sopra = (sub["T_disponibile"] >= T_mandata_ideale)
             righe_riep.append({
                 "Flusso": fid, "Destinazione": dest,
-                f"Utilizzabile a T≥{T_mandata_ideale}°C (MWh/a)": round(sub.loc[sopra, "MWh"].sum()),
+                f"Utilizzabile a T\u2265{T_mandata_ideale}\u00b0C (MWh/a)": round(sub.loc[sopra, "MWh"].sum()),
                 "Fornita sotto soglia (MWh/a)": round(sub.loc[~sopra, "MWh"].sum()),
             })
         fig_comp.add_hline(y=T_mandata_ideale, line_dash="dot", line_color="red",
-                            annotation_text=f"T mandata ideale ({T_mandata_ideale}°C)",
-                            annotation_position="top left")
+                           annotation_text=f"T mandata ideale ({T_mandata_ideale}\u00b0C)",
+                           annotation_position="top left")
         fig_comp.update_layout(height=680, xaxis_title="Energia cumulata disponibile (MWh/anno)",
-                                yaxis_title="Temperatura disponibile (°C)",
-                                font=dict(size=14),
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02))
+                               yaxis_title="Temperatura disponibile (\u00b0C)",
+                               font=dict(size=14),
+                               legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig_comp, use_container_width=True)
 
         if righe_riep:
             riepilogo = pd.DataFrame(righe_riep).sort_values(
-                f"Utilizzabile a T≥{T_mandata_ideale}°C (MWh/a)", ascending=False)
+                f"Utilizzabile a T\u2265{T_mandata_ideale}\u00b0C (MWh/a)", ascending=False)
             st.dataframe(riepilogo, use_container_width=True, hide_index=True)
     else:
         st.info("Nessun flusso selezionato con dati di temperatura in questo periodo.")
@@ -1286,7 +1690,7 @@ with tab_offerta:
 # TAB 3 - DIMENSIONAMENTO
 # =============================================================================
 with tab_dimensionamento:
-    st.markdown("### Dimensionamento — schema a cascata (3 accumuli + 2 HP)")
+    st.markdown("### Dimensionamento \u2014 schema a cascata (3 accumuli + 2 HP)")
 
     edifici_dim = st.session_state.get("_dom_edifici") or \
         buildings.loc[buildings["tipo_utenza"] == "Pubblico", "edificio"].tolist()
@@ -1294,6 +1698,7 @@ with tab_dimensionamento:
     eredita_ok = bool(st.session_state.get("_dom_edifici")) and bool(st.session_state.get("_off_flussi"))
     zone_dim = st.session_state.get("_dom_zone", [])
     fattore_priv = st.session_state.get("_dom_fattore_privato", 1.0)
+
     dom_dim = domanda[domanda["edificio"].isin(edifici_dim)].copy()
     is_priv = dom_dim["tipo_utenza"] == "Privato (potenziale)"
     dom_dim.loc[is_priv, "MWh_riscaldamento"] *= fattore_priv
@@ -1301,23 +1706,23 @@ with tab_dimensionamento:
     dom_dim_series = dom_dim.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum().sum(axis=1)
     idx_h = dom_dim_series.index
     dom_arr = dom_dim_series.values
-    dom_tot_utenze = float(dom_arr.sum())  # domanda alle utenze, PRIMA delle perdite
+    dom_tot_utenze = float(dom_arr.sum())    # domanda ALLE UTENZE, prima delle perdite
 
-    # =====================================================================
-    # PATCH 6 - Perdite di rete QM: la domanda alla CENTRALE include le perdite tubi
-    # =====================================================================
+    # -------------------------------------------------------------------------
+    # P6 - Perdite di rete QM: la domanda ALLA CENTRALE include le perdite tubi
+    # -------------------------------------------------------------------------
     _rete_info = st.session_state.get("_rete_info", {}) or {}
     _dens_lin = float(_rete_info.get("densita", 2.0))
     _T_media_rete = (T_mandata_ideale + T_ritorno_ideale) / 2.0
-    _classe_iso = 2  # classe standard pre-isolate PN16 (QM baseline)
+    _classe_iso = 2      # pre-isolate rigide PN16, classe media (baseline QM)
     _perd_pct = perdite_pct_QM(_dens_lin, _T_media_rete, _classe_iso)
     _fatt_lordo = 1.0 + _perd_pct / 100.0
     dom_arr = dom_arr * _fatt_lordo
     dom_tot = float(dom_arr.sum())
 
-    # =====================================================================
-    # PATCH 5 - Contemporaneità QM (solo picco di dimensionamento)
-    # =====================================================================
+    # -------------------------------------------------------------------------
+    # P5 - Contemporaneita QM: agisce SOLO sul picco di dimensionamento
+    # -------------------------------------------------------------------------
     _mask_priv = dom_dim["tipo_utenza"].isin(["Privato (potenziale)", "Condominio"])
     _carico_priv = (dom_dim[_mask_priv].groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]]
                     .sum().sum(axis=1).reindex(idx_h, fill_value=0).values) * _fatt_lordo
@@ -1327,88 +1732,121 @@ with tab_dimensionamento:
     picco_naive_kw = float(dom_arr.max()) * 1000.0
     picco_kw = float((_f_sim * _carico_priv + _carico_pub).max()) * 1000.0
 
+    # -------------------------------------------------------------------------
     pinch_dim = st.session_state.get("_off_pinch", 5.0)
-    off_all = genera_offerta_flussi(flussi, pinch_dim)
+    _fo = st.session_state.get("_off_forni", {"on": True, "T_e4": 144.0, "delta": 0.0, "shift": 0.0})
+    off_all = genera_offerta_completa(flussi, pinch_dim, _fo["T_e4"], _fo["delta"],
+                                      _fo["shift"], _fo["on"])
     off_all = off_all[off_all["id_flusso"].isin(flussi_dim)].copy()
     soil_temp_arr = soil_temp_monthly(pvgis)[idx_h.month.values - 1]
 
     def capex_hp_kw(pot_kw):
-        p = max(pot_kw / 1000.0, 0.1); pts = [(1, 340), (3, 300), (10, 220)]
-        if p <= 1: return 340
-        if p >= 10: return 220
+        """CAPEX specifico HP (\u20ac/kW). Curva conservativa 'sola macchina'.
+
+        Nota: i fact sheet IEA DHC TS5 F6 Tab.4 (chiavi in mano, Europa
+        occidentale) danno 0,67-1,24 M\u20ac/MW per HP su excess heat a 25 \u00b0C,
+        cioe 670-1240 \u20ac/kW comprensivi di edificio, allaccio elettrico MT e
+        sistema di regolazione. Usare lo slider CAPEX per la sensitivita.
+        """
+        p = max(pot_kw / 1000.0, 0.1)
+        pts = [(1, 340), (3, 300), (10, 220)]
+        if p <= 1:
+            return 340
+        if p >= 10:
+            return 220
         for (p0, c0), (p1, c1) in zip(pts, pts[1:]):
             if p0 <= p <= p1:
                 return c0 + (np.log(p) - np.log(p0)) / (np.log(p1) - np.log(p0)) * (c1 - c0)
         return 220
-    perdita_func = (lambda v: float(np.interp(np.log(np.clip(v, 500, 5000)), [np.log(500), np.log(5000)], [2.0, 1.0])) if v > 0 else 0.0)
+
+    perdita_func = (lambda v: float(np.interp(np.log(np.clip(v, 500, 5000)),
+                                              [np.log(500), np.log(5000)], [2.0, 1.0])) if v > 0 else 0.0)
     _maxp = int(picco_kw) + 1000
 
     col_ctrl, col_res = st.columns([1, 3])
 
     with col_ctrl:
-        st.markdown("#### ⚙️ Parametri")
-        T_int = st.slider("Anello intermedio (°C)", 40, 60, 50, key="dim_tint",
-                          help="La HP alta T solleva sempre da qui a mandata. ~45-50°C è l'ottimo tipico.")
+        st.markdown("#### \u2699\ufe0f Parametri")
+        T_int = st.slider("Anello intermedio (\u00b0C)", 40, 60, 50, key="dim_tint",
+                          help="La HP alta T solleva sempre da qui a mandata. "
+                               "45-50 \u00b0C e l'ottimo tipico.")
         st.markdown("**Supporto (parallelo)**")
         backup_tipo = st.radio("Copre il gap con:", ["HP bassa T", "gas", "biomassa"],
                                key="dim_backup_tipo")
         is_hp_par = (backup_tipo == "HP bassa T")
-        eta_hp = st.slider("η 2° principio HP (%)", 30, 60, 50, key="dim_eta") / 100.0
-        prezzo_el = st.slider("Prezzo elettricità (€/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el")
-        antigelo = st.slider("Floor antigelo ground loop (°C)", -5, 10, 0, key="dim_antigelo")
+        if not is_hp_par:
+            st.caption("\u2139\ufe0f **Merit order**: la HP alta T lavora sempre per prima, "
+                       "sollevando il calore dall'anello intermedio alla mandata. "
+                       f"Il {backup_tipo} entra **solo sul residuo** che la HP non riesce a coprire.")
+        eta_hp = st.slider("\u03b7 2\u00b0 principio HP (%)", 30, 60, 50, key="dim_eta") / 100.0
+        prezzo_el = st.slider("Prezzo elettricit\u00e0 (\u20ac/MWh)", 80, 350, 180, step=10, key="dim_prezzo_el")
+        antigelo = st.slider("Floor antigelo ground loop (\u00b0C)", -5, 10, 0, key="dim_antigelo")
+
         if backup_tipo == "gas":
             rend_gas = st.slider("Rendimento caldaia (%)", 85, 98, 92, key="dim_rend_gas") / 100.0
-            prezzo_gas = st.slider("Prezzo gas (€/MWh)", 40, 160, 90, key="dim_prezzo_gas")
-            capex_kw_bk = st.slider("CAPEX caldaia (€/kW)", 60, 300, 120, step=10, key="dim_capex_gas")
+            prezzo_gas = st.slider("Prezzo gas (\u20ac/MWh)", 40, 160, 90, key="dim_prezzo_gas")
+            capex_kw_bk = st.slider("CAPEX caldaia (\u20ac/kW)", 60, 300, 120, step=10, key="dim_capex_gas")
             opex_bk_mwh = prezzo_gas / rend_gas
         elif backup_tipo == "biomassa":
             rend_bio = st.slider("Rendimento caldaia (%)", 75, 92, 85, key="dim_rend_bio") / 100.0
-            costo_cip = st.slider("Costo cippato (€/MWh)", 20, 60, 35, key="dim_costo_bio")
-            capex_kw_bk = st.slider("CAPEX caldaia (€/kW)", 300, 900, 550, step=25, key="dim_capex_bio")
+            costo_cip = st.slider("Costo cippato (\u20ac/MWh)", 20, 60, 35, key="dim_costo_bio")
+            capex_kw_bk = st.slider("CAPEX caldaia (\u20ac/kW)", 300, 900, 550, step=25, key="dim_capex_bio")
             opex_bk_mwh = costo_cip / rend_bio
+            st.caption("\u26a0\ufe0f Nota QM: la filosofia del Handbook e l'opposto \u2014 caldaia a "
+                       "biomassa in **base** con molte ore equivalenti e fossile in punta. "
+                       "Usata come supporto avr\u00e0 poche ore/anno con CAPEX elevato.")
         else:
-            capex_kw_bk = 700.0; opex_bk_mwh = 0.0
+            capex_kw_bk = 700.0
+            opex_bk_mwh = 0.0
         backup_cop = None
-        costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 1000, step=20, key="dim_costo_m3",
-                             help="IEA DHC F1 Tab.3 (Sud Europa, <5000 m³ ≈ 1000 €/m³).")
 
-        solare_on = st.checkbox("☀️ Solare nell'accumulo basso", value=False, key="dim_solare_on")
-        solar_low = np.zeros(len(dom_arr)); capex_solare = 0.0; area_sol = 0
+        costo_m3 = st.slider("CAPEX accumuli (\u20ac/m\u00b3)", 80, 1500, 1000, step=20, key="dim_costo_m3",
+                             help="IEA DHC F1 Tab.3: TTES 110-200 \u20ac/m\u00b3 sopra i 2.000 m\u00b3; "
+                                  "1.000 \u20ac/m\u00b3 e conservativo per serbatoi in acciaio piccoli.")
+
+        solare_on = st.checkbox("\u2600\ufe0f Solare nell'accumulo basso", value=False, key="dim_solare_on")
+        solar_low = np.zeros(len(dom_arr))
+        capex_solare = 0.0
+        area_sol = 0
         if solare_on:
             acs = dom_dim.groupby("datetime")["MWh_ACS"].sum().reindex(idx_h, fill_value=0)
-            est = idx_h.month.isin([6, 7, 8]); acs_est = float(acs[est].sum())
+            est = idx_h.month.isin([6, 7, 8])
+            acs_est = float(acs[est].sum())
             pref = genera_offerta_solare(pvgis, 1000.0, 0.30).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0)
-            pref_est = float(pref[est].sum()); area_base = (acs_est / pref_est * 1000.0) if pref_est > 1e-6 else 2000.0
+            pref_est = float(pref[est].sum())
+            area_base = (acs_est / pref_est * 1000.0) if pref_est > 1e-6 else 2000.0
             quota = st.slider("Quota solare (% ACS estiva)", 0, 300, 100, step=10, key="dim_quota_sol")
             eff = st.slider("Efficienza collettori (%)", 15, 50, 30, key="dim_eff_sol") / 100.0
-            capex_mq = st.slider("CAPEX solare (€/m²)", 200, 900, 450, step=20, key="dim_capex_sol")
+            capex_mq = st.slider("CAPEX solare (\u20ac/m\u00b2)", 200, 900, 450, step=20, key="dim_capex_sol")
             area_sol = int(round(area_base * quota / 100.0 * (0.30 / max(eff, 0.01))))
             solar_low = genera_offerta_solare(pvgis, area_sol, eff).groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0).values
             capex_solare = area_sol * capex_mq
-            st.caption(f"Campo ~{area_sol:,} m²".replace(",", "."))
+            st.caption(f"Campo ~{area_sol:,} m\u00b2".replace(",", "."))
 
-            # PATCH 3 - Warning se solare + backup a combustibile
+            # --- P3: warning solare + supporto a combustibile ---
             if not is_hp_par:
                 st.warning(
-                    "⚠️ Solare attivo con supporto a **combustibile**: senza HP bassa T "
-                    "il calore solare finisce nell'accumulo basso ma non ha un utilizzatore. "
-                    "Considera di attivare 'HP bassa T' come supporto, oppure disattiva il solare."
+                    "\u26a0\ufe0f Solare attivo con supporto a **combustibile**: il calore solare "
+                    "finisce nella fascia pi\u00f9 calda dell'anello basso, ma senza HP bassa T non "
+                    "ha alcun utilizzatore e viene scartato \u2014 mentre il CAPEX resta a bilancio. "
+                    "Attiva 'HP bassa T' come supporto, oppure disattiva il solare."
                 )
 
-        q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
+        q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(
+            off_all, idx_h, T_mandata_ideale, T_int)
         q_low_bins_eff = q_low_bins.copy()
         if solare_on:
             q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low
 
-        st.markdown("#### 🔎 Ottimizzazione")
+        st.markdown("#### \U0001F50E Ottimizzazione")
         if st.button("Ottimizza scenario", key="dim_btn_opt", use_container_width=True):
             with st.spinner("LCOH minimo, copertura 100%..."):
-                # PATCH 5: passo il picco_kw realistico
-                best = ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
-                                         float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
-                                         backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
-                                         prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func, float(antigelo),
-                                         picco_kw_override=picco_kw)
+                best = ottimizza_cascata(
+                    dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
+                    float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
+                    backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
+                    prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func, float(antigelo),
+                    picco_kw_override=picco_kw)
             if best:
                 st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
                 st.session_state["dim_p_bassa"] = int(round(best["P_bassa"] / 100) * 100)
@@ -1420,21 +1858,23 @@ with tab_dimensionamento:
                 st.rerun()
 
         st.markdown("**Taglie** (dall'ottimo, ritoccabili)")
-        for k, dv in [("dim_p_alta", int(picco_kw)), ("dim_p_bassa", int(picco_kw * 0.8)), ("dim_p_bk", int(picco_kw))]:
+        for k, dv in [("dim_p_alta", int(picco_kw)), ("dim_p_bassa", int(picco_kw * 0.8)),
+                      ("dim_p_bk", int(picco_kw))]:
             st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), _maxp))
         for k, dv in [("dim_v_hot", 0), ("dim_v_int", 800), ("dim_v_low", 400)]:
             st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), 4000))
         P_alta = st.slider("HP alta T (kW)", 0, _maxp, step=100, key="dim_p_alta")
         if is_hp_par:
-            P_bassa = st.slider("HP bassa T (kW)", 0, _maxp, step=100, key="dim_p_bassa"); P_bk = 0
+            P_bassa = st.slider("HP bassa T (kW)", 0, _maxp, step=100, key="dim_p_bassa")
+            P_bk = 0
         else:
             P_bassa = 0
             P_bk = st.slider(f"Caldaia {backup_tipo} (kW)", 0, _maxp, step=100, key="dim_p_bk")
-        V_hot = st.slider("Accumulo CALDO (m³)", 0, 4000, step=50, key="dim_v_hot")
-        V_int = st.slider("Accumulo INTERMEDIO (m³)", 0, 4000, step=50, key="dim_v_int")
-        V_low = st.slider("Accumulo BASSO (m³)", 0, 4000, step=50, key="dim_v_low")
+        V_hot = st.slider("Accumulo CALDO (m\u00b3)", 0, 4000, step=50, key="dim_v_hot")
+        V_int = st.slider("Accumulo INTERMEDIO (m\u00b3)", 0, 4000, step=50, key="dim_v_int")
+        V_low = st.slider("Accumulo BASSO (m\u00b3)", 0, 4000, step=50, key="dim_v_low")
 
-    # =========================== CALCOLO ===========================
+    # ============================== CALCOLO ==============================
     perd = perdita_func(max(V_hot, V_int, V_low))
     sim = dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
                            float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
@@ -1445,6 +1885,7 @@ with tab_dimensionamento:
     E_bk, E_nc = sim["E_backup"], sim["E_non_coperta"]
     E_fer = E_hot + E_alta + (E_bk if backup_tipo == "biomassa" else 0.0)
     quota_fer = E_fer / dom_tot * 100 if dom_tot > 0 else 0
+
     fattore_crf = crf(0.04, 20)
     capex_alta = P_alta * capex_hp_kw(P_alta)
     capex_bassa = P_bassa * capex_hp_kw(P_bassa) if is_hp_par else 0.0
@@ -1455,41 +1896,55 @@ with tab_dimensionamento:
     costo_annuo = capex_sistema * fattore_crf + opex
     lcoh = costo_annuo / dom_tot if dom_tot > 0 else np.nan
 
+    el_hp = sim["el_alta"] + sim["el_bassa"]
+    ground = sim["q_ground"]
+    scarto_via_hp = np.maximum(sim["q_alta"] - el_hp - ground, 0.0)
+    E_scarto_via_hp = float(scarto_via_hp.sum())
+    E_ground = sim["E_ground"]
+    E_el = float(el_hp.sum())
+    E_scarto_tot = E_hot + E_scarto_via_hp
+
     with col_res:
         if eredita_ok:
-            st.caption(f"**{len(edifici_dim)} edifici** (zone: {', '.join(zone_dim) if zone_dim else '—'}) · "
-                       f"**{len(flussi_dim)} flussi** · mandata/ritorno **{T_mandata_ideale}/{T_ritorno_ideale}°C** "
-                       f"· anello intermedio **{T_int}°C**.")
+            st.caption(f"**{len(edifici_dim)} edifici** (zone: {', '.join(zone_dim) if zone_dim else '\u2014'}) "
+                       f"\u00b7 **{len(flussi_dim)} flussi** \u00b7 mandata/ritorno "
+                       f"**{T_mandata_ideale}/{T_ritorno_ideale}\u00b0C** \u00b7 anello intermedio "
+                       f"**{T_int}\u00b0C**.")
         else:
             st.info(f"Valori predefiniti ({len(edifici_dim)} edifici pubblici, {len(flussi_dim)} flussi).")
 
-        # Info QM (patch 5 + 6)
         st.info(
-            f"📉 **Perdite di rete QM (Fig. 12.3 Verenum)**: {_perd_pct:.1f}% "
-            f"(densità {_dens_lin:.2f} MWh/(m·a), T media {_T_media_rete:.0f}°C, classe isolante {_classe_iso}). "
-            f"Domanda utenze: **{dom_tot_utenze:,.0f} MWh/a** → alla centrale: **{dom_tot:,.0f} MWh/a** "
-            f"(×{_fatt_lordo:.3f}).".replace(",", ".") + "\n\n" +
-            (f"👥 **Contemporaneità QM (Fig. 12.2)**: {_n_priv} utenze private/condominiali → f={_f_sim:.2f}. "
-             f"Picco per dimensionamento **{picco_kw:.0f} kW** (vs {picco_naive_kw:.0f} kW senza contemporaneità)."
-             if _n_priv > 1 else "👥 Contemporaneità: solo utenze pubbliche (f=1.0).")
+            f"\U0001F4C9 **Perdite di rete QM (Fig. 12.3)**: {_perd_pct:.1f} % \u2014 densit\u00e0 "
+            f"{_dens_lin:.2f} MWh/(m\u00b7a), T media rete {_T_media_rete:.0f} \u00b0C, classe "
+            f"isolante {_classe_iso}. Domanda alle utenze **{dom_tot_utenze:,.0f} MWh/a** "
+            f"\u2192 alla centrale **{dom_tot:,.0f} MWh/a** (\u00d7{_fatt_lordo:.3f}).".replace(",", ".")
         )
+        if _n_priv > 1:
+            st.info(
+                f"\U0001F465 **Contemporaneit\u00e0 QM (Fig. 12.2)**: {_n_priv} utenze "
+                f"private/condominiali \u2192 f = {_f_sim:.2f}. Picco per il dimensionamento "
+                f"**{picco_kw:.0f} kW**, contro {picco_naive_kw:.0f} kW senza contemporaneit\u00e0 "
+                f"(\u2212{(1 - picco_kw / max(picco_naive_kw, 1)) * 100:.0f} %). "
+                f"L'energia annua non e toccata."
+            )
 
         ores = st.session_state.get("_opt_casc")
         if ores:
-            st.markdown("#### ✅ Scenario ottimizzato")
+            st.markdown("#### \u2705 Scenario ottimizzato")
             o1, o2, o3, o4, o5 = st.columns(5)
             o1.metric("HP alta T", f"{ores['P_alta']:.0f} kW")
             o2.metric("HP bassa T" if is_hp_par else "Caldaia",
                       f"{(ores['P_bassa'] if is_hp_par else ores['P_bk']):.0f} kW")
-            o3.metric("LCOH", f"{ores['lcoh']:.1f} €/MWh")
+            o3.metric("LCOH", f"{ores['lcoh']:.1f} \u20ac/MWh")
             o4.metric("Quota FER", f"{ores['quota_fer']:.0f}%")
             o5.metric("COP HP alta", f"{ores['cop_alta']:.1f}")
             va1, va2, va3 = st.columns(3)
-            va1.metric("Accumulo CALDO", f"{ores['v_hot']:.0f} m³")
-            va2.metric("Accumulo INTERMEDIO", f"{ores['v_int']:.0f} m³")
-            va3.metric("Accumulo BASSO", f"{ores['v_low']:.0f} m³")
-            st.caption("Backup **firm** (potenza al picco): copre il 100% anche a zero scarto. "
-                       "Cambi supporto/solare/fonti? Rilancia l'ottimizzazione.")
+            va1.metric("Accumulo CALDO", f"{ores['v_hot']:.0f} m\u00b3")
+            va2.metric("Accumulo INTERMEDIO", f"{ores['v_int']:.0f} m\u00b3")
+            va3.metric("Accumulo BASSO", f"{ores['v_low']:.0f} m\u00b3")
+            st.caption("Backup **firm** (potenza al picco): copre il 100 % anche a zero scarto. "
+                       "La HP alta T e dimensionata anch'essa sul picco perche e la macchina di "
+                       "base del sistema. Cambi supporto/solare/fonti? Rilancia l'ottimizzazione.")
         else:
             st.info("Premi **Ottimizza scenario** (a sinistra) per dimensionare HP e accumuli a LCOH minimo.")
 
@@ -1497,91 +1952,89 @@ with tab_dimensionamento:
         st.markdown("#### Instradamento dello scarto per temperatura")
         cA1, cA2, cA3, cA4 = st.columns(4)
         cA1.metric("Domanda annua alla centrale", f"{dom_tot:,.0f} MWh".replace(",", "."),
-                   help=f"picco {picco_kw:.0f} kW (con contemporaneità QM)")
-        cA2.metric("🔴 → caldo", f"{q_hot_arr.sum():,.0f} MWh".replace(",", "."),
-                   help=f"scarto ≥ mandata ({T_mandata_ideale}°C)")
-        cA3.metric("🟠 → intermedio", f"{q_int_arr.sum():,.0f} MWh".replace(",", "."),
-                   help=f"tra {T_int} e {T_mandata_ideale}°C")
-        cA4.metric("🔵 → basso", f"{q_low_arr.sum():,.0f} MWh".replace(",", "."),
-                   help=f"< {T_int}°C")
+                   help=f"picco di dimensionamento {picco_kw:.0f} kW (contemporaneit\u00e0 QM inclusa)")
+        cA2.metric("\U0001F534 \u2192 caldo", f"{q_hot_arr.sum():,.0f} MWh".replace(",", "."),
+                   help=f"scarto \u2265 mandata ({T_mandata_ideale}\u00b0C), uso diretto")
+        cA3.metric("\U0001F7E0 \u2192 intermedio", f"{q_int_arr.sum():,.0f} MWh".replace(",", "."),
+                   help=f"tra {T_int} e {T_mandata_ideale}\u00b0C, evaporatore HP alta T")
+        cA4.metric("\U0001F535 \u2192 basso", f"{q_low_arr.sum():,.0f} MWh".replace(",", "."),
+                   help=f"< {T_int}\u00b0C, utilizzabile solo con HP bassa T")
 
-        el_hp = sim["el_alta"] + sim["el_bassa"]
-        ground = sim["q_ground"]
-        scarto_via_hp = np.maximum(sim["q_alta"] - el_hp - ground, 0.0)
-        E_scarto_via_hp = float(scarto_via_hp.sum())
-        E_ground = sim["E_ground"]; E_el = float(el_hp.sum())
-        E_scarto_tot = E_hot + E_scarto_via_hp
-        C_GROUND = "#8C6D46"
-
-        st.markdown("##### 📉 Curva di durata: da dove arriva l'energia")
+        st.markdown("##### \U0001F4C9 Curva di durata: da dove arriva l'energia")
         order = np.argsort(dom_arr)[::-1]
         x = np.arange(1, len(dom_arr) + 1)
         fig_dur = go.Figure()
         bande = [("Scarto diretto", sim["q_hot_direct"], COLOR_ALTA_T),
                  ("Scarto risollevato dalle HP", scarto_via_hp, COLOR_OFFERTA),
-                 ("Suolo / ground loop", ground, C_GROUND),
-                 ("Elettricità HP alta", sim["el_alta"], COLOR_HP),
-                 ("Elettricità HP bassa", sim["el_bassa"], COLOR_HP_BASSA),
+                 ("Suolo / ground loop", ground, COLOR_GROUND),
+                 ("Elettricit\u00e0 HP alta", sim["el_alta"], COLOR_HP),
+                 ("Elettricit\u00e0 HP bassa", sim["el_bassa"], COLOR_HP_BASSA),
                  (f"Supporto ({backup_tipo})", sim["q_backup"], COLOR_BACKUP)]
         for nome, arr, col in bande:
             if float(arr.sum()) < 1:
                 continue
             fig_dur.add_trace(go.Scatter(x=x, y=arr[order], mode="lines", name=nome,
-                                         stackgroup="c", line=dict(width=0), fillcolor=hex_to_rgba(col, 0.9)))
+                                         stackgroup="c", line=dict(width=0),
+                                         fillcolor=hex_to_rgba(col, 0.9)))
         fig_dur.add_trace(go.Scatter(x=x, y=dom_arr[order], mode="lines", name="Domanda",
                                      line=dict(color=COLOR_DOMANDA, width=2.4)))
         fig_dur.update_layout(height=440, xaxis_title="Ore/anno", yaxis_title="MW",
-                              legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=30, b=10))
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                              margin=dict(t=30, b=10))
         st.plotly_chart(fig_dur, use_container_width=True)
 
-        st.markdown("##### 🗺️ Heatmap: energia di scarto per mese e temperatura")
+        st.markdown("##### \U0001F5FA\ufe0f Heatmap: energia di scarto per mese e temperatura")
         _h = off_all[off_all["MWh"] > 0].copy()
         if _h.empty:
             st.info("Nessuno scarto disponibile.")
         else:
             _h["mese"] = _h["datetime"].dt.month
             bins = [0, 30, 40, 50, 60, 70, 80, 100, 150, 2000]
-            labels = ["<30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-100", "100-150", "≥150"]
+            labels = ["<30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-100", "100-150", "\u2265150"]
             _h["fascia"] = pd.cut(_h["T_disponibile"], bins=bins, labels=labels, right=False)
             piv = (_h.pivot_table(index="fascia", columns="mese", values="MWh", aggfunc="sum", observed=False)
                    .reindex(index=labels).reindex(columns=range(1, 13)).fillna(0))
-            fig_hm = go.Figure(go.Heatmap(z=piv.values, x=[MONTH_NAMES[m-1] for m in piv.columns], y=labels,
-                                          colorscale="YlOrRd", colorbar=dict(title="MWh")))
-            for _lv, _lab in [(T_int, f"intermedio {T_int}°C"), (T_mandata_ideale, f"mandata {T_mandata_ideale}°C")]:
+            fig_hm = go.Figure(go.Heatmap(z=piv.values, x=[MONTH_NAMES[m - 1] for m in piv.columns],
+                                          y=labels, colorscale="YlOrRd", colorbar=dict(title="MWh")))
+            for _lv, _lab in [(T_int, f"intermedio {T_int}\u00b0C"),
+                              (T_mandata_ideale, f"mandata {T_mandata_ideale}\u00b0C")]:
                 try:
-                    _ib = next(i for i in range(len(labels)) if bins[i] <= _lv < bins[i+1])
+                    _ib = next(i for i in range(len(labels)) if bins[i] <= _lv < bins[i + 1])
                     fig_hm.add_hline(y=_ib - 0.5, line_color="#22C3DD", line_width=2,
                                      annotation_text=_lab, annotation_position="top left")
                 except StopIteration:
                     pass
-            fig_hm.update_layout(height=420, yaxis_title="Temperatura scarto (°C)", margin=dict(t=30, b=10))
+            fig_hm.update_layout(height=420, yaxis_title="Temperatura scarto (\u00b0C)",
+                                 margin=dict(t=30, b=10))
             st.plotly_chart(fig_hm, use_container_width=True)
 
         st.divider()
         st.markdown("#### Copertura (simulazione oraria)")
-        mets = [("Caldo diretto", E_hot, f"{E_hot/dom_tot*100:.0f}% della domanda"),
-                ("HP alta T", E_alta, f"{E_alta/dom_tot*100:.0f}% consegnato · COP {sim['cop_alta_medio']:.2f}")]
+        mets = [("Caldo diretto", E_hot, f"{E_hot / dom_tot * 100:.0f}% della domanda"),
+                ("HP alta T", E_alta, f"{E_alta / dom_tot * 100:.0f}% consegnato \u00b7 COP {sim['cop_alta_medio']:.2f}")]
         if is_hp_par:
             mets.append(("HP bassa T (interna)", E_bassa,
-                         f"→ intermedio · COP {sim['cop_bassa_medio']:.2f} · ground {sim['ore_ground']} ore"))
+                         f"\u2192 intermedio \u00b7 COP {sim['cop_bassa_medio']:.2f} \u00b7 "
+                         f"ground {sim['ore_ground']} ore"))
         else:
-            mets.append((f"Supporto: {backup_tipo}", E_bk, f"{E_bk/dom_tot*100:.0f}% della domanda"))
+            mets.append((f"Supporto: {backup_tipo}", E_bk, f"{E_bk / dom_tot * 100:.0f}% della domanda"))
         cols_r = st.columns(len(mets) + 1)
         for i, (lab, val, hlp) in enumerate(mets):
             cols_r[i].metric(lab, f"{val:,.0f} MWh".replace(",", "."), help=hlp)
         cols_r[-1].metric("Quota FER", f"{quota_fer:.0f}%")
         if sim["ore_non_coperte"] > 0:
-            st.error(f"⚠️ {sim['ore_non_coperte']} ore non coperte ({E_nc:,.0f} MWh): ottimizza o aumenta le taglie.".replace(",", "."))
+            st.error(f"\u26a0\ufe0f {sim['ore_non_coperte']} ore non coperte "
+                     f"({E_nc:,.0f} MWh): ottimizza o aumenta le taglie.".replace(",", "."))
         else:
-            st.success("✅ Copertura 100% in tutte le ore.")
+            st.success("\u2705 Copertura 100 % in tutte le ore.")
 
         st.markdown("**Da dove arriva l'energia** (fonti, sull'anno)")
         fig_mix = go.Figure()
         voci = [("Scarto diretto", E_hot, COLOR_ALTA_T),
                 ("Scarto risollevato dalle HP", E_scarto_via_hp, COLOR_OFFERTA),
-                ("Suolo / ground loop", E_ground, C_GROUND),
-                ("Elettricità HP alta", float(sim["el_alta"].sum()), COLOR_HP),
-                ("Elettricità HP bassa", float(sim["el_bassa"].sum()), COLOR_HP_BASSA),
+                ("Suolo / ground loop", E_ground, COLOR_GROUND),
+                ("Elettricit\u00e0 HP alta", float(sim["el_alta"].sum()), COLOR_HP),
+                ("Elettricit\u00e0 HP bassa", float(sim["el_bassa"].sum()), COLOR_HP_BASSA),
                 (f"Supporto ({backup_tipo})", E_bk, COLOR_BACKUP)]
         if E_nc > 1:
             voci.append(("Non coperto", E_nc, COLOR_NONCOP))
@@ -1589,423 +2042,510 @@ with tab_dimensionamento:
         tot_mix = sum(v for _, v, _ in voci) or 1.0
         for nome, val, col in voci:
             pct = val / tot_mix * 100
-            fig_mix.add_trace(go.Bar(y=["Fonti"], x=[val], name=nome, orientation="h", marker_color=col,
+            fig_mix.add_trace(go.Bar(y=["Fonti"], x=[val], name=nome, orientation="h",
+                                     marker_color=col,
                                      text=(f"{pct:.0f}%" if pct >= 6 else ""), textposition="inside",
-                                     insidetextanchor="middle", textfont=dict(color="white", size=13), cliponaxis=False))
+                                     insidetextanchor="middle",
+                                     textfont=dict(color="white", size=13), cliponaxis=False))
         fig_mix.update_layout(barmode="stack", height=220, xaxis_title="MWh/anno",
-                              legend=dict(orientation="h", yanchor="top", y=-0.5), margin=dict(t=30, b=10))
+                              legend=dict(orientation="h", yanchor="top", y=-0.5),
+                              margin=dict(t=30, b=10))
         fig_mix.update_yaxes(showticklabels=False)
         st.plotly_chart(fig_mix, use_container_width=True)
 
-        # Bilancio energetico
         st.markdown("**Bilancio energetico dello scenario**")
         _spf = (E_hot + E_alta) / E_el if E_el > 1e-6 else 0.0
         bb = st.columns(4)
         bb[0].metric("Scarto utilizzato", f"{E_scarto_tot:,.0f} MWh".replace(",", "."),
-                     help=f"{E_scarto_tot/dom_tot*100:.0f}% della domanda")
-        bb[1].metric("Elettricità HP", f"{E_el:,.0f} MWh".replace(",", "."),
-                     help=f"compressori · SPF sistema {_spf:.1f}")
-        bb[2].metric("Suolo / ground", f"{E_ground:,.0f} MWh".replace(",", "."), help=f"{sim['ore_ground']} ore")
+                     help=f"{E_scarto_tot / dom_tot * 100:.0f}% della domanda")
+        bb[1].metric("Elettricit\u00e0 HP", f"{E_el:,.0f} MWh".replace(",", "."),
+                     help=f"compressori \u00b7 SPF di sistema {_spf:.1f}")
+        bb[2].metric("Suolo / ground", f"{E_ground:,.0f} MWh".replace(",", "."),
+                     help=f"{sim['ore_ground']} ore")
         bb[3].metric("Combustibile", f"{E_bk:,.0f} MWh".replace(",", "."),
                      help=(f"{backup_tipo}" if not is_hp_par else "nessuno"))
 
-        # Curva di durata COP
-        st.markdown("**📈 Curva di durata del COP delle pompe di calore**")
-        st.caption("COP con cap realistico (lift min 8K, cop max 6.5 - IEA F6/F10).")
+        st.markdown("**\U0001F4C8 Curva di durata del COP delle pompe di calore**")
+        st.caption("COP con vincoli realistici: lift minimo 8 K e tetto 6,5 (IEA DHC F6/F10).")
         fig_cop = go.Figure()
         _ca = sim["cop_alta_s"][(sim["q_alta"] > 1e-6) & np.isfinite(sim["cop_alta_s"])]
         if len(_ca):
             fig_cop.add_trace(go.Scatter(y=np.sort(_ca)[::-1], x=np.arange(1, len(_ca) + 1),
-                                         mode="lines", name="COP HP alta T", line=dict(color=COLOR_HP, width=2)))
+                                         mode="lines", name="COP HP alta T",
+                                         line=dict(color=COLOR_HP, width=2)))
         _cb = sim["cop_bassa_s"][(sim["q_bassa"] > 1e-6) & np.isfinite(sim["cop_bassa_s"])]
         if len(_cb):
             fig_cop.add_trace(go.Scatter(y=np.sort(_cb)[::-1], x=np.arange(1, len(_cb) + 1),
-                                         mode="lines", name="COP HP bassa T", line=dict(color=COLOR_HP_BASSA, width=2)))
+                                         mode="lines", name="COP HP bassa T",
+                                         line=dict(color=COLOR_HP_BASSA, width=2)))
         if len(_ca) or len(_cb):
-            fig_cop.update_layout(height=320, xaxis_title="Ore di funzionamento",
-                                  yaxis_title="COP", legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            fig_cop.update_layout(height=320, xaxis_title="Ore di funzionamento", yaxis_title="COP",
+                                  legend=dict(orientation="h", yanchor="bottom", y=1.02),
                                   margin=dict(t=30, b=10))
             st.plotly_chart(fig_cop, use_container_width=True)
         else:
             st.info("Nessuna HP attiva in questo scenario.")
 
         st.divider()
-        st.markdown("#### 💰 Costi e LCOH")
+        st.markdown("#### \U0001F4B0 Costi e LCOH")
         righe = [
-            {"Voce": f"HP alta T ({P_alta} kW)", "CAPEX (€)": round(capex_alta), "OPEX (€/a)": round(sim["E_el_alta"] * prezzo_el)},
-            ({"Voce": f"HP bassa T ({P_bassa} kW)", "CAPEX (€)": round(capex_bassa), "OPEX (€/a)": round(sim["E_el_bassa"] * prezzo_el)} if is_hp_par else
-             {"Voce": f"Caldaia {backup_tipo} ({P_bk} kW)", "CAPEX (€)": round(capex_bk), "OPEX (€/a)": round(E_bk * opex_bk_mwh)}),
-            {"Voce": f"Accumuli ({V_hot}+{V_int}+{V_low} m³)", "CAPEX (€)": round(capex_acc), "OPEX (€/a)": 0},
+            {"Voce": f"HP alta T ({P_alta} kW)", "CAPEX (\u20ac)": round(capex_alta),
+             "OPEX (\u20ac/a)": round(sim["E_el_alta"] * prezzo_el)},
+            ({"Voce": f"HP bassa T ({P_bassa} kW)", "CAPEX (\u20ac)": round(capex_bassa),
+              "OPEX (\u20ac/a)": round(sim["E_el_bassa"] * prezzo_el)} if is_hp_par else
+             {"Voce": f"Caldaia {backup_tipo} ({P_bk} kW)", "CAPEX (\u20ac)": round(capex_bk),
+              "OPEX (\u20ac/a)": round(E_bk * opex_bk_mwh)}),
+            {"Voce": f"Accumuli ({V_hot}+{V_int}+{V_low} m\u00b3)", "CAPEX (\u20ac)": round(capex_acc),
+             "OPEX (\u20ac/a)": 0},
         ]
         if solare_on:
-            righe.append({"Voce": f"Solare ({area_sol} m²)", "CAPEX (€)": round(capex_solare), "OPEX (€/a)": 0})
+            righe.append({"Voce": f"Solare ({area_sol} m\u00b2)", "CAPEX (\u20ac)": round(capex_solare),
+                          "OPEX (\u20ac/a)": 0})
         st.dataframe(pd.DataFrame(righe), use_container_width=True, hide_index=True)
+
         fig_co = go.Figure(go.Pie(labels=["CAPEX (annualizzato)", "OPEX (annuo)"],
                                   values=[capex_sistema * fattore_crf, opex], hole=0.5,
                                   marker=dict(colors=["#5B8DEF", "#F4A259"]), sort=False))
-        fig_co.update_layout(title=f"Costo annuo · {costo_annuo:,.0f} €/a".replace(",", "."),
+        fig_co.update_layout(title=f"Costo annuo \u00b7 {costo_annuo:,.0f} \u20ac/a".replace(",", "."),
                              height=300, margin=dict(t=45, b=10), legend=dict(orientation="h", y=-0.1))
         st.plotly_chart(fig_co, use_container_width=True)
+
         df_c = pd.DataFrame(righe)
         _pal = [COLOR_HP, (COLOR_HP_BASSA if is_hp_par else COLOR_BACKUP), COLOR_ACCUMULO, COLOR_SOLARE]
         pc1, pc2 = st.columns(2)
         with pc1:
-            fig_capex = go.Figure(go.Pie(labels=df_c["Voce"], values=df_c["CAPEX (€)"], hole=0.5,
+            fig_capex = go.Figure(go.Pie(labels=df_c["Voce"], values=df_c["CAPEX (\u20ac)"], hole=0.5,
                                          marker=dict(colors=_pal[:len(df_c)]), sort=False))
-            fig_capex.update_layout(title=f"CAPEX totale · {capex_sistema:,.0f} €".replace(",", "."),
-                                    height=330, margin=dict(t=45, b=10), legend=dict(orientation="h", y=-0.1))
+            fig_capex.update_layout(title=f"CAPEX totale \u00b7 {capex_sistema:,.0f} \u20ac".replace(",", "."),
+                                    height=330, margin=dict(t=45, b=10),
+                                    legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig_capex, use_container_width=True)
         with pc2:
-            df_o = df_c[df_c["OPEX (€/a)"] > 0]
-            fig_opex = go.Figure(go.Pie(labels=df_o["Voce"], values=df_o["OPEX (€/a)"], hole=0.5,
+            df_o = df_c[df_c["OPEX (\u20ac/a)"] > 0]
+            fig_opex = go.Figure(go.Pie(labels=df_o["Voce"], values=df_o["OPEX (\u20ac/a)"], hole=0.5,
                                         marker=dict(colors=_pal[:len(df_o)]), sort=False))
-            fig_opex.update_layout(title=f"OPEX annuo · {opex:,.0f} €/a".replace(",", "."),
-                                   height=330, margin=dict(t=45, b=10), legend=dict(orientation="h", y=-0.1))
+            fig_opex.update_layout(title=f"OPEX annuo \u00b7 {opex:,.0f} \u20ac/a".replace(",", "."),
+                                   height=330, margin=dict(t=45, b=10),
+                                   legend=dict(orientation="h", y=-0.1))
             st.plotly_chart(fig_opex, use_container_width=True)
+
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("CAPEX di sistema", f"{capex_sistema:,.0f} €".replace(",", "."))
-        s2.metric("Costo annuo", f"{costo_annuo:,.0f} €/a".replace(",", "."))
-        s3.metric("LCOH di sistema", f"{lcoh:.1f} €/MWh" if not np.isnan(lcoh) else "n/d")
+        s1.metric("CAPEX di sistema", f"{capex_sistema:,.0f} \u20ac".replace(",", "."))
+        s2.metric("Costo annuo", f"{costo_annuo:,.0f} \u20ac/a".replace(",", "."))
+        s3.metric("LCOH di sistema", f"{lcoh:.1f} \u20ac/MWh" if not np.isnan(lcoh) else "n/d")
         s4.metric("Quota FER", f"{quota_fer:.0f}%")
 
+    # ---------------------------------------------------------------------
+    # SNAPSHOT PER CONFRONTO / ECONOMIA
+    # ---------------------------------------------------------------------
     st.session_state["_dim_snapshot"] = {
         "utenza": f"{len(edifici_dim)} edifici",
-        "T mandata/ritorno": f"{T_mandata_ideale}/{T_ritorno_ideale}°C",
-        "carico_utenze_mwh": round(dom_tot_utenze),  # domanda alle utenze
-        "carico_residuo_mwh": round(dom_tot),         # domanda alla centrale (con perdite)
+        "zone": ", ".join(zone_dim) if zone_dim else "\u2014",
+        "T_mandata": int(T_mandata_ideale),
+        "T_ritorno": int(T_ritorno_ideale),
+        "T_int": int(T_int),
+        "supporto": backup_tipo,
+        "carico_utenze_mwh": round(dom_tot_utenze),
+        "carico_centrale_mwh": round(dom_tot),
         "perdite_rete_pct": round(_perd_pct, 1),
         "contemporaneita": round(_f_sim, 2),
         "picco_naive_kw": round(picco_naive_kw),
         "picco_dim_kw": round(picco_kw),
-        "tecnologie": f"HP alta {P_alta}kW + " + (f"HP bassa {P_bassa}kW" if is_hp_par else f"{backup_tipo} {P_bk}kW")
-                      + (f" + solare {area_sol}m²" if solare_on else ""),
-        "volume_accumulo": f"{V_hot}+{V_int}+{V_low}",
+        "P_alta_kw": int(P_alta),
+        "P_bassa_kw": int(P_bassa),
+        "P_backup_kw": int(P_bk),
+        "V_hot": int(V_hot), "V_int": int(V_int), "V_low": int(V_low),
+        "area_solare_m2": int(area_sol),
+        "tecnologie": (f"HP alta {P_alta} kW + "
+                       + (f"HP bassa {P_bassa} kW" if is_hp_par else f"{backup_tipo} {P_bk} kW")
+                       + (f" + solare {area_sol} m\u00b2" if solare_on else "")),
+        "E_hot_diretto": round(E_hot), "E_hp_alta": round(E_alta), "E_hp_bassa": round(E_bassa),
+        "E_backup": round(E_bk), "E_elettrica": round(E_el), "E_ground": round(E_ground),
+        "E_scarto_utilizzato": round(E_scarto_tot), "E_non_coperta": round(E_nc, 1),
+        "ore_non_coperte": int(sim["ore_non_coperte"]),
+        "cop_alta": round(sim["cop_alta_medio"], 2), "cop_bassa": round(sim["cop_bassa_medio"], 2),
+        "spf_sistema": round(_spf, 2),
+        "quota_fer_pct": round(quota_fer, 1),
         "capex_sistema": round(capex_sistema),
-        "costo_annuo_sistema": round(costo_annuo),
-        "lcoh_sistema": round(float(lcoh), 1) if not np.isnan(lcoh) else None,
-        "quota_fer_pct": round(quota_fer),
-        "ore_non_coperte": sim["ore_non_coperte"],
-        # dettaglio per l'analisi economica
-        "capex_hp_alta": round(capex_alta), "capex_hp_bassa": round(capex_bassa),
-        "capex_caldaia": round(capex_bk), "capex_accumuli": round(capex_acc),
-        "capex_solare": round(capex_solare),
-        "opex_elettrico": round(sim["E_el_tot"] * prezzo_el), "opex_combustibile": round(E_bk * opex_bk_mwh),
-        "E_el_mwh": round(sim["E_el_tot"]), "E_comb_mwh": round(E_bk),
-        "E_scarto_mwh": round(E_hot + max(sim["E_hp_alta"] - sim["E_el_tot"] - sim["E_ground"], 0)),
-        "backup_tipo": backup_tipo, "cop_alta": round(sim["cop_alta_medio"], 2),
-        "rete": st.session_state.get("_rete_info"),
+        "capex_rete": round(float(_rete_info.get("capex_rete", 0.0))),
+        "lunghezza_rete_m": round(float(_rete_info.get("lunghezza_m", 0.0))),
+        "densita_lineare": round(_dens_lin, 2),
+        "opex_annuo": round(opex),
+        "costo_annuo": round(costo_annuo),
+        "lcoh": round(float(lcoh), 2) if not np.isnan(lcoh) else None,
+        "prezzo_el": int(prezzo_el),
+        "opex_backup_mwh": round(float(opex_bk_mwh), 1),
     }
 
+    # --- salvataggio scenario (P9: rimovibili singolarmente) ---
+    st.divider()
+    sc1, sc2 = st.columns([3, 1])
+    _nome_def = f"{backup_tipo} \u00b7 {T_mandata_ideale}/{T_ritorno_ideale}\u00b0C"
+    nome_scen = sc1.text_input("Nome dello scenario da salvare", value=_nome_def, key="dim_nome_scen")
+    if sc2.button("\U0001F4BE Salva scenario", use_container_width=True, key="dim_btn_salva"):
+        if nome_scen.strip():
+            st.session_state["_scenari"][nome_scen.strip()] = dict(st.session_state["_dim_snapshot"])
+            st.success(f"Scenario **{nome_scen.strip()}** salvato "
+                       f"({len(st.session_state['_scenari'])} in memoria).")
+        else:
+            st.warning("Dai un nome allo scenario prima di salvarlo.")
+
+
 # =============================================================================
-# TAB 4 - CONFRONTO SCENARI
+# TAB 4 - CONFRONTO SCENARI (P9: rimozione selettiva)
 # =============================================================================
 with tab_confronto:
-    st.markdown("### Confronto scenari")
-    st.caption(
-        "Salva la configurazione corrente della scheda Dimensionamento (mix tecnologico + accumulo) "
-        "per confrontarla con altre — es. **100% rinnovabile** vs **rinnovabile + quota gas**. "
-        "Imposta le tecnologie in Dimensionamento, torna qui e salva; poi cambia il mix e salva di nuovo."
-    )
+    st.markdown("### \U0001F4CA Confronto tra scenari salvati")
+    _scen = st.session_state.get("_scenari", {})
 
-    if "scenari_salvati" not in st.session_state:
-        st.session_state.scenari_salvati = []
-
-    snap = st.session_state.get("_dim_snapshot")
-    if snap is None:
-        st.info("Apri prima la scheda Dimensionamento e imposta un mix di tecnologie.")
+    if not _scen:
+        st.info("Nessuno scenario salvato. Vai nella scheda **Dimensionamento**, configura un "
+                "assetto e premi *Salva scenario*. Puoi salvarne quanti vuoi e confrontarli qui.")
     else:
-        cprev1, cprev2, cprev3, cprev4 = st.columns(4)
-        cprev1.metric("Carico residuo", f"{snap['carico_residuo_mwh']:,.0f} MWh".replace(",", "."))
-        cprev2.metric("LCOH di sistema", f"{snap['lcoh_sistema']:.1f} €/MWh" if snap['lcoh_sistema'] else "n/d")
-        cprev3.metric("Quota FER", f"{snap['quota_fer_pct']:.0f}%")
-        cprev4.metric("Ore non coperte", f"{snap['ore_non_coperte']}" if snap['ore_non_coperte'] is not None else "n/d")
-        st.caption(f"Mix corrente: **{snap['tecnologie']}** · accumulo {snap['volume_accumulo']} m³")
+        st.caption(f"**{len(_scen)}** scenari in memoria. Ogni scenario si rimuove singolarmente "
+                   "con il pulsante \u274c sulla sua riga.")
 
-        nome_scenario = st.text_input("Nome scenario",
-                                      value=f"Scenario {len(st.session_state.scenari_salvati)+1}", key="conf_nome")
-        if st.button("💾 Salva scenario corrente"):
-            st.session_state.scenari_salvati.append({
-                "Nome": nome_scenario,
-                "Utenza": snap["utenza"],
-                "T mand./rit.": snap["T mandata/ritorno"],
-                "Tecnologie": snap["tecnologie"],
-                "Carico residuo (MWh)": snap["carico_residuo_mwh"],
-                "Accumulo (m³)": snap["volume_accumulo"],
-                "Quota FER (%)": snap["quota_fer_pct"],
-                "CAPEX (€)": snap["capex_sistema"],
-                "Costo annuo (€/a)": snap["costo_annuo_sistema"],
-                "LCOH (€/MWh)": snap["lcoh_sistema"],
-                "Ore non coperte": snap["ore_non_coperte"],
-            })
-            st.session_state.setdefault("scenari_full", {})[nome_scenario] = dict(snap)
-            st.success(f"Scenario '{nome_scenario}' salvato.")
+        # --- gestione: rimozione selettiva + svuota tutto ---
+        with st.expander("\U0001F5C2\ufe0f Gestione scenari", expanded=True):
+            for _nome in list(_scen.keys()):
+                _s = _scen[_nome]
+                g1, g2, g3 = st.columns([5, 3, 1])
+                g1.markdown(f"**{_nome}**")
+                _lc = _s.get("lcoh")
+                g2.caption(f"{_s.get('tecnologie', '')} \u00b7 LCOH "
+                           + (f"{_lc:.1f} \u20ac/MWh" if _lc is not None else "n/d")
+                           + f" \u00b7 FER {_s.get('quota_fer_pct', 0):.0f}%")
+                if g3.button("\u274c", key=f"del_scen_{_nome}", help=f"Rimuovi '{_nome}'"):
+                    del st.session_state["_scenari"][_nome]
+                    st.rerun()
+            st.divider()
+            gz1, gz2 = st.columns([1, 4])
+            if gz1.button("\U0001F5D1\ufe0f Svuota tutto", key="del_scen_all"):
+                st.session_state["_scenari"] = {}
+                st.rerun()
+            gz2.caption("Attenzione: *Svuota tutto* cancella l'intera lista senza conferma.")
 
-    if st.session_state.scenari_salvati:
-        df_scenari = pd.DataFrame(st.session_state.scenari_salvati)
-        st.dataframe(df_scenari, use_container_width=True, hide_index=True)
+        _scen = st.session_state.get("_scenari", {})
+        if not _scen:
+            st.stop()
 
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_lcoh_conf = go.Figure(go.Bar(
-                x=df_scenari["Nome"], y=df_scenari["LCOH (€/MWh)"], marker_color=COLOR_CALDAIA,
-                text=df_scenari["LCOH (€/MWh)"].map(lambda v: f"{v:.0f}" if pd.notna(v) else "n/d"),
-                textposition="outside"))
-            fig_lcoh_conf.update_layout(height=340, yaxis_title="LCOH (€/MWh)",
-                                        title="LCOH di sistema per scenario (più basso = più conveniente)")
-            st.plotly_chart(fig_lcoh_conf, use_container_width=True)
-        with c2:
-            fig_fer_conf = go.Figure(go.Bar(
-                x=df_scenari["Nome"], y=df_scenari["Quota FER (%)"], marker_color=COLOR_OFFERTA,
-                text=df_scenari["Quota FER (%)"].map(lambda v: f"{v:.0f}%"), textposition="outside"))
-            fig_fer_conf.update_layout(height=340, yaxis_title="Quota FER (%)", yaxis_range=[0, 105],
-                                       title="Quota rinnovabile per scenario")
-            st.plotly_chart(fig_fer_conf, use_container_width=True)
+        # --- tabella di confronto ---
+        _campi = [
+            ("carico_utenze_mwh", "Calore venduto (MWh/a)"),
+            ("carico_centrale_mwh", "Calore prodotto in centrale (MWh/a)"),
+            ("perdite_rete_pct", "Perdite di rete (%)"),
+            ("contemporaneita", "Contemporaneit\u00e0 QM"),
+            ("picco_naive_kw", "Picco senza contemporaneit\u00e0 (kW)"),
+            ("picco_dim_kw", "Picco di dimensionamento (kW)"),
+            ("densita_lineare", "Densit\u00e0 lineare (MWh/m\u00b7a)"),
+            ("lunghezza_rete_m", "Lunghezza rete (m)"),
+            ("tecnologie", "Assetto impianto"),
+            ("P_alta_kw", "HP alta T (kW)"),
+            ("P_bassa_kw", "HP bassa T (kW)"),
+            ("P_backup_kw", "Caldaia di supporto (kW)"),
+            ("V_hot", "Accumulo caldo (m\u00b3)"),
+            ("V_int", "Accumulo intermedio (m\u00b3)"),
+            ("V_low", "Accumulo basso (m\u00b3)"),
+            ("E_hot_diretto", "Scarto diretto (MWh/a)"),
+            ("E_hp_alta", "Consegnato da HP alta T (MWh/a)"),
+            ("E_backup", "Da combustibile (MWh/a)"),
+            ("E_elettrica", "Elettricit\u00e0 HP (MWh/a)"),
+            ("E_scarto_utilizzato", "Scarto utilizzato (MWh/a)"),
+            ("cop_alta", "COP medio HP alta T"),
+            ("spf_sistema", "SPF di sistema"),
+            ("quota_fer_pct", "Quota FER (%)"),
+            ("ore_non_coperte", "Ore non coperte"),
+            ("capex_sistema", "CAPEX centrale (\u20ac)"),
+            ("capex_rete", "CAPEX rete (\u20ac)"),
+            ("opex_annuo", "OPEX (\u20ac/a)"),
+            ("costo_annuo", "Costo annuo equivalente (\u20ac/a)"),
+            ("lcoh", "LCOH di sistema (\u20ac/MWh)"),
+        ]
+        righe_cf = []
+        for k, lab in _campi:
+            r = {"Indicatore": lab}
+            for nome, s in _scen.items():
+                r[nome] = s.get(k, "\u2014")
+            righe_cf.append(r)
+        df_cf = pd.DataFrame(righe_cf)
+        st.dataframe(df_cf, use_container_width=True, hide_index=True)
 
-        fig_costo = go.Figure()
-        fig_costo.add_trace(go.Bar(x=df_scenari["Nome"], y=df_scenari["CAPEX (€)"],
-                                   name="CAPEX (€)", marker_color=COLOR_ACCUMULO))
-        fig_costo.add_trace(go.Bar(x=df_scenari["Nome"], y=df_scenari["Costo annuo (€/a)"],
-                                   name="Costo annuo (€/a)", marker_color=COLOR_HP))
-        fig_costo.update_layout(height=340, barmode="group", yaxis_title="€",
-                                title="CAPEX totale vs costo annuo, per scenario",
-                                legend=dict(orientation="h", yanchor="bottom", y=1.02))
-        st.plotly_chart(fig_costo, use_container_width=True)
-        st.caption(
-            "Lettura tipica: lo scenario **100% FER** ha CAPEX più alto (HP/biomassa sovradimensionate "
-            "per il picco) ma OPEX più basso; lo scenario **FER + gas** ha CAPEX più basso (il gas copre "
-            "il picco con poca spesa d'impianto) ma OPEX più alto e quota FER inferiore. Il LCOH dice "
-            "quale delle due, nel complesso, produce calore a minor costo."
-        )
+        st.divider()
 
-        if st.button("🗑️ Cancella tutti gli scenari salvati"):
-            st.session_state.scenari_salvati = []
-            st.rerun()
-    else:
-        st.info("Nessuno scenario salvato ancora. Imposta la scheda Dimensionamento e premi 'Salva scenario corrente'.")
+        # --- grafici di confronto ---
+        nomi = list(_scen.keys())
+        _pal_scen = px.colors.qualitative.Set2
 
-st.divider()
-st.caption(
-    "Fonti: Google Sheet 'Utenze TLR Maniago' (De Blasio Associati / APE FVG), TRL_utenze_bioman.xlsx, "
-    "stazione meteo Vivaro (ARPA FVG OSMER), interviste aziende + foto monitoraggio. "
-    "ACS stimata da base load estivo reale dove disponibile, altrimenti da % tipologica (QM Handbook). "
-    "Profili aziende: motore generico per tipo_profilo, parametri da validare con log dati reali. "
-    "Simulazione accumulo: dispatch greedy orario, nessun limite di potenza carica/scarico."
-)
+        gg1, gg2 = st.columns(2)
+        with gg1:
+            st.markdown("**LCOH di sistema**")
+            _v = [(_scen[n].get("lcoh") or 0) for n in nomi]
+            fig_l = go.Figure(go.Bar(x=nomi, y=_v, marker_color=_pal_scen[:len(nomi)],
+                                     text=[f"{x:.1f}" for x in _v], textposition="outside"))
+            fig_l.update_layout(height=340, yaxis_title="\u20ac/MWh", margin=dict(t=20, b=10),
+                                xaxis_tickangle=-20)
+            st.plotly_chart(fig_l, use_container_width=True)
+        with gg2:
+            st.markdown("**Quota FER**")
+            _v = [_scen[n].get("quota_fer_pct", 0) for n in nomi]
+            fig_f = go.Figure(go.Bar(x=nomi, y=_v, marker_color=COLOR_OFFERTA,
+                                     text=[f"{x:.0f}%" for x in _v], textposition="outside"))
+            fig_f.update_layout(height=340, yaxis_title="%", margin=dict(t=20, b=10),
+                                xaxis_tickangle=-20, yaxis_range=[0, 105])
+            st.plotly_chart(fig_f, use_container_width=True)
+
+        st.markdown("**Mix di produzione per scenario**")
+        fig_mixs = go.Figure()
+        _voci_mix = [("E_hot_diretto", "Scarto diretto", COLOR_ALTA_T),
+                     ("E_hp_alta", "HP alta T", COLOR_HP),
+                     ("E_backup", "Combustibile", COLOR_BACKUP)]
+        for k, lab, col in _voci_mix:
+            fig_mixs.add_trace(go.Bar(x=nomi, y=[_scen[n].get(k, 0) for n in nomi],
+                                      name=lab, marker_color=col))
+        fig_mixs.update_layout(barmode="stack", height=380, yaxis_title="MWh/a",
+                               legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                               margin=dict(t=30, b=10), xaxis_tickangle=-20)
+        st.plotly_chart(fig_mixs, use_container_width=True)
+
+        st.markdown("**CAPEX centrale vs CAPEX rete vs OPEX annuo**")
+        fig_cx = go.Figure()
+        fig_cx.add_trace(go.Bar(x=nomi, y=[_scen[n].get("capex_sistema", 0) for n in nomi],
+                                name="CAPEX centrale", marker_color="#5B8DEF"))
+        fig_cx.add_trace(go.Bar(x=nomi, y=[_scen[n].get("capex_rete", 0) for n in nomi],
+                                name="CAPEX rete", marker_color="#8E5FC2"))
+        fig_cx.add_trace(go.Scatter(x=nomi, y=[_scen[n].get("opex_annuo", 0) for n in nomi],
+                                    name="OPEX annuo", mode="markers+lines",
+                                    marker=dict(size=12, color="#F4A259"), yaxis="y2"))
+        fig_cx.update_layout(barmode="stack", height=400, yaxis_title="\u20ac (CAPEX)",
+                             yaxis2=dict(title="\u20ac/a (OPEX)", overlaying="y", side="right"),
+                             legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                             margin=dict(t=30, b=10), xaxis_tickangle=-20)
+        st.plotly_chart(fig_cx, use_container_width=True)
+
+        st.download_button(
+            "\u2B07\ufe0f Scarica il confronto (CSV)",
+            data=df_cf.to_csv(index=False).encode("utf-8"),
+            file_name="maniago_tlr_confronto_scenari.csv", mime="text/csv")
+
 
 # =============================================================================
 # TAB 5 - ANALISI ECONOMICA
 # =============================================================================
-def van(flussi_cassa, tasso):
-    """Valore Attuale Netto di una serie di flussi (anno 0 incluso)."""
-    return float(sum(f / (1 + tasso) ** t for t, f in enumerate(flussi_cassa)))
-
-
-def tir(flussi_cassa, lo=-0.9, hi=1.5):
-    """Tasso Interno di Rendimento per bisezione; None se non esiste nell'intervallo."""
-    f_lo, f_hi = van(flussi_cassa, lo), van(flussi_cassa, hi)
-    if f_lo * f_hi > 0:
-        return None
-    for _ in range(200):
-        mid = (lo + hi) / 2
-        f_mid = van(flussi_cassa, mid)
-        if abs(f_mid) < 1e-6:
-            return mid
-        if f_lo * f_mid < 0:
-            hi, f_hi = mid, f_mid
-        else:
-            lo, f_lo = mid, f_mid
-    return (lo + hi) / 2
-
-
 with tab_economia:
-    st.markdown("### Analisi economica degli scenari")
-    _full = st.session_state.get("scenari_full", {})
-    if not _full:
-        st.info("Nessuno scenario salvato. Vai in **Dimensionamento**, imposta il sistema, poi in "
-                "**Confronto scenari** premi *Salva scenario corrente*. Puoi salvarne quanti vuoi "
-                "(es. gas / biomassa / HP bassa T, con e senza privati) e confrontarli qui.")
+    st.markdown("### \U0001F4B6 Analisi economica del progetto")
+    _snap = st.session_state.get("_dim_snapshot")
+
+    if not _snap:
+        st.info("Configura prima uno scenario nella scheda **Dimensionamento**: "
+                "l'analisi economica ne eredita automaticamente i risultati.")
     else:
-        col_par, col_ris = st.columns([1, 3])
+        st.caption(f"Scenario corrente: **{_snap['tecnologie']}** \u00b7 "
+                   f"calore venduto **{_snap['carico_utenze_mwh']:,} MWh/a** \u00b7 "
+                   f"prodotto in centrale **{_snap['carico_centrale_mwh']:,} MWh/a** "
+                   f"(perdite di rete {_snap['perdite_rete_pct']:.1f} %)".replace(",", "."))
 
-        with col_par:
-            st.markdown("#### ⚙️ Ipotesi economiche")
-            scen_sel = st.multiselect("Scenari da analizzare", list(_full.keys()),
-                                      default=list(_full.keys()), key="ec_scen")
-            anni = st.slider("Orizzonte (anni)", 10, 40, 25, key="ec_anni")
-            tasso = st.slider("Tasso di sconto (%)", 0.0, 12.0, 4.0, step=0.5, key="ec_tasso") / 100
+        ec1, ec2, ec3 = st.columns(3)
+        with ec1:
             st.markdown("**Ricavi**")
-            prezzo_vendita = st.slider("Prezzo di vendita calore (€/MWh)", 40, 200, 95, step=5,
-                                       key="ec_prezzo_v",
-                                       help="Tariffa al cliente finale, al netto di IVA.")
-            allacc_una_tantum = st.slider("Contributo di allacciamento (€/utenza)", 0, 8000, 1500,
-                                          step=100, key="ec_allacc",
-                                          help="Una tantum incassato all'anno 0 per ogni utenza collegata.")
+            prezzo_calore = st.slider("Prezzo di vendita del calore (\u20ac/MWh)", 40, 180, 95, step=5,
+                                      key="eco_prezzo",
+                                      help="Si applica al calore VENDUTO alle utenze, non a quello "
+                                           "prodotto in centrale: le perdite di rete sono a carico "
+                                           "del gestore.")
+            quota_fissa = st.slider("Quota fissa per utenza (\u20ac/a)", 0, 800, 250, step=25,
+                                    key="eco_quotafissa")
+            n_utenze_eco = st.number_input("Numero di utenze contrattualizzate", min_value=0,
+                                           value=int(st.session_state.get("_rete_info", {}).get("n_utenze", 0)),
+                                           step=1, key="eco_nutenze")
+            allacci_eur = st.slider("Contributo di allacciamento una tantum (\u20ac/utenza)",
+                                    0, 8000, 1500, step=250, key="eco_allacci")
+        with ec2:
             st.markdown("**Costi**")
-            om_pct = st.slider("O&M annuo (% del CAPEX)", 0.0, 5.0, 2.0, step=0.25, key="ec_om") / 100
-            contributo = st.slider("Contributo a fondo perduto (% CAPEX)", 0, 80, 40, step=5,
-                                   key="ec_contributo",
-                                   help="Quota di CAPEX coperta da finanziamenti pubblici (PNRR, bandi regionali).")
-            incl_rete = st.checkbox("Includi CAPEX rete", value=True, key="ec_incl_rete")
-            st.markdown("**Confronto con gas metano**")
-            prezzo_gas_ut = st.slider("Prezzo gas utente (€/MWh)", 40, 180, 95, step=5, key="ec_gas_p",
-                                      help="Costo del metano per l'utente finale, comprensivo di oneri.")
-            rend_cald = st.slider("Rendimento caldaie esistenti (%)", 70, 100, 88, key="ec_gas_r") / 100
-            escalation = st.slider("Escalation prezzi energia (%/anno)", 0.0, 5.0, 2.0, step=0.5,
-                                   key="ec_esc") / 100
+            st.caption(f"OPEX energia dallo scenario: **{_snap['opex_annuo']:,} \u20ac/a**".replace(",", "."))
+            om_pct = st.slider("O&M in % del CAPEX totale (\u20ac/a)", 0.5, 5.0, 2.0, step=0.25,
+                               key="eco_om")
+            pompaggio_kwh_mwh = st.slider("Elettricit\u00e0 di pompaggio (kWh el / MWh distribuito)",
+                                          0, 40, 12, step=1, key="eco_pomp",
+                                          help="QM: 8-20 kWh/MWh per reti ben progettate.")
+            personale = st.slider("Personale e gestione (\u20ac/a)", 0, 200000, 45000, step=5000,
+                                  key="eco_personale")
+            assicuraz = st.slider("Assicurazioni, amministrazione, varie (\u20ac/a)",
+                                  0, 100000, 15000, step=2500, key="eco_assic")
+        with ec3:
+            st.markdown("**Finanziario**")
+            orizzonte = st.slider("Orizzonte di analisi (anni)", 10, 40, 25, key="eco_anni")
+            wacc = st.slider("Tasso di attualizzazione WACC (%)", 1.0, 12.0, 4.0, step=0.5,
+                             key="eco_wacc") / 100.0
+            contributo_pct = st.slider("Contributo a fondo perduto (% del CAPEX)", 0, 80, 40, step=5,
+                                       key="eco_contributo")
+            esc_ricavi = st.slider("Escalation ricavi (%/a)", 0.0, 6.0, 2.0, step=0.25,
+                                   key="eco_esc_ric") / 100.0
+            esc_costi = st.slider("Escalation costi energia (%/a)", 0.0, 8.0, 3.0, step=0.25,
+                                  key="eco_esc_cos") / 100.0
+            esc_om = st.slider("Escalation O&M (%/a)", 0.0, 6.0, 2.0, step=0.25,
+                               key="eco_esc_om") / 100.0
 
-        with col_ris:
-            if not scen_sel:
-                st.warning("Seleziona almeno uno scenario.")
-            else:
-                risultati = []
-                for nome in scen_sel:
-                    s = _full[nome]
-                    rete = s.get("rete") or {}
-                    capex_prod = float(s.get("capex_sistema") or 0)
-                    capex_rete = float(rete.get("capex_rete") or 0) if incl_rete else 0.0
-                    capex_tot = capex_prod + capex_rete
-                    capex_netto = capex_tot * (1 - contributo / 100)
-                    dom_mwh = float(s.get("carico_residuo_mwh") or 0)
-                    n_ut = int(rete.get("n_utenze") or 0)
-                    opex_en = float(s.get("opex_elettrico") or 0) + float(s.get("opex_combustibile") or 0)
-                    opex_om = capex_tot * om_pct
-                    ricavo_calore = dom_mwh * prezzo_vendita
-                    costo_gas_oggi = dom_mwh / rend_cald * prezzo_gas_ut
-                    # flussi di cassa (ottica del gestore)
-                    cf = [-capex_netto + n_ut * allacc_una_tantum]
-                    for t in range(1, anni + 1):
-                        k = (1 + escalation) ** t
-                        cf.append(ricavo_calore * k - (opex_en * k + opex_om))
-                    v = van(cf, tasso)
-                    r = tir(cf)
-                    margine = ricavo_calore - opex_en - opex_om
-                    payback = None
-                    cum = cf[0]
-                    for t in range(1, anni + 1):
-                        cum += cf[t]
-                        if cum >= 0:
-                            payback = t
-                            break
-                    lcoh_tot = ((capex_netto * crf(tasso, anni)) + opex_en + opex_om) / dom_mwh if dom_mwh > 0 else np.nan
-                    risultati.append({
-                        "Scenario": nome, "Tecnologie": s.get("tecnologie", ""),
-                        "Domanda (MWh/a)": round(dom_mwh), "Utenze": n_ut,
-                        "CAPEX prod. (€)": round(capex_prod), "CAPEX rete (€)": round(capex_rete),
-                        "CAPEX totale (€)": round(capex_tot), "CAPEX netto (€)": round(capex_netto),
-                        "OPEX energia (€/a)": round(opex_en), "O&M (€/a)": round(opex_om),
-                        "Ricavi (€/a)": round(ricavo_calore), "Margine (€/a)": round(margine),
-                        "VAN (€)": round(v), "TIR (%)": (round(r * 100, 1) if r is not None else None),
-                        "Payback (anni)": payback,
-                        "LCOH completo (€/MWh)": round(float(lcoh_tot), 1) if dom_mwh > 0 else None,
-                        "Costo gas oggi (€/a)": round(costo_gas_oggi),
-                        "Risparmio vs gas (€/a)": round(costo_gas_oggi - (opex_en + opex_om)),
-                        "Quota FER (%)": s.get("quota_fer_pct"),
-                        "Densità (MWh/m·a)": round(float(rete.get("densita") or 0), 2),
-                        "Rete (km)": round(float(rete.get("lunghezza_m") or 0) / 1000, 1),
-                    })
-                df_ec = pd.DataFrame(risultati)
+        # ---------------------------------------------------------------------
+        capex_centrale = float(_snap["capex_sistema"])
+        capex_rete = float(_snap["capex_rete"])
+        capex_tot = capex_centrale + capex_rete
+        contributo = capex_tot * contributo_pct / 100.0
+        capex_netto = capex_tot - contributo
 
-                st.markdown("#### 📋 Risultati per scenario")
-                for r in risultati:
-                    with st.expander(f"**{r['Scenario']}** · VAN {r['VAN (€)']/1e6:.2f} M€ · "
-                                     f"TIR {r['TIR (%)'] if r['TIR (%)'] is not None else 'n/d'}% · "
-                                     f"LCOH {r['LCOH completo (€/MWh)']} €/MWh",
-                                     expanded=(len(risultati) <= 2)):
-                        st.caption(f"{r['Tecnologie']} · {r['Domanda (MWh/a)']:,} MWh/a · "
-                                   f"{r['Utenze']} utenze · rete {r['Rete (km)']} km".replace(",", "."))
-                        e1, e2, e3, e4 = st.columns(4)
-                        e1.metric("VAN", f"{r['VAN (€)']/1e6:.2f} M€",
-                                  help=f"a {anni} anni, tasso {tasso*100:.1f}%")
-                        e2.metric("TIR", f"{r['TIR (%)']}%" if r["TIR (%)"] is not None else "n/d")
-                        e3.metric("Payback", f"{r['Payback (anni)']} anni" if r["Payback (anni)"] else "oltre orizzonte")
-                        e4.metric("LCOH completo", f"{r['LCOH completo (€/MWh)']} €/MWh",
-                                  help="produzione + rete + O&M, CAPEX annualizzato")
-                        f1, f2 = st.columns(2)
-                        with f1:
-                            _lab = ["HP alta T", "HP bassa T", "Caldaia", "Accumuli", "Solare", "Rete"]
-                            _s = _full[r["Scenario"]]
-                            _val = [_s.get("capex_hp_alta", 0), _s.get("capex_hp_bassa", 0),
-                                    _s.get("capex_caldaia", 0), _s.get("capex_accumuli", 0),
-                                    _s.get("capex_solare", 0), r["CAPEX rete (€)"]]
-                            _c = [COLOR_HP, COLOR_HP_BASSA, COLOR_BACKUP, COLOR_ACCUMULO, COLOR_SOLARE, COLOR_ALTA_T]
-                            _k = [(l, v, c) for l, v, c in zip(_lab, _val, _c) if v and v > 0]
-                            fig_cx = go.Figure(go.Pie(labels=[k[0] for k in _k], values=[k[1] for k in _k],
-                                                      hole=0.5, marker=dict(colors=[k[2] for k in _k]), sort=False))
-                            fig_cx.update_layout(title=f"CAPEX · {r['CAPEX totale (€)']/1e6:.2f} M€",
-                                                 height=300, margin=dict(t=45, b=10),
-                                                 legend=dict(orientation="h", y=-0.1))
-                            st.plotly_chart(fig_cx, use_container_width=True, key=f"ec_cx_{r['Scenario']}")
-                        with f2:
-                            _s = _full[r["Scenario"]]
-                            _lo = [("Elettricità HP", _s.get("opex_elettrico", 0), COLOR_HP),
-                                   ("Combustibile", _s.get("opex_combustibile", 0), COLOR_BACKUP),
-                                   ("O&M", r["O&M (€/a)"], COLOR_ACCUMULO)]
-                            _lo = [x for x in _lo if x[1] and x[1] > 0]
-                            fig_ox = go.Figure(go.Pie(labels=[x[0] for x in _lo], values=[x[1] for x in _lo],
-                                                      hole=0.5, marker=dict(colors=[x[2] for x in _lo]), sort=False))
-                            fig_ox.update_layout(title=f"OPEX · {(r['OPEX energia (€/a)']+r['O&M (€/a)'])/1e3:.0f} k€/a",
-                                                 height=300, margin=dict(t=45, b=10),
-                                                 legend=dict(orientation="h", y=-0.1))
-                            st.plotly_chart(fig_ox, use_container_width=True, key=f"ec_ox_{r['Scenario']}")
-                        g1, g2, g3 = st.columns(3)
-                        g1.metric("Costo con gas oggi", f"{r['Costo gas oggi (€/a)']/1e3:.0f} k€/a",
-                                  help=f"{r['Domanda (MWh/a)']} MWh / rendimento {rend_cald*100:.0f}% × {prezzo_gas_ut} €/MWh")
-                        g2.metric("Costo esercizio TLR", f"{(r['OPEX energia (€/a)']+r['O&M (€/a)'])/1e3:.0f} k€/a")
-                        g3.metric("Risparmio vs gas", f"{r['Risparmio vs gas (€/a)']/1e3:.0f} k€/a",
-                                  delta=f"{r['Risparmio vs gas (€/a)']/max(r['Costo gas oggi (€/a)'],1)*100:.0f}%")
-                        # mappa del tracciato dello scenario
-                        _rete = _full[r["Scenario"]].get("rete") or {}
-                        if _rete.get("traccia_lat"):
-                            fig_m = go.Figure()
-                            fig_m.add_trace(go.Scattermapbox(lat=_rete["traccia_lat"], lon=_rete["traccia_lon"],
-                                                             mode="lines", line=dict(width=2, color=COLOR_ALTA_T),
-                                                             name="Tracciato", hoverinfo="skip"))
-                            fig_m.add_trace(go.Scattermapbox(lat=_rete["pt_lat"], lon=_rete["pt_lon"],
-                                                             mode="markers", marker=dict(size=5, color=COLOR_HP),
-                                                             name="Utenze", hoverinfo="skip"))
-                            fig_m.add_trace(go.Scattermapbox(lat=[CENTRALE_LAT], lon=[CENTRALE_LON],
-                                                             mode="markers", marker=dict(size=16, color="#FF9F1C"),
-                                                             name="Centrale", hoverinfo="skip"))
-                            fig_m.update_layout(mapbox=dict(style="open-street-map",
-                                                            center=dict(lat=(np.mean(_rete["pt_lat"]) + CENTRALE_LAT) / 2,
-                                                                        lon=(np.mean(_rete["pt_lon"]) + CENTRALE_LON) / 2),
-                                                            zoom=12),
-                                                height=380, margin=dict(t=5, b=0, l=0, r=0),
-                                                legend=dict(orientation="h", yanchor="bottom", y=1.01))
-                            st.plotly_chart(fig_m, use_container_width=True, key=f"ec_map_{r['Scenario']}")
+        E_venduto = float(_snap["carico_utenze_mwh"])
+        E_prodotto = float(_snap["carico_centrale_mwh"])
 
-                st.divider()
-                st.markdown("#### ⚖️ Confronto tra scenari")
-                _metriche = {"VAN (€)": "VAN (€)", "TIR (%)": "TIR (%)",
-                             "LCOH completo (€/MWh)": "LCOH completo (€/MWh)",
-                             "CAPEX totale (€)": "CAPEX totale (€)",
-                             "OPEX energia (€/a)": "OPEX energia (€/a)",
-                             "Quota FER (%)": "Quota FER (%)",
-                             "Densità (MWh/m·a)": "Densità (MWh/m·a)",
-                             "Risparmio vs gas (€/a)": "Risparmio vs gas (€/a)"}
-                scelte = st.multiselect("Parametri da confrontare", list(_metriche.keys()),
-                                        default=["VAN (€)", "TIR (%)", "LCOH completo (€/MWh)", "Quota FER (%)"],
-                                        key="ec_metriche")
-                if scelte:
-                    _n = len(scelte)
-                    for i in range(0, _n, 2):
-                        cc = st.columns(min(2, _n - i))
-                        for j, m in enumerate(scelte[i:i + 2]):
-                            _d = df_ec[["Scenario", m]].dropna()
-                            if _d.empty:
-                                continue
-                            fig_b = go.Figure(go.Bar(x=_d["Scenario"], y=_d[m],
-                                                     marker_color=[COLOR_HP, COLOR_BACKUP, COLOR_OFFERTA,
-                                                                   COLOR_HP_BASSA, COLOR_SOLARE][:len(_d)],
-                                                     text=_d[m].round(1), textposition="outside"))
-                            fig_b.update_layout(title=m, height=300, margin=dict(t=45, b=10),
-                                                yaxis=dict(zeroline=True, zerolinecolor="#888"))
-                            cc[j].plotly_chart(fig_b, use_container_width=True, key=f"ec_bar_{m}")
-                st.markdown("##### Tabella completa")
-                st.dataframe(df_ec, use_container_width=True, hide_index=True)
-                st.download_button("⬇️ Scarica confronto (CSV)", df_ec.to_csv(index=False).encode("utf-8"),
-                                   "maniago_analisi_economica.csv", "text/csv")
-                st.caption("**VAN** = valore attuale netto dei flussi di cassa del gestore (ricavi da vendita "
-                           "calore + allacciamenti − CAPEX netto − OPEX − O&M). **TIR** = tasso che azzera il VAN. "
-                           "**LCOH completo** include produzione, rete e O&M con CAPEX annualizzato. "
-                           "Il confronto col gas è sui soli costi di esercizio, a parità di calore fornito.")
+        ricavo_calore_0 = E_venduto * prezzo_calore
+        ricavo_fisso_0 = n_utenze_eco * quota_fissa
+        ricavi_0 = ricavo_calore_0 + ricavo_fisso_0
+        incasso_allacci = n_utenze_eco * allacci_eur
+
+        opex_energia_0 = float(_snap["opex_annuo"])
+        costo_pompaggio_0 = E_prodotto * pompaggio_kwh_mwh / 1000.0 * float(_snap["prezzo_el"])
+        om_0 = capex_tot * om_pct / 100.0
+        costi_fissi_0 = personale + assicuraz
+
+        # --- flussi di cassa ---
+        flussi_cassa = [-(capex_netto) + incasso_allacci]
+        dettaglio = []
+        for t in range(1, orizzonte + 1):
+            ric = ricavi_0 * (1 + esc_ricavi) ** (t - 1)
+            c_en = (opex_energia_0 + costo_pompaggio_0) * (1 + esc_costi) ** (t - 1)
+            c_om = (om_0 + costi_fissi_0) * (1 + esc_om) ** (t - 1)
+            netto = ric - c_en - c_om
+            flussi_cassa.append(netto)
+            dettaglio.append({"Anno": t, "Ricavi (\u20ac)": round(ric),
+                              "Costi energia (\u20ac)": round(c_en),
+                              "O&M e gestione (\u20ac)": round(c_om),
+                              "Flusso netto (\u20ac)": round(netto)})
+
+        _van = van(flussi_cassa, wacc)
+        _tir = tir(flussi_cassa)
+        _pb = payback_semplice(flussi_cassa)
+        margine_0 = ricavi_0 - opex_energia_0 - costo_pompaggio_0 - om_0 - costi_fissi_0
+
+        # LCOH completo: include rete, O&M, pompaggio; riferito al calore VENDUTO
+        _crf_eco = crf(wacc, orizzonte)
+        costo_annuo_completo = (capex_netto * _crf_eco + opex_energia_0 + costo_pompaggio_0
+                                + om_0 + costi_fissi_0)
+        lcoh_completo = costo_annuo_completo / E_venduto if E_venduto > 0 else np.nan
+
+        st.divider()
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("VAN", f"{_van / 1e6:.2f} M\u20ac",
+                  delta="positivo" if _van > 0 else "negativo",
+                  delta_color="normal" if _van > 0 else "inverse")
+        m2.metric("TIR", f"{_tir * 100:.1f}%" if _tir is not None else "n/d",
+                  help="Non definito se i flussi non cambiano mai segno.")
+        m3.metric("Payback semplice", f"{_pb:.1f} anni" if _pb is not None else "> orizzonte",
+                  help="Non attualizzato.")
+        m4.metric("Margine anno 1", f"{margine_0 / 1000:.0f} k\u20ac/a")
+
+        n1, n2, n3, n4 = st.columns(4)
+        n1.metric("CAPEX totale", f"{capex_tot / 1e6:.2f} M\u20ac",
+                  help=f"centrale {capex_centrale / 1e6:.2f} M\u20ac + rete {capex_rete / 1e6:.2f} M\u20ac")
+        n2.metric("Contributo pubblico", f"{contributo / 1e6:.2f} M\u20ac",
+                  help=f"{contributo_pct}% del CAPEX")
+        n3.metric("Investimento netto", f"{capex_netto / 1e6:.2f} M\u20ac")
+        n4.metric("LCOH completo", f"{lcoh_completo:.1f} \u20ac/MWh",
+                  help="Include rete, O&M, pompaggio, personale. Riferito al calore VENDUTO. "
+                       "Il 'LCOH di sistema' della scheda Dimensionamento e piu ristretto "
+                       "(sola centrale, riferito al calore prodotto): non sono confrontabili "
+                       "direttamente.")
+
+        if lcoh_completo > prezzo_calore:
+            st.warning(f"\u26a0\ufe0f Il costo pieno del calore ({lcoh_completo:.1f} \u20ac/MWh) supera "
+                       f"il prezzo di vendita ({prezzo_calore} \u20ac/MWh): il progetto non si "
+                       f"sostiene senza ulteriore contributo o senza aumentare la densit\u00e0 di "
+                       f"utenza.")
+        else:
+            st.success(f"\u2705 Il prezzo di vendita ({prezzo_calore} \u20ac/MWh) copre il costo pieno "
+                       f"({lcoh_completo:.1f} \u20ac/MWh): margine unitario "
+                       f"{prezzo_calore - lcoh_completo:.1f} \u20ac/MWh.")
+
+        st.divider()
+        st.markdown("#### Flussi di cassa cumulati")
+        cum = np.cumsum(flussi_cassa)
+        anni_x = list(range(0, orizzonte + 1))
+        fig_cf = go.Figure()
+        fig_cf.add_trace(go.Bar(x=anni_x, y=flussi_cassa, name="Flusso annuo",
+                                marker_color=["#B0413E" if f < 0 else "#3FA34D" for f in flussi_cassa]))
+        fig_cf.add_trace(go.Scatter(x=anni_x, y=cum, name="Cumulato", mode="lines+markers",
+                                    line=dict(color="#22C3DD", width=3)))
+        fig_cf.add_hline(y=0, line_dash="dot", line_color="#888")
+        fig_cf.update_layout(height=420, xaxis_title="Anno", yaxis_title="\u20ac",
+                             legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                             margin=dict(t=30, b=10))
+        st.plotly_chart(fig_cf, use_container_width=True)
+
+        st.markdown("#### Struttura dei costi annui (anno 1)")
+        _voci_c = [("Energia (elettricit\u00e0 HP + combustibile)", opex_energia_0, COLOR_HP),
+                   ("Pompaggio di rete", costo_pompaggio_0, "#4C6EF5"),
+                   ("O&M impianti e rete", om_0, COLOR_ACCUMULO),
+                   ("Personale e gestione", personale, "#F4A259"),
+                   ("Assicurazioni e varie", assicuraz, "#9AA0A6"),
+                   ("CAPEX annualizzato", capex_netto * _crf_eco, "#5B8DEF")]
+        _voci_c = [(n, v, c) for n, v, c in _voci_c if v > 0]
+        fig_str = go.Figure(go.Pie(labels=[n for n, _, _ in _voci_c],
+                                   values=[v for _, v, _ in _voci_c], hole=0.5,
+                                   marker=dict(colors=[c for _, _, c in _voci_c]), sort=False))
+        fig_str.update_layout(title=f"Costo annuo completo \u00b7 "
+                                    f"{costo_annuo_completo:,.0f} \u20ac/a".replace(",", "."),
+                              height=400, margin=dict(t=50, b=10),
+                              legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(fig_str, use_container_width=True)
+
+        # --- sensitivita ---
+        st.markdown("#### Sensitivit\u00e0 del VAN")
+        st.caption("Variazione del VAN al variare del prezzo di vendita del calore e della quota "
+                   "di contributo pubblico, a parita di tutto il resto.")
+        _prezzi = np.arange(max(prezzo_calore - 40, 30), prezzo_calore + 45, 10)
+        _contrib = np.arange(0, 85, 10)
+        Z = np.zeros((len(_contrib), len(_prezzi)))
+        for i, cp in enumerate(_contrib):
+            _cn = capex_tot * (1 - cp / 100.0)
+            for j, pz in enumerate(_prezzi):
+                _r0 = E_venduto * pz + ricavo_fisso_0
+                _fc = [-_cn + incasso_allacci]
+                for t in range(1, orizzonte + 1):
+                    _fc.append(_r0 * (1 + esc_ricavi) ** (t - 1)
+                               - (opex_energia_0 + costo_pompaggio_0) * (1 + esc_costi) ** (t - 1)
+                               - (om_0 + costi_fissi_0) * (1 + esc_om) ** (t - 1))
+                Z[i, j] = van(_fc, wacc) / 1e6
+        fig_sens = go.Figure(go.Heatmap(
+            z=Z, x=[f"{p:.0f}" for p in _prezzi], y=[f"{c:.0f}%" for c in _contrib],
+            colorscale="RdYlGn", zmid=0, colorbar=dict(title="VAN (M\u20ac)"),
+            hovertemplate="prezzo %{x} \u20ac/MWh<br>contributo %{y}<br>VAN %{z:.2f} M\u20ac<extra></extra>"))
+        fig_sens.update_layout(height=400, xaxis_title="Prezzo di vendita (\u20ac/MWh)",
+                               yaxis_title="Contributo a fondo perduto", margin=dict(t=30, b=10))
+        st.plotly_chart(fig_sens, use_container_width=True)
+
+        with st.expander("\U0001F4C4 Dettaglio dei flussi di cassa anno per anno"):
+            df_det = pd.DataFrame(dettaglio)
+            df_det["Cumulato (\u20ac)"] = df_det["Flusso netto (\u20ac)"].cumsum() + flussi_cassa[0]
+            st.dataframe(df_det, use_container_width=True, hide_index=True)
+            st.download_button("\u2B07\ufe0f Scarica i flussi (CSV)",
+                               data=df_det.to_csv(index=False).encode("utf-8"),
+                               file_name="maniago_tlr_flussi_cassa.csv", mime="text/csv")
+
+        st.caption(
+            "**Nota metodologica.** I ricavi si applicano al calore *venduto* alle utenze, mentre "
+            "i costi di produzione si riferiscono al calore *prodotto in centrale*: la differenza "
+            "sono le perdite di rete (QM cap. 12.2.8), che restano a carico del gestore. "
+            "Il payback e semplice, non attualizzato. L'O&M e stimato in percentuale del CAPEX "
+            "totale (centrale + rete) e segue una propria escalation, distinta da quella dei "
+            "prezzi dell'energia."
+        )
+
+# =============================================================================
+# FOOTER
+# =============================================================================
+st.divider()
+st.markdown(FOOTER_HTML)
+st.caption(
+    "Strumento di supporto allo studio di fattibilit\u00e0. I risultati dipendono dalla qualit\u00e0 "
+    "dei dati di ingresso e dalle ipotesi selezionate: non sostituiscono un progetto esecutivo. "
+    "Metodologia di riferimento: QM Holzheizwerke Planning Handbook (3rd ed.), "
+    "Verenum Planungshandbuch Fernw\u00e4rme, IEA DHC Annex TS5. "
+    "Dati di emissione dei forni: Ecol Studio SpA, rapporti di prova 25LF24167-170 del 14/07/2025."
+)
