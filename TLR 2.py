@@ -237,6 +237,72 @@ def stima_lunghezza_rete(lat, lon, fattore_tortuosita=1.35):
     return tot * fattore_tortuosita
 
 
+def _latlon_a_xy(lat, lon):
+    """Proiezione locale metrica (equirettangolare centrata sulla media)."""
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    R = 6371000.0
+    la0 = np.radians(lat.mean()) if len(lat) else 0.0
+    x = R * np.radians(lon) * np.cos(la0)
+    y = R * np.radians(lat)
+    return x, y
+
+
+def dist_punto_segmento_m(px, py, ax, ay, bx, by):
+    """Distanza (m) di ogni punto (px,py) dal segmento AB.
+    px,py sono array; ax,ay,bx,by sono scalari. Ritorna array + parametro t in [0,1].
+    """
+    px = np.asarray(px, dtype=float); py = np.asarray(py, dtype=float)
+    dx = bx - ax; dy = by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-9:
+        return np.hypot(px - ax, py - ay), np.zeros_like(px)
+    t = np.clip(((px - ax) * dx + (py - ay) * dy) / L2, 0.0, 1.0)
+    cx = ax + t * dx; cy = ay + t * dy
+    return np.hypot(px - cx, py - cy), t
+
+
+def buffer_tracciato(archi_pubblici, priv_lat, priv_lon, raggio_m=50.0):
+    """Per ogni privato calcola la distanza minima dal tracciato pubblico.
+
+    archi_pubblici: lista di ((lat1,lon1),(lat2,lon2),dist_m)
+    Ritorna: dist_min (m), idx_arco_piu_vicino, (lat_pt,lon_pt) del punto sul tubo.
+    """
+    if not len(archi_pubblici) or not len(priv_lat):
+        return np.array([]), np.array([]), np.array([]), np.array([])
+    # proiezione comune: uso tutti i vertici degli archi + i privati
+    all_lat = np.concatenate([[a[0][0] for a in archi_pubblici],
+                              [a[1][0] for a in archi_pubblici],
+                              np.asarray(priv_lat, dtype=float)])
+    all_lon = np.concatenate([[a[0][1] for a in archi_pubblici],
+                              [a[1][1] for a in archi_pubblici],
+                              np.asarray(priv_lon, dtype=float)])
+    xs, ys = _latlon_a_xy(all_lat, all_lon)
+    N = len(archi_pubblici); M = len(priv_lat)
+    ax = xs[:N]; ay = ys[:N]
+    bx = xs[N:2 * N]; by = ys[N:2 * N]
+    px = xs[2 * N:]; py = ys[2 * N:]
+    dist_min = np.full(M, np.inf)
+    idx_arco = np.zeros(M, dtype=int)
+    t_best = np.zeros(M)
+    for k in range(N):
+        d, t = dist_punto_segmento_m(px, py, ax[k], ay[k], bx[k], by[k])
+        migl = d < dist_min
+        dist_min[migl] = d[migl]
+        idx_arco[migl] = k
+        t_best[migl] = t[migl]
+    # coordinate del punto sul tubo piu vicino (per lo stub)
+    lat_pt = np.array([archi_pubblici[idx_arco[i]][0][0]
+                       + t_best[i] * (archi_pubblici[idx_arco[i]][1][0]
+                                      - archi_pubblici[idx_arco[i]][0][0])
+                       for i in range(M)])
+    lon_pt = np.array([archi_pubblici[idx_arco[i]][0][1]
+                       + t_best[i] * (archi_pubblici[idx_arco[i]][1][1]
+                                      - archi_pubblici[idx_arco[i]][0][1])
+                       for i in range(M)])
+    return dist_min, idx_arco, lat_pt, lon_pt
+
+
 def build_cluster_color_map(clusters_list):
     return {cl: ZONA_COLORI.get(cl, "#888888") for cl in clusters_list}
 
@@ -990,6 +1056,17 @@ with tab_domanda:
             _n_priv_reale += int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
         if sel_cond_zone and not condomini.empty:
             _n_priv_reale += int(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum())
+        # Se un buffer sul tracciato ha ristretto i privati agganciabili, correggo
+        # anche il conteggio utenze per la contemporaneita QM.
+        _buff_records_qm = st.session_state.get("_dom_priv_in_buffer", None)
+        if _buff_records_qm is not None and sel_priv_zone and not privati.empty:
+            _n_priv_zone_tot = int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
+            if _n_priv_zone_tot > 0:
+                # scalo la parte "privati" (non i condomini) alla quota buffer
+                _n_cond_uni = 0
+                if sel_cond_zone and not condomini.empty:
+                    _n_cond_uni = int(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum())
+                _n_priv_reale = int(round(len(_buff_records_qm))) + _n_cond_uni
         st.session_state["_dom_n_privati"] = _n_priv_reale
         if _n_priv_reale > 1:
             _f_sim_ui = coeff_simultaneita_QM(_n_priv_reale)
@@ -1017,17 +1094,33 @@ with tab_domanda:
                         | buildings["edificio"].isin(selected_privati)))
     selected_buildings = buildings.loc[mask_building, "edificio"].tolist()
 
+    # Se il buffer sul tracciato ha ristretto i privati agganciabili, correggo
+    # il fattore di allacciamento in modo che rappresenti la quota realmente
+    # servita rispetto al totale della zona. Aggregando su zona/anello questo
+    # e l'unico modo di rispettare il vincolo geometrico senza cambiare i dati.
+    _buff_records = st.session_state.get("_dom_priv_in_buffer", None)
+    _priv_zone_totali = 0
+    _priv_zone_buffer = 0
+    if sel_priv_zone and not privati.empty:
+        _priv_zone_totali = int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
+    if _buff_records is not None:
+        _priv_zone_buffer = int(len(_buff_records))
+    quota_buffer = (_priv_zone_buffer / _priv_zone_totali
+                    if _priv_zone_totali > 0 and _buff_records is not None else 1.0)
+    fattore_effettivo = (fattore_correzione / 100.0) * quota_buffer
+
     st.session_state["_dom_edifici"] = selected_buildings
     st.session_state["_dom_zone"] = selected_clusters
-    st.session_state["_dom_fattore_privato"] = fattore_correzione / 100.0
+    st.session_state["_dom_fattore_privato"] = fattore_effettivo
     st.session_state["_dom_ha_privati"] = len(selected_privati) > 0
+    st.session_state["_dom_quota_buffer"] = quota_buffer
 
     dom = domanda[domanda["edificio"].isin(selected_buildings)].copy()
     dom["month"] = dom["datetime"].dt.month
     dom = dom[(dom["month"] >= month_range[0]) & (dom["month"] <= month_range[1])]
 
     is_privato = dom["tipo_utenza"] == "Privato (potenziale)"
-    fattore = fattore_correzione / 100.0
+    fattore = fattore_effettivo
     dom.loc[is_privato, "MWh_riscaldamento"] = dom.loc[is_privato, "MWh_riscaldamento"] * fattore
     dom.loc[is_privato, "MWh_ACS"] = dom.loc[is_privato, "MWh_ACS"] * fattore
     is_cond = dom["tipo_utenza"] == "Condominio"
@@ -1233,9 +1326,11 @@ with tab_domanda:
         # P1 - Densita termica lineare (doppio fattore di allacciamento rimosso)
         # ---------------------------------------------------------------------
         if not privati.empty:
-            st.markdown("##### \U0001F4CF Densit\u00e0 termica lineare (quanto rende il tubo)")
-            st.caption("Per ogni zona e livello di estensione: lunghezza indicativa della rete "
-                       "e **densit\u00e0 lineare** = MWh/anno per metro di rete. "
+            st.markdown("##### \U0001F4CF Densit\u00e0 termica lineare per zona/livello (stima teorica)")
+            st.caption("**Stima esplorativa** per capire dove la rete rende: per ogni zona e "
+                       "livello di estensione, quanto sarebbe la densit\u00e0 lineare se si servissero "
+                       "*tutti* i privati fino a quell'anello. Il valore realistico invece dipende "
+                       "dal buffer sul tracciato pubblico (vedi *Ipotesi di tracciato* pi\u00f9 sotto). "
                        "QM: sotto ~1,2 MWh/(m\u00b7a) la rete fatica a ripagarsi, sopra ~2,0 e buona.")
             cD1, cD2 = st.columns(2)
             costo_m_rete = cD1.slider("Costo rete (\u20ac/m di trincea)", 200, 1500, 600, step=50,
@@ -1301,64 +1396,224 @@ with tab_domanda:
 
         st.divider()
         st.markdown("##### \U0001F6E4\ufe0f Ipotesi di tracciato della rete")
-        st.caption(f"Rete ad albero minimo che parte dalla **sottocentrale** "
-                   f"({CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}) e raggiunge le utenze selezionate.")
-        _tr = []
+        st.caption(f"Rete progettata in **2 tempi**: prima il tratto *obbligato* che collega la "
+                   f"**sottocentrale** ({CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}) agli **edifici pubblici** "
+                   f"e ai **condomini censiti** selezionati; poi i **privati** vengono agganciati "
+                   f"solo se cadono entro un raggio dal tubo pubblico.")
+
+        # --- 1. Tratto obbligato: pubblici + condomini censiti (opzione B) ---
+        _pts_obb = []
         if not bmap.empty:
-            _tr.append(bmap[["lat", "lon", "consumo_annuo_MWh"]])
-        if sel_priv_zone and not privati.empty:
-            _tr.append(privati[privati["cluster"].isin(sel_priv_zone)][["lat", "lon", "consumo_annuo_MWh"]])
-        _tr = pd.concat(_tr, ignore_index=True).dropna(subset=["lat", "lon"]) if _tr else pd.DataFrame()
-        if _tr.empty:
-            st.info("Seleziona almeno un'utenza georeferenziata per vedere il tracciato.")
+            _pts_obb.append(bmap[["lat", "lon", "consumo_annuo_MWh"]].assign(tipo="pubblico"))
+        if sel_cond_zone and not condomini.empty:
+            _cond_z = condomini[condomini["cluster"].isin(sel_cond_zone)].copy()
+            _cond_z["MWh_stimato"] = _cond_z["unita"] * mwh_unita * tasso_cond / 100.0
+            _cond_z = _cond_z.dropna(subset=["lat", "lon"])[["lat", "lon", "MWh_stimato"]]
+            if not _cond_z.empty:
+                _cond_z = _cond_z.rename(columns={"MWh_stimato": "consumo_annuo_MWh"})
+                _pts_obb.append(_cond_z.assign(tipo="condominio"))
+        _obb = (pd.concat(_pts_obb, ignore_index=True).dropna(subset=["lat", "lon"])
+                if _pts_obb else pd.DataFrame())
+
+        if _obb.empty:
+            st.info("Seleziona almeno un edificio pubblico o un condominio "
+                    "georeferenziato per vedere il tracciato.")
         else:
-            tc1, tc2 = st.columns(2)
+            tc1, tc2, tc3 = st.columns(3)
             tort = tc1.slider("Fattore di tortuosit\u00e0", 1.0, 2.0, 1.35, step=0.05, key="dom_tort")
             costo_m_tr = tc2.slider("Costo rete (\u20ac/m)", 200, 1500, 600, step=50, key="dom_costo_tr")
-            _archi, _len = mst_archi(_tr["lat"].values, _tr["lon"].values,
-                                     radice=(CENTRALE_LAT, CENTRALE_LON))
-            _len_t = _len * tort
+            buffer_m = tc3.slider("Buffer privati dal tubo pubblico (m)", 20, 150, 50, step=5,
+                                  key="dom_buffer",
+                                  help="Un privato viene allacciato solo se si trova entro questa "
+                                       "distanza dal tubo del tratto pubblico. Piu il buffer e "
+                                       "piccolo, piu selettivo diventa (meno stub, densit\u00e0 lineare "
+                                       "piu alta).")
+
+            _archi_pub, _len_pub = mst_archi(_obb["lat"].values, _obb["lon"].values,
+                                             radice=(CENTRALE_LAT, CENTRALE_LON))
+            _len_pub_t = _len_pub * tort
+
+            # --- 2. Buffer privati sul tracciato pubblico ---
+            _priv_in = pd.DataFrame()
+            _len_stub_t = 0.0
+            _stub_lat_l, _stub_lon_l = [], []
+            _pt_tubo_lat, _pt_tubo_lon = np.array([]), np.array([])
+            _fatt_priv = fattore_correzione / 100.0
+            if sel_priv_zone and not privati.empty and _archi_pub:
+                _pv = privati[privati["cluster"].isin(sel_priv_zone)].dropna(subset=["lat", "lon"]).copy()
+                if not _pv.empty:
+                    _dmin, _idx_arco, _lat_tubo, _lon_tubo = buffer_tracciato(
+                        _archi_pub, _pv["lat"].values, _pv["lon"].values, raggio_m=buffer_m)
+                    _pv["dist_tubo_m"] = _dmin
+                    _in_buffer = _dmin <= buffer_m
+                    _priv_in = _pv[_in_buffer].copy()
+                    if not _priv_in.empty:
+                        _pt_tubo_lat = _lat_tubo[_in_buffer]
+                        _pt_tubo_lon = _lon_tubo[_in_buffer]
+                        # stub: linea dal punto del tubo al privato (moltiplicato per tortuosita)
+                        _lat_stub_flat, _lon_stub_flat = [], []
+                        _len_stub_m = 0.0
+                        for i, (_, _r) in enumerate(_priv_in.iterrows()):
+                            _lat_stub_flat += [float(_pt_tubo_lat[i]), float(_r["lat"]), None]
+                            _lon_stub_flat += [float(_pt_tubo_lon[i]), float(_r["lon"]), None]
+                            _len_stub_m += float(_r["dist_tubo_m"])
+                        _stub_lat_l = _lat_stub_flat
+                        _stub_lon_l = _lon_stub_flat
+                        _len_stub_t = _len_stub_m * tort
+
+            _len_totale = _len_pub_t + _len_stub_t
+
+            # --- linee tracciato pubblico ---
             _lat_l, _lon_l = [], []
-            for (a, b, _d) in _archi:
+            for (a, b, _d) in _archi_pub:
                 _lat_l += [a[0], b[0], None]
                 _lon_l += [a[1], b[1], None]
+
             fig_tr = go.Figure()
+            # tracciato pubblico (rosso, spesso)
             fig_tr.add_trace(go.Scattermapbox(lat=_lat_l, lon=_lon_l, mode="lines",
-                                              line=dict(width=2, color="#FF4B4B"),
-                                              name="Tracciato ipotizzato", hoverinfo="skip"))
-            fig_tr.add_trace(go.Scattermapbox(
-                lat=_tr["lat"], lon=_tr["lon"], mode="markers", name="Utenze",
-                marker=dict(size=5, color="#22C3DD", opacity=0.7),
-                text=_tr["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a", hoverinfo="text"))
+                                              line=dict(width=3, color="#FF4B4B"),
+                                              name=f"Tratto obbligato: {_len_pub_t / 1000:.1f} km",
+                                              hoverinfo="skip"))
+            # stub privati (giallo, sottile)
+            if _stub_lat_l:
+                fig_tr.add_trace(go.Scattermapbox(lat=_stub_lat_l, lon=_stub_lon_l, mode="lines",
+                                                  line=dict(width=1.5, color="#F5C518"),
+                                                  name=f"Allacci privati: {_len_stub_t / 1000:.1f} km",
+                                                  hoverinfo="skip"))
+            # pubblici (blu)
+            if not bmap.empty:
+                fig_tr.add_trace(go.Scattermapbox(
+                    lat=bmap["lat"], lon=bmap["lon"], mode="markers", name="Pubblici",
+                    marker=dict(size=10, color="#22C3DD"),
+                    text=(bmap["edificio"] + "<br>"
+                          + bmap["consumo_annuo_MWh"].round(0).astype(int).astype(str) + " MWh/a"),
+                    hoverinfo="text"))
+            # condomini (viola)
+            if sel_cond_zone and not condomini.empty:
+                _c_geo = condomini[condomini["cluster"].isin(sel_cond_zone)].dropna(subset=["lat", "lon"])
+                if not _c_geo.empty:
+                    _c_geo = _c_geo.copy()
+                    _c_geo["MWh_stimato"] = (_c_geo["unita"] * mwh_unita * tasso_cond / 100.0).round(1)
+                    fig_tr.add_trace(go.Scattermapbox(
+                        lat=_c_geo["lat"], lon=_c_geo["lon"], mode="markers", name="Condomini",
+                        marker=dict(size=9, color="#9B5DE5"),
+                        text=(_c_geo["denominazione"].fillna("Condominio").astype(str) + "<br>"
+                              + _c_geo["unita"].astype(str) + " unita\u0300 \u00b7 "
+                              + _c_geo["MWh_stimato"].astype(str) + " MWh/a"),
+                        hoverinfo="text"))
+            # privati DENTRO il buffer (verde)
+            if not _priv_in.empty:
+                fig_tr.add_trace(go.Scattermapbox(
+                    lat=_priv_in["lat"], lon=_priv_in["lon"], mode="markers",
+                    name=f"Privati agganciabili ({len(_priv_in)})",
+                    marker=dict(size=5, color="#3FA34D", opacity=0.85),
+                    text=(_priv_in.get("nome", pd.Series([""] * len(_priv_in))).fillna("").astype(str)
+                          + "<br>dist. tubo: " + _priv_in["dist_tubo_m"].round(0).astype(int).astype(str)
+                          + " m \u00b7 " + _priv_in["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a"),
+                    hoverinfo="text"))
+            # privati FUORI dal buffer (grigi trasparenti, per contesto)
+            if sel_priv_zone and not privati.empty:
+                _pv_all = privati[privati["cluster"].isin(sel_priv_zone)].dropna(subset=["lat", "lon"])
+                if not _priv_in.empty:
+                    _pv_out = _pv_all[~_pv_all.index.isin(_priv_in.index)]
+                else:
+                    _pv_out = _pv_all
+                if not _pv_out.empty:
+                    fig_tr.add_trace(go.Scattermapbox(
+                        lat=_pv_out["lat"], lon=_pv_out["lon"], mode="markers",
+                        name=f"Privati fuori buffer ({len(_pv_out)})",
+                        marker=dict(size=3, color="#666666", opacity=0.35),
+                        hoverinfo="skip"))
+            # aziende
             for _n, (_la, _lo) in AZIENDE_COORD.items():
                 fig_tr.add_trace(go.Scattermapbox(lat=[_la], lon=[_lo], mode="markers",
-                                                  name=_n, marker=dict(size=9, color="#F5C518"),
+                                                  name=_n, marker=dict(size=9, color="#E9C46A"),
                                                   text=_n, hoverinfo="text", showlegend=False))
+            # sottocentrale
             fig_tr.add_trace(go.Scattermapbox(
                 lat=[CENTRALE_LAT], lon=[CENTRALE_LON], mode="markers+text", name="Sottocentrale",
                 marker=dict(size=18, color="#FF9F1C"), text=["CENTRALE"], textposition="top right",
                 textfont=dict(size=13, color="#FF9F1C")))
-            _clat = (float(_tr["lat"].mean()) + CENTRALE_LAT) / 2
-            _clon = (float(_tr["lon"].mean()) + CENTRALE_LON) / 2
+            _clat = (float(_obb["lat"].mean()) + CENTRALE_LAT) / 2
+            _clon = (float(_obb["lon"].mean()) + CENTRALE_LON) / 2
             fig_tr.update_layout(mapbox=dict(style="open-street-map",
-                                             center=dict(lat=_clat, lon=_clon), zoom=12.2),
-                                 height=560, margin=dict(t=10, b=0, l=0, r=0),
+                                             center=dict(lat=_clat, lon=_clon), zoom=13.5),
+                                 height=580, margin=dict(t=10, b=0, l=0, r=0),
                                  legend=dict(orientation="h", yanchor="bottom", y=1.01))
             st.plotly_chart(fig_tr, use_container_width=True)
-            _dom_tr = float(_tr["consumo_annuo_MWh"].sum())
+
+            # --- energia servita ---
+            _E_pub = float(bmap["consumo_annuo_MWh"].sum()) if not bmap.empty else 0.0
+            _E_cond = 0.0
+            if sel_cond_zone and not condomini.empty:
+                _cond_sel = condomini[condomini["cluster"].isin(sel_cond_zone)]
+                _E_cond = float(_cond_sel["unita"].sum()) * mwh_unita * tasso_cond / 100.0
+            _E_priv = float(_priv_in["consumo_annuo_MWh"].sum()) * _fatt_priv if not _priv_in.empty else 0.0
+            _E_tot = _E_pub + _E_cond + _E_priv
+            _n_utenze_tot = (len(bmap) + (len(condomini[condomini['cluster'].isin(sel_cond_zone)])
+                                          if sel_cond_zone and not condomini.empty else 0)
+                             + len(_priv_in))
+
             t1, t2, t3, t4 = st.columns(4)
-            t1.metric("Lunghezza rete", f"{_len_t / 1000:.1f} km",
-                      help=f"{_len_t:,.0f} m con tortuosit\u00e0 {tort}".replace(",", "."))
-            t2.metric("Utenze collegate", f"{len(_tr):,}".replace(",", "."))
-            t3.metric("CAPEX rete", f"{_len_t * costo_m_tr / 1e6:.1f} M\u20ac")
-            t4.metric("Densit\u00e0 lineare", f"{_dom_tr / _len_t:.2f} MWh/(m\u00b7a)",
-                      help="sotto ~1,2 la rete fatica a ripagarsi; sopra ~2 e buona (QM)")
+            t1.metric("Lunghezza totale rete", f"{_len_totale / 1000:.2f} km",
+                      help=f"Obbligato {_len_pub_t / 1000:.2f} km + stub {_len_stub_t / 1000:.2f} km "
+                           f"(tortuosit\u00e0 {tort})")
+            t2.metric("Utenze totali",
+                      f"{_n_utenze_tot}",
+                      help=f"pubblici + condomini + {len(_priv_in) if not _priv_in.empty else 0} privati nel buffer")
+            t3.metric("CAPEX rete", f"{_len_totale * costo_m_tr / 1e6:.2f} M\u20ac")
+            _dens = _E_tot / _len_totale if _len_totale > 0 else 0.0
+            t4.metric("Densit\u00e0 lineare", f"{_dens:.2f} MWh/(m\u00b7a)",
+                      help="sotto ~1,2 la rete fatica a ripagarsi; sopra ~2,0 e buona (QM)")
+
+            # --- breakdown ---
+            b1, b2, b3 = st.columns(3)
+            b1.metric("da pubblici", f"{_E_pub:,.0f} MWh/a".replace(",", "."),
+                      help=f"{len(bmap)} edifici")
+            b2.metric("da condomini", f"{_E_cond:,.0f} MWh/a".replace(",", "."),
+                      help=f"adesione {tasso_cond}%")
+            _n_priv_dentro = len(_priv_in) if not _priv_in.empty else 0
+            _n_priv_totale = 0
+            if sel_priv_zone and not privati.empty:
+                _n_priv_totale = int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
+            _quota_bff = _n_priv_dentro / max(_n_priv_totale, 1) * 100
+            b3.metric("da privati nel buffer",
+                      f"{_E_priv:,.0f} MWh/a".replace(",", "."),
+                      help=f"{_n_priv_dentro}/{_n_priv_totale} privati "
+                           f"({_quota_bff:.0f}% delle zone attive) \u00b7 "
+                           f"buffer {buffer_m} m \u00b7 allacciamento {fattore_correzione}%")
+
+            if _dens < 1.2 and _len_totale > 100:
+                st.warning(f"\u26a0\ufe0f Densit\u00e0 lineare {_dens:.2f} MWh/(m\u00b7a) sotto la soglia critica QM (1,2). "
+                           f"Prova: buffer piu grande per pescare piu privati, oppure zone piu compatte.")
+            elif _dens >= 2.0:
+                st.success(f"\u2705 Densit\u00e0 lineare {_dens:.2f} MWh/(m\u00b7a): rete favorevole (QM \u2265 2,0).")
+
             st.session_state["_rete_info"] = {
-                "lunghezza_m": float(_len_t), "capex_rete": float(_len_t * costo_m_tr),
-                "densita": float(_dom_tr / _len_t), "n_utenze": int(len(_tr)),
-                "costo_m": int(costo_m_tr), "traccia_lat": _lat_l, "traccia_lon": _lon_l,
-                "pt_lat": _tr["lat"].tolist(), "pt_lon": _tr["lon"].tolist(),
+                "lunghezza_m": float(_len_totale),
+                "lunghezza_pubblico_m": float(_len_pub_t),
+                "lunghezza_stub_m": float(_len_stub_t),
+                "capex_rete": float(_len_totale * costo_m_tr),
+                "densita": float(_dens),
+                "n_utenze": int(_n_utenze_tot),
+                "n_privati_agganciati": int(_n_priv_dentro),
+                "buffer_m": int(buffer_m),
+                "costo_m": int(costo_m_tr),
+                "traccia_lat": _lat_l, "traccia_lon": _lon_l,
+                "stub_lat": _stub_lat_l, "stub_lon": _stub_lon_l,
+                "E_pubblico": float(_E_pub),
+                "E_condomini": float(_E_cond),
+                "E_privati": float(_E_priv),
+                "E_totale": float(_E_tot),
             }
+
+            # espongo l'elenco dei privati effettivamente agganciati, per Dimensionamento
+            if not _priv_in.empty:
+                st.session_state["_dom_priv_in_buffer"] = _priv_in[["cluster", "lat", "lon",
+                                                                   "consumo_annuo_MWh"]].to_dict("records")
+            else:
+                st.session_state["_dom_priv_in_buffer"] = []
 
 
 # =============================================================================
@@ -1772,6 +2027,17 @@ with tab_dimensionamento:
             f"isolante {_classe_iso}. Domanda alle utenze **{dom_tot_utenze:,.0f} MWh/a** "
             f"\u2192 alla centrale **{dom_tot:,.0f} MWh/a** (\u00d7{_fatt_lordo:.3f}).".replace(",", ".")
         )
+        _quota_buf = st.session_state.get("_dom_quota_buffer", 1.0)
+        _rete_info_dim = st.session_state.get("_rete_info", {}) or {}
+        _buffer_m_dim = int(_rete_info_dim.get("buffer_m", 0))
+        _n_priv_agg = int(_rete_info_dim.get("n_privati_agganciati", 0))
+        if _quota_buf < 0.999 and _buffer_m_dim > 0:
+            st.info(
+                f"\U0001F6E4\ufe0f **Buffer di tracciato**: {_buffer_m_dim} m. "
+                f"Dei privati delle zone attive, **{_quota_buf * 100:.0f} %** ({_n_priv_agg}) "
+                f"cade nel buffer del tubo pubblico e viene servito; il resto e escluso. "
+                f"Domanda dei privati e picco corretti di conseguenza."
+            )
         if _n_priv > 1:
             st.info(
                 f"\U0001F465 **Contemporaneit\u00e0 QM (Fig. 12.2)**: {_n_priv} utenze "
@@ -2078,6 +2344,10 @@ with tab_dimensionamento:
         "capex_sistema": round(capex_sistema),
         "capex_rete": round(float(_rete_info.get("capex_rete", 0.0))),
         "lunghezza_rete_m": round(float(_rete_info.get("lunghezza_m", 0.0))),
+        "lunghezza_pubblico_m": round(float(_rete_info.get("lunghezza_pubblico_m", 0.0))),
+        "lunghezza_stub_m": round(float(_rete_info.get("lunghezza_stub_m", 0.0))),
+        "buffer_m": int(_rete_info.get("buffer_m", 0)),
+        "n_privati_agganciati": int(_rete_info.get("n_privati_agganciati", 0)),
         "densita_lineare": round(_dens_lin, 2),
         "opex_annuo": round(opex),
         "costo_annuo": round(costo_annuo),
@@ -2147,7 +2417,11 @@ with tab_confronto:
             ("picco_naive_kw", "Picco senza contemporaneit\u00e0 (kW)"),
             ("picco_dim_kw", "Picco di dimensionamento (kW)"),
             ("densita_lineare", "Densit\u00e0 lineare (MWh/m\u00b7a)"),
-            ("lunghezza_rete_m", "Lunghezza rete (m)"),
+            ("lunghezza_rete_m", "Lunghezza rete totale (m)"),
+            ("lunghezza_pubblico_m", "di cui tratto obbligato (m)"),
+            ("lunghezza_stub_m", "di cui allacci privati (m)"),
+            ("buffer_m", "Buffer privati (m)"),
+            ("n_privati_agganciati", "Privati agganciati"),
             ("tecnologie", "Assetto impianto"),
             ("P_alta_kw", "HP alta T (kW)"),
             ("P_bassa_kw", "HP bassa T (kW)"),
