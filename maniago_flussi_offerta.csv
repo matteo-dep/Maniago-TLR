@@ -2,7 +2,7 @@ azienda,flusso,destinazione,fluido,T_alta_C,T_out_C,P_kW,profilo,cicli_min,cicli
 Pandolfo,Torri raffreddamento fusione,tiepido,acqua,50.0,27.5,5931,ciclico_colate,8.0,9.0,7,30,,
 Pandolfo,Fumi crogiolo,tiepido,fumi,80.0,40.0,1650,continuo,,,7,30,,
 Pandolfo,Fumi forni rigeneranti,alta_T,fumi,260.0,150.0,100,cf_random,,,7,30,0.35,
-ZML,Ritorno forni fusori (torri),tiepido,acqua,77.0,40.0,7325,ciclico_colate,9.0,10.0,5,45,,168
+ZML,Ritorno forni fusori (torri),tiepido,acqua,65.0,40.0,7325,ciclico_colate,9.0,10.0,5,45,,168
 ZML,Camino aspirazione fumi,tiepido,fumi,40.0,25.0,562,continuo,,,5,45,,
 Inossman,Compressori Kaeser,tiepido,acqua,77.0,71.0,660,continuo,,,7,0,,
 Inossman,Calcinazione sabbia (IMF),alta_T,fumi,800.0,150.0,24375,cf_random,,,7,15,0.3,
@@ -10,4 +10,7 @@ Inossman,Forni trattamento grandi (6),alta_T,fumi,800.0,150.0,1450,notturno_18_0
 Inossman,Forno piccolo continuo,alta_T,fumi,1100.0,150.0,400,ore_giorno_20,,,6,20,,
 Inossman,Forno piccolo saltuario,alta_T,fumi,1100.0,150.0,370,continuo,,,6,20,,
 Pietro Rosa,Nuova torre evaporativa,tiepido,acqua,34.5,29.5,850,continuo,,,7,0,,
-Pietro Rosa,Forno forgiatura,alta_T,fumi,1150.0,150.0,915,ore_giorno_16,,,5,30,,
+Pietro Rosa,E4 MAGLIO 3000,alta_T,fumi,144,60,264,continuo,,,5,30,,
+Pietro Rosa,E5 forni riscaldo,bassa_T,fumi,84,45,15,continuo,,,7,22,,
+Pietro Rosa,E6 forni riscaldo,bassa_T,fumi,50,40,6,continuo,,,7,22,,
+Pietro Rosa,E1 MAGLIO MAS10000,bassa_T,fumi,48,40,5,continuo,,,7,22,,

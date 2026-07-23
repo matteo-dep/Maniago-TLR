@@ -44,6 +44,11 @@
    maniago_privati_edifici.csv       (opzionale)
    edifici_pubblici_coordinate.csv   (opzionale)
    TLR_zones_borders.geojson
+try:
+    import scipy
+    _SCIPY_DEBUG = f"scipy OK top-level: {scipy.__file__}"
+except Exception as _e:
+    _SCIPY_DEBUG = f"scipy TOP-LEVEL FAIL: {type(_e).__name__}: {_e}"
 =============================================================================
 """
 import streamlit as st
@@ -53,6 +58,12 @@ import os
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+
+try:
+    from scipy.spatial import cKDTree
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
 
 st.set_page_config(page_title="Maniago TLR | HEAT35 - APE FVG", layout="wide", page_icon="\U0001F525")
 
@@ -391,13 +402,8 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
             strade.append(el.get("nodes", []))
     if not nodi:
         return None, "risposta OSM senza nodi (bbox vuoto o filtro errato)"
-    # KDTree sui nodi per snap
-    try:
-        from scipy.spatial import cKDTree
-    except ImportError as _e_scipy:
-        return None, f"import scipy fallito: {type(_e_scipy).__name__}: {_e_scipy}"
-    except Exception as _e_scipy:
-        return None, f"errore inatteso importando scipy: {type(_e_scipy).__name__}: {_e_scipy}"
+    if not _HAS_SCIPY:
+        return None, "scipy non disponibile in streamlit runtime"
     node_ids = list(nodi.keys())
     coords_xy = np.array([_latlon_a_xy(np.array([nodi[i][0]]),
                                        np.array([nodi[i][1]]))[0][0] for i in node_ids])
