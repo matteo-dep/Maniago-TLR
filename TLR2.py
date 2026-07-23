@@ -394,8 +394,10 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
     # KDTree sui nodi per snap
     try:
         from scipy.spatial import cKDTree
-    except ImportError:
-        return None, "modulo 'scipy' non installato (pip install scipy)"
+    except ImportError as _e_scipy:
+        return None, f"import scipy fallito: {type(_e_scipy).__name__}: {_e_scipy}"
+    except Exception as _e_scipy:
+        return None, f"errore inatteso importando scipy: {type(_e_scipy).__name__}: {_e_scipy}"
     node_ids = list(nodi.keys())
     coords_xy = np.array([_latlon_a_xy(np.array([nodi[i][0]]),
                                        np.array([nodi[i][1]]))[0][0] for i in node_ids])
