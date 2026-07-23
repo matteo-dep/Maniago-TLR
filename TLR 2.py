@@ -24,6 +24,15 @@
  P8  Forni di forgiatura Pietro Rosa da misure Ecol Studio 14/07/2025
      (rapporti 25LF24167/168/169/170 - punti E1, E4, E5, E6)
  P9  Scenari salvati rimovibili singolarmente
+ P10 Tracciato rete in 2 tempi: pubblici+condomini come obbligato + privati
+     agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
+     Zone senza pubblici possono essere agganciate opportunisticamente se il
+     tubo di altre zone ci passa vicino.
+ P11 Routing su strade reali OSM (Overpass API) con Dijkstra (networkx):
+     ogni edificio "snappa" al nodo stradale piu vicino, il tratto obbligato
+     e un albero di Steiner approssimato lungo le strade, gli stub dei privati
+     sono anch'essi calcolati su strada. Cache locale in maniago_strade_cache.json.
+     Dipendenze: networkx, scipy, requests (fallback silenzioso a MST se assenti).
 
  File dati richiesti nella stessa cartella:
    maniago_domanda_edifici.csv
@@ -40,6 +49,7 @@
 import streamlit as st
 import pandas as pd
 import json
+import os
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
@@ -301,6 +311,185 @@ def buffer_tracciato(archi_pubblici, priv_lat, priv_lon, raggio_m=50.0):
                                       - archi_pubblici[idx_arco[i]][0][1])
                        for i in range(M)])
     return dist_min, idx_arco, lat_pt, lon_pt
+
+
+# =============================================================================
+# ROUTING SU RETE STRADALE OSM
+# =============================================================================
+def _osm_download_strade(centro_lat, centro_lon, raggio_km=1.5, timeout=90):
+    """Scarica il grafo stradale attorno al centro tramite Overpass API.
+    Ritorna il dict JSON grezzo di Overpass o None in caso di errore.
+    """
+    import requests
+    d = raggio_km / 111.0
+    bbox = (centro_lat - d, centro_lon - d, centro_lat + d, centro_lon + d)
+    q = f"""
+[out:json][timeout:{timeout}];
+(
+  way["highway"~"^(primary|secondary|tertiary|unclassified|residential|service|living_street|pedestrian)$"]
+    ({bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]});
+);
+out body;
+>;
+out skel qt;
+"""
+    try:
+        r = requests.get("https://overpass-api.de/api/interpreter",
+                         params={"data": q}, timeout=timeout + 30)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner="Scarico la rete stradale di Maniago (una volta sola)...")
+def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
+                        raggio_km=1.5, cache_file="maniago_strade_cache.json"):
+    """Carica il grafo stradale OSM. Usa cache locale su file se presente.
+
+    Ritorna (nodi_dict, archi_list, kdtree, node_ids_ordinati) oppure None
+    se non c'e ne cache locale ne connessione. Il grafo networkx si costruisce
+    a partire da questi elementi in build_grafo_stradale().
+    """
+    import os, json
+    data = None
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+    if data is None:
+        data = _osm_download_strade(centro_lat, centro_lon, raggio_km)
+        if data is None:
+            return None
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass  # non fatale
+    # parse: nodi + strade
+    nodi = {}
+    strade = []
+    for el in data.get("elements", []):
+        if el["type"] == "node":
+            nodi[el["id"]] = (el["lat"], el["lon"])
+        elif el["type"] == "way":
+            strade.append(el.get("nodes", []))
+    # KDTree sui nodi per snap
+    from scipy.spatial import cKDTree
+    node_ids = list(nodi.keys())
+    if not node_ids:
+        return None
+    coords_xy = np.array([_latlon_a_xy(np.array([nodi[i][0]]),
+                                       np.array([nodi[i][1]]))[0][0] for i in node_ids])
+    ys = np.array([_latlon_a_xy(np.array([nodi[i][0]]),
+                                np.array([nodi[i][1]]))[1][0] for i in node_ids])
+    pts = np.column_stack([coords_xy, ys])
+    kd = cKDTree(pts)
+    return {"nodi": nodi, "strade": strade, "kd": kd,
+            "node_ids": node_ids, "pts_xy": pts}
+
+
+def build_grafo_stradale(strade_data):
+    """Costruisce il grafo networkx dai dati OSM per Dijkstra."""
+    import networkx as nx
+    G = nx.Graph()
+    nodi = strade_data["nodi"]
+    for way in strade_data["strade"]:
+        for a, b in zip(way[:-1], way[1:]):
+            if a not in nodi or b not in nodi:
+                continue
+            lat1, lon1 = nodi[a]
+            lat2, lon2 = nodi[b]
+            x, y = _latlon_a_xy(np.array([lat1, lat2]), np.array([lon1, lon2]))
+            d = float(np.hypot(x[1] - x[0], y[1] - y[0]))
+            if G.has_edge(a, b):
+                if d < G[a][b]["weight"]:
+                    G[a][b]["weight"] = d
+            else:
+                G.add_edge(a, b, weight=d)
+    return G
+
+
+def snap_a_strade(lat_arr, lon_arr, strade_data):
+    """Per ogni punto, id del nodo stradale piu vicino + distanza (m)."""
+    lat_arr = np.asarray(lat_arr, dtype=float)
+    lon_arr = np.asarray(lon_arr, dtype=float)
+    kd = strade_data["kd"]
+    node_ids = strade_data["node_ids"]
+    x_pt, y_pt = _latlon_a_xy(lat_arr, lon_arr)
+    d, idx = kd.query(np.column_stack([x_pt, y_pt]), k=1)
+    return [node_ids[i] for i in idx], d
+
+
+def albero_steiner_su_strade(G, nodi_target, radice_nodo):
+    """Approssima l'albero di Steiner: parte dalla radice, aggiunge iterativamente
+    ogni nodo target agganciandosi al percorso minimo verso il tratto gia esistente.
+    Ritorna: lista di archi ((lat1,lon1),(lat2,lon2),d), lunghezza totale, set di nodi usati.
+    """
+    import networkx as nx
+    targets = [t for t in nodi_target if t != radice_nodo and t in G]
+    if radice_nodo not in G:
+        return [], 0.0, set()
+    usati = {radice_nodo}
+    archi_res = []
+    # dijkstra da radice
+    dist_from_root, _ = nx.single_source_dijkstra(G, radice_nodo, weight="weight")
+    # ordino i target per distanza dalla radice, dal piu vicino
+    targets = sorted(targets, key=lambda t: dist_from_root.get(t, np.inf))
+    for t in targets:
+        if t in usati:
+            continue
+        # trovo il nodo gia usato piu vicino a t (dijkstra multi-source)
+        try:
+            # dijkstra da t verso set 'usati'
+            dist_to_used, path = nx.multi_source_dijkstra(G, sources=usati, target=t, weight="weight")
+        except nx.NetworkXNoPath:
+            continue
+        # path e la lista di nodi
+        for a, b in zip(path[:-1], path[1:]):
+            if b in usati and a in usati:
+                continue
+            # aggiungo l'arco
+            w = G[a][b]["weight"]
+            archi_res.append((a, b, w))
+            usati.add(a)
+            usati.add(b)
+    lun_tot = float(sum(w for _, _, w in archi_res))
+    return archi_res, lun_tot, usati
+
+
+def archi_a_coords(archi_nodi, strade_data):
+    """Converte lista di archi (id_a, id_b, dist) in ((lat1,lon1),(lat2,lon2),dist)."""
+    nodi = strade_data["nodi"]
+    out = []
+    for a, b, d in archi_nodi:
+        if a in nodi and b in nodi:
+            out.append(((nodi[a][0], nodi[a][1]), (nodi[b][0], nodi[b][1]), d))
+    return out
+
+
+def dijkstra_stub_al_tubo(G, nodi_tubo, nodo_partenza):
+    """Percorso minimo da nodo_partenza al set di nodi_tubo (l'arrivo e il tubo piu vicino).
+    Ritorna: lista di archi, lunghezza totale, nodo di aggancio sul tubo.
+    """
+    import networkx as nx
+    if nodo_partenza in nodi_tubo:
+        return [], 0.0, nodo_partenza
+    if nodo_partenza not in G:
+        return [], 0.0, None
+    try:
+        lun, path = nx.multi_source_dijkstra(G, sources=nodi_tubo,
+                                             target=nodo_partenza, weight="weight")
+    except nx.NetworkXNoPath:
+        return [], 0.0, None
+    # il path va da qualche nodo in nodi_tubo a nodo_partenza
+    archi = []
+    for a, b in zip(path[:-1], path[1:]):
+        archi.append((a, b, G[a][b]["weight"]))
+    nodo_aggancio = path[0]
+    return archi, float(lun), nodo_aggancio
 
 
 def build_cluster_color_map(clusters_list):
@@ -1399,7 +1588,9 @@ with tab_domanda:
         st.caption(f"Rete progettata in **2 tempi**: prima il tratto *obbligato* che collega la "
                    f"**sottocentrale** ({CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}) agli **edifici pubblici** "
                    f"e ai **condomini censiti** selezionati; poi i **privati** vengono agganciati "
-                   f"solo se cadono entro un raggio dal tubo pubblico.")
+                   f"solo se cadono entro un raggio dal tubo pubblico. "
+                   f"**Zone senza pubblici** (es. Zona 3) possono essere agganciate in modo "
+                   f"opportunistico se il tubo di altre zone ci passa vicino.")
 
         # --- 1. Tratto obbligato: pubblici + condomini censiti (opzione B) ---
         _pts_obb = []
@@ -1429,15 +1620,66 @@ with tab_domanda:
                                        "piccolo, piu selettivo diventa (meno stub, densit\u00e0 lineare "
                                        "piu alta).")
 
-            _archi_pub, _len_pub = mst_archi(_obb["lat"].values, _obb["lon"].values,
-                                             radice=(CENTRALE_LAT, CENTRALE_LON))
-            _len_pub_t = _len_pub * tort
+            # Scelta metodo: OSM (Dijkstra su strade) con fallback MST + tortuosita
+            usa_strade = st.checkbox(
+                "\U0001F6E3\ufe0f Tracciato sulle strade reali (OSM)", value=True, key="dom_usa_osm",
+                help="Al primo avvio scarica la rete stradale di Maniago da OpenStreetMap "
+                     "(qualche decina di secondi). Poi la cache resta locale in "
+                     "`maniago_strade_cache.json`. Se disattivato o se il download fallisce, "
+                     "si usa l'MST in linea d'aria con tortuosita.")
 
-            # --- 2. Buffer privati sul tracciato pubblico ---
+            _strade = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=1.8) if usa_strade else None
+            _uso_osm = _strade is not None
+            if usa_strade and not _uso_osm:
+                st.warning("\u26a0\ufe0f Rete stradale OSM non disponibile "
+                           "(nessuna cache locale e nessuna connessione). "
+                           "Uso il metodo MST + tortuosita.")
+
+            if _uso_osm:
+                # --- ROUTING SU STRADE: Steiner approssimato via Dijkstra ---
+                _G = build_grafo_stradale(_strade)
+                # snap centrale + edifici del tratto obbligato
+                _lat_obb = np.concatenate([[CENTRALE_LAT], _obb["lat"].values])
+                _lon_obb = np.concatenate([[CENTRALE_LON], _obb["lon"].values])
+                _nodi_obb, _dsnap_obb = snap_a_strade(_lat_obb, _lon_obb, _strade)
+                _rad_nodo = _nodi_obb[0]
+                _target_nodi = _nodi_obb[1:]
+                _archi_G, _len_pub_osm, _nodi_tubo = albero_steiner_su_strade(
+                    _G, _target_nodi, _rad_nodo)
+                _archi_pub = archi_a_coords(_archi_G, _strade)
+                # linee "ultimo metro" dagli edifici al nodo stradale
+                _ultimi_metri = []
+                _len_ultimi = 0.0
+                for i in range(len(_obb)):
+                    _lat_ed = float(_obb["lat"].iloc[i])
+                    _lon_ed = float(_obb["lon"].iloc[i])
+                    _n = _nodi_obb[i + 1]
+                    _lat_n, _lon_n = _strade["nodi"][_n]
+                    _ultimi_metri += [_lat_ed, _lat_n, None]
+                    _ultimi_metri += [_lon_ed, _lon_n, None]  # placeholder
+                    _len_ultimi += float(_dsnap_obb[i + 1])
+                # ricostruisco correttamente lat/lon separati
+                _um_lat, _um_lon = [], []
+                for i in range(len(_obb)):
+                    _lat_ed = float(_obb["lat"].iloc[i])
+                    _lon_ed = float(_obb["lon"].iloc[i])
+                    _n = _nodi_obb[i + 1]
+                    _lat_n, _lon_n = _strade["nodi"][_n]
+                    _um_lat += [_lat_ed, _lat_n, None]
+                    _um_lon += [_lon_ed, _lon_n, None]
+                _len_pub_t = _len_pub_osm + _len_ultimi
+            else:
+                # --- FALLBACK: MST + tortuosita ---
+                _archi_pub, _len_pub = mst_archi(_obb["lat"].values, _obb["lon"].values,
+                                                 radice=(CENTRALE_LAT, CENTRALE_LON))
+                _len_pub_t = _len_pub * tort
+                _um_lat, _um_lon = [], []
+                _nodi_tubo = set()
+
+            # --- 2. Buffer privati: aggancio via strade se disponibili ---
             _priv_in = pd.DataFrame()
             _len_stub_t = 0.0
             _stub_lat_l, _stub_lon_l = [], []
-            _pt_tubo_lat, _pt_tubo_lon = np.array([]), np.array([])
             _fatt_priv = fattore_correzione / 100.0
             if sel_priv_zone and not privati.empty and _archi_pub:
                 _pv = privati[privati["cluster"].isin(sel_priv_zone)].dropna(subset=["lat", "lon"]).copy()
@@ -1448,18 +1690,45 @@ with tab_domanda:
                     _in_buffer = _dmin <= buffer_m
                     _priv_in = _pv[_in_buffer].copy()
                     if not _priv_in.empty:
-                        _pt_tubo_lat = _lat_tubo[_in_buffer]
-                        _pt_tubo_lon = _lon_tubo[_in_buffer]
-                        # stub: linea dal punto del tubo al privato (moltiplicato per tortuosita)
-                        _lat_stub_flat, _lon_stub_flat = [], []
-                        _len_stub_m = 0.0
-                        for i, (_, _r) in enumerate(_priv_in.iterrows()):
-                            _lat_stub_flat += [float(_pt_tubo_lat[i]), float(_r["lat"]), None]
-                            _lon_stub_flat += [float(_pt_tubo_lon[i]), float(_r["lon"]), None]
-                            _len_stub_m += float(_r["dist_tubo_m"])
-                        _stub_lat_l = _lat_stub_flat
-                        _stub_lon_l = _lon_stub_flat
-                        _len_stub_t = _len_stub_m * tort
+                        if _uso_osm:
+                            # per ogni privato, dijkstra dal suo nodo strada al set dei nodi-tubo
+                            _lat_pv = _priv_in["lat"].values
+                            _lon_pv = _priv_in["lon"].values
+                            _nodi_pv, _dsnap_pv = snap_a_strade(_lat_pv, _lon_pv, _strade)
+                            _lat_stub_flat, _lon_stub_flat = [], []
+                            _len_stub_m = 0.0
+                            for i in range(len(_priv_in)):
+                                # ultimo metro edificio -> nodo stradale
+                                _n = _nodi_pv[i]
+                                _lat_n, _lon_n = _strade["nodi"][_n]
+                                _lat_stub_flat += [float(_lat_pv[i]), _lat_n, None]
+                                _lon_stub_flat += [float(_lon_pv[i]), _lon_n, None]
+                                _len_stub_m += float(_dsnap_pv[i])
+                                # percorso stradale dal nodo al tubo
+                                _stub_archi, _stub_len, _agg = dijkstra_stub_al_tubo(
+                                    _G, _nodi_tubo, _n)
+                                for a, b, w in _stub_archi:
+                                    _la1, _lo1 = _strade["nodi"][a]
+                                    _la2, _lo2 = _strade["nodi"][b]
+                                    _lat_stub_flat += [_la1, _la2, None]
+                                    _lon_stub_flat += [_lo1, _lo2, None]
+                                _len_stub_m += _stub_len
+                            _stub_lat_l = _lat_stub_flat
+                            _stub_lon_l = _lon_stub_flat
+                            _len_stub_t = _len_stub_m
+                        else:
+                            # MST classico: linea dritta al punto del tubo * tortuosita
+                            _pt_tubo_lat = _lat_tubo[_in_buffer]
+                            _pt_tubo_lon = _lon_tubo[_in_buffer]
+                            _lat_stub_flat, _lon_stub_flat = [], []
+                            _len_stub_m = 0.0
+                            for i, (_, _r) in enumerate(_priv_in.iterrows()):
+                                _lat_stub_flat += [float(_pt_tubo_lat[i]), float(_r["lat"]), None]
+                                _lon_stub_flat += [float(_pt_tubo_lon[i]), float(_r["lon"]), None]
+                                _len_stub_m += float(_r["dist_tubo_m"])
+                            _stub_lat_l = _lat_stub_flat
+                            _stub_lon_l = _lon_stub_flat
+                            _len_stub_t = _len_stub_m * tort
 
             _len_totale = _len_pub_t + _len_stub_t
 
@@ -1471,10 +1740,18 @@ with tab_domanda:
 
             fig_tr = go.Figure()
             # tracciato pubblico (rosso, spesso)
+            _label_pub = (f"Tratto obbligato (strade OSM): {_len_pub_t / 1000:.2f} km" if _uso_osm
+                          else f"Tratto obbligato (MST x{tort}): {_len_pub_t / 1000:.2f} km")
             fig_tr.add_trace(go.Scattermapbox(lat=_lat_l, lon=_lon_l, mode="lines",
                                               line=dict(width=3, color="#FF4B4B"),
-                                              name=f"Tratto obbligato: {_len_pub_t / 1000:.1f} km",
+                                              name=_label_pub,
                                               hoverinfo="skip"))
+            # ultimi metri edificio->strada (rosa tratteggiato)
+            if _uso_osm and _um_lat:
+                fig_tr.add_trace(go.Scattermapbox(lat=_um_lat, lon=_um_lon, mode="lines",
+                                                  line=dict(width=1.2, color="#FF9AA0"),
+                                                  name="Ultimi metri edificio\u2192strada",
+                                                  hoverinfo="skip"))
             # stub privati (giallo, sottile)
             if _stub_lat_l:
                 fig_tr.add_trace(go.Scattermapbox(lat=_stub_lat_l, lon=_stub_lon_l, mode="lines",
@@ -1583,6 +1860,28 @@ with tab_domanda:
                       help=f"{_n_priv_dentro}/{_n_priv_totale} privati "
                            f"({_quota_bff:.0f}% delle zone attive) \u00b7 "
                            f"buffer {buffer_m} m \u00b7 allacciamento {fattore_correzione}%")
+
+            # --- opportunistici: zone senza ancora (nessun pubblico n\u00e9 condominio) ---
+            _zone_ancora = set()
+            if not bmap.empty:
+                _zone_ancora |= set(bmap["cluster"].unique())
+            _zone_ancora |= set(sel_cond_zone)
+            _zone_opportunistiche = [z for z in sel_priv_zone if z not in _zone_ancora]
+            if _zone_opportunistiche and not _priv_in.empty:
+                _priv_opp = _priv_in[_priv_in["cluster"].isin(_zone_opportunistiche)]
+                if not _priv_opp.empty:
+                    _E_opp = float(_priv_opp["consumo_annuo_MWh"].sum()) * _fatt_priv
+                    _zn = ", ".join(z.split(" - ")[0] for z in _zone_opportunistiche)
+                    st.info(f"\U0001F517 **Zone opportunistiche** ({_zn}): non hanno pubblici "
+                            f"n\u00e9 condomini censiti, ma **{len(_priv_opp)} privati** "
+                            f"cadono comunque nel buffer del tubo posato per le altre zone. "
+                            f"Contribuiscono con **{_E_opp:,.0f} MWh/a**.".replace(",", "."))
+                else:
+                    _zn = ", ".join(z.split(" - ")[0] for z in _zone_opportunistiche)
+                    st.warning(f"\U0001F4CD **Zone opportunistiche** ({_zn}): nessun privato "
+                               f"cade nel buffer del tubo delle altre zone. Prova ad allargare "
+                               f"il buffer, o dovrai valutare queste zone con un secondo tratto "
+                               f"di rete dedicato.")
 
             if _dens < 1.2 and _len_totale > 100:
                 st.warning(f"\u26a0\ufe0f Densit\u00e0 lineare {_dens:.2f} MWh/(m\u00b7a) sotto la soglia critica QM (1,2). "
