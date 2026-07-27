@@ -146,11 +146,31 @@ AZIENDE_COORD = {
     "ZML":         (46.148400, 12.727597),  # Via dell'Industria 10, Maniago
     "Pandolfo":    (46.146761, 12.719458),  # Via Ponte Giulio 45, Maniago
 }
-# Sottocentrale: baricentro geometrico delle 4 aziende sorgente. E' un'ipotesi
-# di lavoro univocamente definita per lo studio di fattibilita'; la posizione
-# definitiva andra' individuata in fase di progetto sulla base degli spazi
-# disponibili, dell'antigelo del ground loop, dei vincoli urbanistici, ecc.
-CENTRALE_LAT, CENTRALE_LON = 46.150015, 12.722375
+# Sottocentrale: punto intermedio tra il baricentro delle aziende sorgente e
+# il baricentro degli edifici pubblici serviti. E' un compromesso tra la
+# vicinanza alle fonti di calore e la distribuzione all'utenza.
+# Il valore hardcoded qui e' un fallback quando gli edifici non sono ancora
+# stati caricati; nel tab Domanda viene ricalcolato dinamicamente.
+_LAT_BAR_AZIENDE = sum(v[0] for v in AZIENDE_COORD.values()) / len(AZIENDE_COORD)
+_LON_BAR_AZIENDE = sum(v[1] for v in AZIENDE_COORD.values()) / len(AZIENDE_COORD)
+CENTRALE_LAT, CENTRALE_LON = 46.149000, 46.149000  # placeholder, ricalcolato
+
+def calcola_sottocentrale(bmap_df):
+    """Calcola la sottocentrale come punto intermedio tra il baricentro
+    delle 4 aziende sorgente e il baricentro degli edifici pubblici passati.
+
+    Se bmap_df e' vuoto, ritorna il baricentro delle aziende (nessun utente
+    da servire -> la centrale sta comunque dove sono le fonti).
+    """
+    if bmap_df is None or bmap_df.empty:
+        return _LAT_BAR_AZIENDE, _LON_BAR_AZIENDE
+    _lat_pub = float(bmap_df["lat"].mean())
+    _lon_pub = float(bmap_df["lon"].mean())
+    return ((_LAT_BAR_AZIENDE + _lat_pub) / 2,
+            (_LON_BAR_AZIENDE + _lon_pub) / 2)
+
+# Valori di default globali (usati prima che il tab Domanda ne calcoli di aggiornati)
+CENTRALE_LAT, CENTRALE_LON = _LAT_BAR_AZIENDE, _LON_BAR_AZIENDE
 
 
 # =============================================================================
@@ -1748,12 +1768,23 @@ with tab_domanda:
 
         st.divider()
         st.markdown("##### \U0001F6E4\ufe0f Ipotesi di tracciato della rete")
+
+        # SOTTOCENTRALE: ricalcolo dinamico come punto intermedio tra baricentro
+        # aziende e baricentro pubblici selezionati (override delle costanti
+        # globali di modulo, valide solo dentro questa sezione).
+        CENTRALE_LAT, CENTRALE_LON = calcola_sottocentrale(bmap)
+
         st.caption(f"Rete progettata in **2 tempi**: prima il tratto *obbligato* che collega la "
                    f"**sottocentrale** ({CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}) agli **edifici pubblici** "
                    f"e ai **condomini censiti** selezionati; poi i **privati** vengono agganciati "
                    f"solo se cadono entro un raggio dal tubo pubblico. "
                    f"**Zone senza pubblici** (es. Zona 3) possono essere agganciate in modo "
                    f"opportunistico se il tubo di altre zone ci passa vicino.")
+        st.caption(f"\U0001F4CD **Posizione sottocentrale**: punto intermedio tra il baricentro "
+                   f"delle 4 aziende sorgente ({_LAT_BAR_AZIENDE:.4f}, {_LON_BAR_AZIENDE:.4f}) "
+                   f"e il baricentro degli edifici pubblici serviti. Si sposta dinamicamente al "
+                   f"variare della selezione. Va confermata in fase di progetto in base agli "
+                   f"spazi disponibili, all'antigelo del ground loop e ai vincoli urbanistici.")
 
         # --- 1. Tratto obbligato: pubblici + condomini censiti (opzione B) ---
         _pts_obb = []
@@ -2057,10 +2088,28 @@ with tab_domanda:
                 lat=[CENTRALE_LAT], lon=[CENTRALE_LON], mode="markers+text", name="Sottocentrale",
                 marker=dict(size=18, color="#FF9F1C"), text=["CENTRALE"], textposition="top right",
                 textfont=dict(size=13, color="#FF9F1C")))
-            _clat = (float(_obb["lat"].mean()) + CENTRALE_LAT) / 2
-            _clon = (float(_obb["lon"].mean()) + CENTRALE_LON) / 2
+            # Centraggio mappa: includo la sottocentrale, gli edifici obbligati
+            # e le 4 aziende sorgente (che stanno nella zona industriale, spesso
+            # a est del centro urbano). Zoom out sufficiente per vederli tutti.
+            _lat_all = list(_obb["lat"].values) + [CENTRALE_LAT]
+            _lon_all = list(_obb["lon"].values) + [CENTRALE_LON]
+            for _la, _lo in AZIENDE_COORD.values():
+                _lat_all.append(_la)
+                _lon_all.append(_lo)
+            _clat = (min(_lat_all) + max(_lat_all)) / 2
+            _clon = (min(_lon_all) + max(_lon_all)) / 2
+            # zoom in base all'estensione spaziale
+            _span_lat = max(_lat_all) - min(_lat_all)
+            _span_lon = max(_lon_all) - min(_lon_all)
+            _span = max(_span_lat, _span_lon)
+            if _span > 0.025:
+                _zoom = 12.5
+            elif _span > 0.015:
+                _zoom = 13.0
+            else:
+                _zoom = 13.5
             fig_tr.update_layout(mapbox=dict(style="open-street-map",
-                                             center=dict(lat=_clat, lon=_clon), zoom=13.5),
+                                             center=dict(lat=_clat, lon=_clon), zoom=_zoom),
                                  height=580, margin=dict(t=10, b=0, l=0, r=0),
                                  legend=dict(orientation="h", yanchor="bottom", y=1.01))
             st.plotly_chart(fig_tr, use_container_width=True)
