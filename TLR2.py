@@ -44,11 +44,6 @@
    maniago_privati_edifici.csv       (opzionale)
    edifici_pubblici_coordinate.csv   (opzionale)
    TLR_zones_borders.geojson
-try:
-    import scipy
-    _SCIPY_DEBUG = f"scipy OK top-level: {scipy.__file__}"
-except Exception as _e:
-    _SCIPY_DEBUG = f"scipy TOP-LEVEL FAIL: {type(_e).__name__}: {_e}"
 =============================================================================
 """
 import streamlit as st
@@ -59,6 +54,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 
+# scipy in cima al modulo per evitare problemi di import dentro cache_data
 try:
     from scipy.spatial import cKDTree
     _HAS_SCIPY = True
@@ -144,12 +140,17 @@ HOURS_2024 = pd.date_range("2024-01-01", "2024-12-31 23:00", freq="h")
 DAYS_2024 = pd.date_range("2024-01-01", "2024-12-31", freq="D")
 
 AZIENDE_COORD = {
-    "ZML": (46.1478, 12.7139),
-    "Pietro Rosa": (46.1432, 12.7215),
-    "Pandolfo": (46.1485, 12.7160),
-    "Inossman": (46.1501, 12.7145),
+    # Coordinate GPS reali degli stabilimenti (fornite da APE FVG, formato DMS convertito).
+    "Inossman":    (46.154511, 12.722867),  # Via dell'Industria 4, Molino di Campagna
+    "Pietro Rosa": (46.150386, 12.719578),  # Via Ponte Giulio 76, Maniago
+    "ZML":         (46.148400, 12.727597),  # Via dell'Industria 10, Maniago
+    "Pandolfo":    (46.146761, 12.719458),  # Via Ponte Giulio 45, Maniago
 }
-CENTRALE_LAT, CENTRALE_LON = 46.1479, 12.7151
+# Sottocentrale: baricentro geometrico delle 4 aziende sorgente. E' un'ipotesi
+# di lavoro univocamente definita per lo studio di fattibilita'; la posizione
+# definitiva andra' individuata in fase di progetto sulla base degli spazi
+# disponibili, dell'antigelo del ground loop, dei vincoli urbanistici, ecc.
+CENTRALE_LAT, CENTRALE_LON = 46.150015, 12.722375
 
 
 # =============================================================================
@@ -403,7 +404,7 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
     if not nodi:
         return None, "risposta OSM senza nodi (bbox vuoto o filtro errato)"
     if not _HAS_SCIPY:
-        return None, "scipy non disponibile in streamlit runtime"
+        return None, "scipy non disponibile in questo processo streamlit"
     node_ids = list(nodi.keys())
     coords_xy = np.array([_latlon_a_xy(np.array([nodi[i][0]]),
                                        np.array([nodi[i][1]]))[0][0] for i in node_ids])
@@ -485,6 +486,141 @@ def albero_steiner_su_strade(G, nodi_target, radice_nodo):
             usati.add(b)
     lun_tot = float(sum(w for _, _, w in archi_res))
     return archi_res, lun_tot, usati
+
+
+def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
+                                  soglia_mwh_per_m=1.0):
+    """Costruisce l'albero di Steiner e POTA i rami la cui densita' cumulativa
+    (MWh totali dei target nel sotto-ramo / metri totali del sotto-ramo) e' sotto soglia.
+
+    Il criterio e' cumulativo: un ramo con 3 edifici piccoli oltre 200 m puo' essere
+    tenuto se in totale porta abbastanza calore; un ramo con 1 solo edificio piccolo
+    a 300 m e' quasi sempre potato.
+
+    Args:
+        G: grafo networkx (nodi = punti stradali, pesi = metri)
+        nodi_target: lista di id nodi da servire
+        radice_nodo: id nodo della sottocentrale
+        mwh_per_target: dict {id_nodo: MWh/a portati da quel target}
+        soglia_mwh_per_m: densita' lineare minima accettabile (default 1.0)
+
+    Ritorna:
+        archi_finali: lista (id_a, id_b, dist_m) dopo potatura
+        lun_totale: metri totali dopo potatura
+        target_serviti: set di id nodi che sono rimasti nell'albero
+        target_esclusi: set di id nodi potati
+    """
+    import networkx as nx
+    # 1) albero completo
+    archi_full, _, _ = albero_steiner_su_strade(G, nodi_target, radice_nodo)
+    if not archi_full:
+        return [], 0.0, set(), set(nodi_target)
+
+    # 2) costruisco l'albero come grafo diretto radicato in 'radice_nodo'
+    #    (BFS/DFS dalla radice sull'albero non orientato per orientarlo)
+    T = nx.Graph()
+    for a, b, w in archi_full:
+        T.add_edge(a, b, weight=w)
+    if radice_nodo not in T:
+        # la radice non e' entrata (target isolato): tutto potato
+        return [], 0.0, set(), set(nodi_target)
+
+    parent = {radice_nodo: None}
+    order = []
+    stack = [radice_nodo]
+    visited = {radice_nodo}
+    while stack:
+        u = stack.pop()
+        order.append(u)
+        for v in T.neighbors(u):
+            if v not in visited:
+                visited.add(v)
+                parent[v] = u
+                stack.append(v)
+
+    target_set = set(nodi_target)
+
+    # 3) per ogni nodo, calcolo (in ordine BFS inverso = foglie prima) il
+    #    sotto-albero cumulativo: MWh totali dei target sotto di lui + lunghezza
+    #    totale degli archi sotto di lui (compreso l'arco che lo collega al padre).
+    sub_mwh = {u: (mwh_per_target.get(u, 0.0) if u in target_set else 0.0) for u in order}
+    sub_len = {u: 0.0 for u in order}  # lunghezza rami DENTRO il sotto-albero
+    children = {u: [] for u in order}
+    for u in order:
+        if parent[u] is not None:
+            children[parent[u]].append(u)
+    for u in reversed(order):
+        p = parent[u]
+        if p is not None:
+            w_edge = T[u][p]["weight"]
+            sub_mwh[p] = sub_mwh[p] + sub_mwh[u]
+            sub_len[p] = sub_len[p] + sub_len[u] + w_edge
+
+    # 4) potatura iterativa dal basso: poto sotto-alberi di foglie/rami con densita' < soglia.
+    #    Ripeto finche' non ci sono piu' rami da potare (la potatura di un ramo
+    #    puo' cambiare la densita' del ramo padre, che diventa piu' compatto).
+    esclusi = set()
+    nodi_vivi = set(order)  # nodi ancora nell'albero
+
+    def _sub_da_zero(u):
+        """ricalcola sub_mwh e sub_len su nodi_vivi partendo da u"""
+        if u not in nodi_vivi:
+            return 0.0, 0.0
+        m = mwh_per_target.get(u, 0.0) if u in target_set else 0.0
+        L = 0.0
+        for c in children[u]:
+            if c in nodi_vivi:
+                m_c, L_c = _sub_da_zero(c)
+                m += m_c
+                arc = T[u][c]["weight"]
+                L += L_c + arc
+        return m, L
+
+    while True:
+        potati = False
+        # ordina i sotto-rami dai piu' interni (foglie) verso l'alto
+        for u in reversed(order):
+            if u == radice_nodo or u not in nodi_vivi:
+                continue
+            p = parent[u]
+            if p is None or p not in nodi_vivi:
+                continue
+            m_u, L_u = _sub_da_zero(u)
+            arc_up = T[u][p]["weight"]
+            L_tot = L_u + arc_up
+            if L_tot < 10.0:  # rami micro: tieni
+                continue
+            dens = m_u / L_tot if L_tot > 0 else 0.0
+            if dens < soglia_mwh_per_m:
+                # poto: rimuovo u e tutto il sotto-albero
+                stack = [u]
+                while stack:
+                    x = stack.pop()
+                    if x in target_set:
+                        esclusi.add(x)
+                    nodi_vivi.discard(x)
+                    stack.extend([c for c in children[x] if c in nodi_vivi])
+                potati = True
+                break  # ripeto il ciclo dall'inizio
+        if not potati:
+            break
+
+    keep = nodi_vivi
+
+    # 5) ricostruisco gli archi finali: solo quelli tra nodi tenuti
+    archi_finali = []
+    for u in order:
+        if u == radice_nodo:
+            continue
+        if u in keep:
+            p = parent[u]
+            if p in keep:
+                w = T[u][p]["weight"]
+                archi_finali.append((p, u, w))
+
+    lun_tot = float(sum(w for _, _, w in archi_finali))
+    target_serviti = (target_set & keep)
+    return archi_finali, lun_tot, target_serviti, esclusi
 
 
 def archi_a_coords(archi_nodi, strade_data):
@@ -1622,14 +1758,19 @@ with tab_domanda:
         # --- 1. Tratto obbligato: pubblici + condomini censiti (opzione B) ---
         _pts_obb = []
         if not bmap.empty:
-            _pts_obb.append(bmap[["lat", "lon", "consumo_annuo_MWh"]].assign(tipo="pubblico"))
+            _p_pub = bmap[["lat", "lon", "consumo_annuo_MWh", "edificio"]].copy()
+            _p_pub["tipo"] = "pubblico"
+            _pts_obb.append(_p_pub)
         if sel_cond_zone and not condomini.empty:
             _cond_z = condomini[condomini["cluster"].isin(sel_cond_zone)].copy()
             _cond_z["MWh_stimato"] = _cond_z["unita"] * mwh_unita * tasso_cond / 100.0
-            _cond_z = _cond_z.dropna(subset=["lat", "lon"])[["lat", "lon", "MWh_stimato"]]
+            _cond_z = _cond_z.dropna(subset=["lat", "lon"])
             if not _cond_z.empty:
-                _cond_z = _cond_z.rename(columns={"MWh_stimato": "consumo_annuo_MWh"})
-                _pts_obb.append(_cond_z.assign(tipo="condominio"))
+                _p_cond = _cond_z[["lat", "lon", "MWh_stimato"]].rename(
+                    columns={"MWh_stimato": "consumo_annuo_MWh"})
+                _p_cond["edificio"] = _cond_z["denominazione"].fillna("Condominio").astype(str).values
+                _p_cond["tipo"] = "condominio"
+                _pts_obb.append(_p_cond)
         _obb = (pd.concat(_pts_obb, ignore_index=True).dropna(subset=["lat", "lon"])
                 if _pts_obb else pd.DataFrame())
 
@@ -1637,7 +1778,7 @@ with tab_domanda:
             st.info("Seleziona almeno un edificio pubblico o un condominio "
                     "georeferenziato per vedere il tracciato.")
         else:
-            tc1, tc2, tc3 = st.columns(3)
+            tc1, tc2, tc3, tc4 = st.columns(4)
             tort = tc1.slider("Fattore di tortuosità", 1.0, 2.0, 1.35, step=0.05, key="dom_tort")
             costo_m_tr = tc2.slider("Costo rete (\u20ac/m)", 200, 1500, 600, step=50, key="dom_costo_tr")
             buffer_m = tc3.slider("Buffer privati dal tubo pubblico (m)", 20, 150, 50, step=5,
@@ -1646,6 +1787,13 @@ with tab_domanda:
                                        "distanza dal tubo del tratto pubblico. Piu il buffer e "
                                        "piccolo, piu selettivo diventa (meno stub, densità lineare "
                                        "piu alta).")
+            soglia_dens = tc4.slider("Soglia densità ramo (MWh/(m·a))", 0.3, 3.0, 1.0, step=0.1,
+                                     key="dom_soglia_dens",
+                                     help="QM: se un ramo del tratto pubblico porta meno di questa "
+                                          "densità (MWh/anno diviso metri del ramo, cumulativo dal "
+                                          "punto di diramazione in avanti), viene POTATO e gli edifici "
+                                          "sotto vengono esclusi dal TLR (andrebbero serviti "
+                                          "localmente). 1.0 = soglia critica QM standard.")
 
             # Scelta metodo: OSM (Dijkstra su strade) con fallback MST + tortuosita
             usa_strade = st.checkbox(
@@ -1655,7 +1803,7 @@ with tab_domanda:
                      "`maniago_strade_cache.json`. Se disattivato o se il download fallisce, "
                      "si usa l'MST in linea d'aria con tortuosita.")
 
-            _strade_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=1.8) if usa_strade else (None, None)
+            _strade_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=2.5) if usa_strade else (None, None)
             _strade, _osm_err = _strade_res if isinstance(_strade_res, tuple) else (_strade_res, None)
             _uso_osm = _strade is not None
             if usa_strade and not _uso_osm:
@@ -1672,7 +1820,7 @@ with tab_domanda:
                 _uso_osm = False
 
             if _uso_osm:
-                # --- ROUTING SU STRADE: Steiner approssimato via Dijkstra ---
+                # --- ROUTING SU STRADE: Steiner con potatura per densita' lineare ---
                 _G = build_grafo_stradale(_strade)
                 # snap centrale + edifici del tratto obbligato
                 _lat_obb = np.concatenate([[CENTRALE_LAT], _obb["lat"].values])
@@ -1680,37 +1828,62 @@ with tab_domanda:
                 _nodi_obb, _dsnap_obb = snap_a_strade(_lat_obb, _lon_obb, _strade)
                 _rad_nodo = _nodi_obb[0]
                 _target_nodi = _nodi_obb[1:]
-                _archi_G, _len_pub_osm, _nodi_tubo = albero_steiner_su_strade(
-                    _G, _target_nodi, _rad_nodo)
+
+                # mappa nodo_stradale -> MWh dell'edificio agganciato (per la potatura).
+                # Se piu edifici snappano sullo stesso nodo, sommo i loro MWh.
+                _mwh_per_target = {}
+                _label_per_target = {}
+                for i in range(len(_obb)):
+                    _n = _nodi_obb[i + 1]
+                    _mwh = float(_obb["consumo_annuo_MWh"].iloc[i]) if "consumo_annuo_MWh" in _obb.columns else 0.0
+                    _mwh_per_target[_n] = _mwh_per_target.get(_n, 0.0) + _mwh
+                    _lab = _obb["edificio"].iloc[i] if "edificio" in _obb.columns else f"edif {i}"
+                    _label_per_target.setdefault(_n, []).append(str(_lab))
+
+                _archi_G, _len_pub_osm, _target_servi, _target_escl = \
+                    steiner_con_potatura_densita(_G, _target_nodi, _rad_nodo,
+                                                  _mwh_per_target,
+                                                  soglia_mwh_per_m=soglia_dens)
+                _nodi_tubo = set()
+                for a, b, _ in _archi_G:
+                    _nodi_tubo.add(a)
+                    _nodi_tubo.add(b)
                 _archi_pub = archi_a_coords(_archi_G, _strade)
-                # linee "ultimo metro" dagli edifici al nodo stradale
-                _ultimi_metri = []
-                _len_ultimi = 0.0
-                for i in range(len(_obb)):
-                    _lat_ed = float(_obb["lat"].iloc[i])
-                    _lon_ed = float(_obb["lon"].iloc[i])
-                    _n = _nodi_obb[i + 1]
-                    _lat_n, _lon_n = _strade["nodi"][_n]
-                    _ultimi_metri += [_lat_ed, _lat_n, None]
-                    _ultimi_metri += [_lon_ed, _lon_n, None]  # placeholder
-                    _len_ultimi += float(_dsnap_obb[i + 1])
-                # ricostruisco correttamente lat/lon separati
+
+                # linee "ultimo metro" solo per gli edifici EFFETTIVAMENTE serviti
                 _um_lat, _um_lon = [], []
+                _len_ultimi = 0.0
+                _obb_servi_mask = []
+                _obb_esclusi_info = []
                 for i in range(len(_obb)):
+                    _n = _nodi_obb[i + 1]
                     _lat_ed = float(_obb["lat"].iloc[i])
                     _lon_ed = float(_obb["lon"].iloc[i])
-                    _n = _nodi_obb[i + 1]
-                    _lat_n, _lon_n = _strade["nodi"][_n]
-                    _um_lat += [_lat_ed, _lat_n, None]
-                    _um_lon += [_lon_ed, _lon_n, None]
+                    _lab = _obb["edificio"].iloc[i] if "edificio" in _obb.columns else f"edif {i}"
+                    _mwh = float(_obb["consumo_annuo_MWh"].iloc[i]) if "consumo_annuo_MWh" in _obb.columns else 0.0
+                    _tipo = _obb["tipo"].iloc[i] if "tipo" in _obb.columns else "?"
+                    if _n in _target_servi:
+                        _lat_n, _lon_n = _strade["nodi"][_n]
+                        _um_lat += [_lat_ed, _lat_n, None]
+                        _um_lon += [_lon_ed, _lon_n, None]
+                        _len_ultimi += float(_dsnap_obb[i + 1])
+                        _obb_servi_mask.append(True)
+                    else:
+                        _obb_servi_mask.append(False)
+                        _obb_esclusi_info.append({"edificio": _lab,
+                                                  "tipo": _tipo,
+                                                  "MWh/a": round(_mwh, 1),
+                                                  "lat": _lat_ed, "lon": _lon_ed})
                 _len_pub_t = _len_pub_osm + _len_ultimi
             else:
-                # --- FALLBACK: MST + tortuosita ---
+                # --- FALLBACK: MST + tortuosita (nessuna potatura per densita') ---
                 _archi_pub, _len_pub = mst_archi(_obb["lat"].values, _obb["lon"].values,
                                                  radice=(CENTRALE_LAT, CENTRALE_LON))
                 _len_pub_t = _len_pub * tort
                 _um_lat, _um_lon = [], []
                 _nodi_tubo = set()
+                _obb_servi_mask = [True] * len(_obb)
+                _obb_esclusi_info = []
 
             # --- 2. Buffer privati: aggancio via strade se disponibili ---
             _priv_in = pd.DataFrame()
@@ -1794,27 +1967,63 @@ with tab_domanda:
                                                   line=dict(width=1.5, color="#F5C518"),
                                                   name=f"Allacci privati: {_len_stub_t / 1000:.1f} km",
                                                   hoverinfo="skip"))
-            # pubblici (blu)
+            # pubblici/condomini SERVITI (blu) vs ESCLUSI (grigi con X)
             if not bmap.empty:
-                fig_tr.add_trace(go.Scattermapbox(
-                    lat=bmap["lat"], lon=bmap["lon"], mode="markers", name="Pubblici",
-                    marker=dict(size=10, color="#22C3DD"),
-                    text=(bmap["edificio"] + "<br>"
-                          + bmap["consumo_annuo_MWh"].round(0).astype(int).astype(str) + " MWh/a"),
-                    hoverinfo="text"))
-            # condomini (viola)
+                # tra gli edifici di _obb, quelli con maschera True sono serviti.
+                # bmap contiene solo i pubblici; abbina per nome.
+                _bmap_edifici = bmap["edificio"].tolist()
+                _obb_edifici = _obb["edificio"].tolist() if "edificio" in _obb.columns else []
+                _mappa_servi = {e: s for e, s in zip(_obb_edifici, _obb_servi_mask)}
+                _serviti_ok = [_mappa_servi.get(e, True) for e in _bmap_edifici]
+                _bmap_srv = bmap[pd.Series(_serviti_ok, index=bmap.index)]
+                _bmap_esc = bmap[~pd.Series(_serviti_ok, index=bmap.index)]
+                if not _bmap_srv.empty:
+                    fig_tr.add_trace(go.Scattermapbox(
+                        lat=_bmap_srv["lat"], lon=_bmap_srv["lon"], mode="markers",
+                        name=f"Pubblici serviti ({len(_bmap_srv)})",
+                        marker=dict(size=10, color="#22C3DD"),
+                        text=(_bmap_srv["edificio"] + "<br>"
+                              + _bmap_srv["consumo_annuo_MWh"].round(0).astype(int).astype(str) + " MWh/a"),
+                        hoverinfo="text"))
+                if not _bmap_esc.empty:
+                    fig_tr.add_trace(go.Scattermapbox(
+                        lat=_bmap_esc["lat"], lon=_bmap_esc["lon"], mode="markers",
+                        name=f"⛔ Pubblici esclusi dalla soglia ({len(_bmap_esc)})",
+                        marker=dict(size=12, color="#9AA0A6", opacity=0.6, symbol="cross"),
+                        text=(_bmap_esc["edificio"] + "<br>"
+                              + _bmap_esc["consumo_annuo_MWh"].round(0).astype(int).astype(str)
+                              + " MWh/a - fuori soglia densità"),
+                        hoverinfo="text"))
+            # condomini (viola per serviti, grigio per esclusi)
             if sel_cond_zone and not condomini.empty:
                 _c_geo = condomini[condomini["cluster"].isin(sel_cond_zone)].dropna(subset=["lat", "lon"])
                 if not _c_geo.empty:
                     _c_geo = _c_geo.copy()
                     _c_geo["MWh_stimato"] = (_c_geo["unita"] * mwh_unita * tasso_cond / 100.0).round(1)
-                    fig_tr.add_trace(go.Scattermapbox(
-                        lat=_c_geo["lat"], lon=_c_geo["lon"], mode="markers", name="Condomini",
-                        marker=dict(size=9, color="#9B5DE5"),
-                        text=(_c_geo["denominazione"].fillna("Condominio").astype(str) + "<br>"
-                              + _c_geo["unita"].astype(str) + " unita\u0300 · "
-                              + _c_geo["MWh_stimato"].astype(str) + " MWh/a"),
-                        hoverinfo="text"))
+                    # marca condomini esclusi (chiavi in _obb_esclusi_info)
+                    _nomi_escl_obb = set()
+                    for _r in _obb_esclusi_info:
+                        _nomi_escl_obb.add(_r["edificio"])
+                    _c_geo["_servi"] = ~_c_geo["denominazione"].fillna("").astype(str).isin(_nomi_escl_obb)
+                    _cs = _c_geo[_c_geo["_servi"]]
+                    _ce = _c_geo[~_c_geo["_servi"]]
+                    if not _cs.empty:
+                        fig_tr.add_trace(go.Scattermapbox(
+                            lat=_cs["lat"], lon=_cs["lon"], mode="markers",
+                            name=f"Condomini serviti ({len(_cs)})",
+                            marker=dict(size=9, color="#9B5DE5"),
+                            text=(_cs["denominazione"].fillna("Condominio").astype(str) + "<br>"
+                                  + _cs["unita"].astype(str) + " unità · "
+                                  + _cs["MWh_stimato"].astype(str) + " MWh/a"),
+                            hoverinfo="text"))
+                    if not _ce.empty:
+                        fig_tr.add_trace(go.Scattermapbox(
+                            lat=_ce["lat"], lon=_ce["lon"], mode="markers",
+                            name=f"⛔ Condomini esclusi ({len(_ce)})",
+                            marker=dict(size=11, color="#9AA0A6", opacity=0.6, symbol="cross"),
+                            text=(_ce["denominazione"].fillna("Condominio").astype(str)
+                                  + " · fuori soglia densità"),
+                            hoverinfo="text"))
             # privati DENTRO il buffer (verde)
             if not _priv_in.empty:
                 fig_tr.add_trace(go.Scattermapbox(
@@ -1856,34 +2065,58 @@ with tab_domanda:
                                  legend=dict(orientation="h", yanchor="bottom", y=1.01))
             st.plotly_chart(fig_tr, use_container_width=True)
 
+            # --- pannello edifici esclusi dalla soglia di densita' ---
+            if _uso_osm and _obb_esclusi_info:
+                _tot_mwh_escl = sum(r["MWh/a"] for r in _obb_esclusi_info)
+                st.warning(
+                    f"⛔ **{len(_obb_esclusi_info)} edifici esclusi dalla rete** per soglia densità "
+                    f"< {soglia_dens:.1f} MWh/(m·a): il ramo per servirli sarebbe troppo lungo "
+                    f"per il calore che portano. Potenziale non allacciato: "
+                    f"**{_tot_mwh_escl:.0f} MWh/a**. Andrebbero serviti localmente."
+                )
+                with st.expander(f"📋 Dettaglio {len(_obb_esclusi_info)} edifici esclusi"):
+                    _df_esc = pd.DataFrame(_obb_esclusi_info)
+                    st.dataframe(_df_esc, use_container_width=True, hide_index=True)
+
             # --- energia servita ---
-            _E_pub = float(bmap["consumo_annuo_MWh"].sum()) if not bmap.empty else 0.0
+            # Energia SERVITA: escludo gli edifici potati dalla soglia densita'.
+            _nomi_pub_serviti = set()
+            _nomi_pub_tutti = bmap["edificio"].tolist() if not bmap.empty else []
+            _nomi_pub_esclusi = set(r["edificio"] for r in _obb_esclusi_info) if _uso_osm else set()
+            _bmap_srv_e = bmap[~bmap["edificio"].isin(_nomi_pub_esclusi)] if not bmap.empty else bmap
+            _E_pub = float(_bmap_srv_e["consumo_annuo_MWh"].sum()) if not _bmap_srv_e.empty else 0.0
             _E_cond = 0.0
+            _n_cond_serviti = 0
             if sel_cond_zone and not condomini.empty:
                 _cond_sel = condomini[condomini["cluster"].isin(sel_cond_zone)]
+                if _uso_osm and _nomi_pub_esclusi:
+                    _cond_sel = _cond_sel[~_cond_sel["denominazione"].fillna("").astype(str).isin(_nomi_pub_esclusi)]
                 _E_cond = float(_cond_sel["unita"].sum()) * mwh_unita * tasso_cond / 100.0
+                _n_cond_serviti = len(_cond_sel)
             _E_priv = float(_priv_in["consumo_annuo_MWh"].sum()) * _fatt_priv if not _priv_in.empty else 0.0
             _E_tot = _E_pub + _E_cond + _E_priv
-            _n_utenze_tot = (len(bmap) + (len(condomini[condomini['cluster'].isin(sel_cond_zone)])
-                                          if sel_cond_zone and not condomini.empty else 0)
-                             + len(_priv_in))
+            _n_utenze_tot = (len(_bmap_srv_e) + _n_cond_serviti
+                             + (len(_priv_in) if not _priv_in.empty else 0))
 
             t1, t2, t3, t4 = st.columns(4)
             t1.metric("Lunghezza totale rete", f"{_len_totale / 1000:.2f} km",
                       help=f"Obbligato {_len_pub_t / 1000:.2f} km + stub {_len_stub_t / 1000:.2f} km "
                            f"(tortuosità {tort})")
-            t2.metric("Utenze totali",
+            t2.metric("Utenze totali servite",
                       f"{_n_utenze_tot}",
-                      help=f"pubblici + condomini + {len(_priv_in) if not _priv_in.empty else 0} privati nel buffer")
+                      help=f"pubblici + condomini + {len(_priv_in) if not _priv_in.empty else 0} privati nel buffer"
+                           f" (edifici sopra soglia densità)")
             t3.metric("CAPEX rete", f"{_len_totale * costo_m_tr / 1e6:.2f} M\u20ac")
             _dens = _E_tot / _len_totale if _len_totale > 0 else 0.0
             t4.metric("Densità lineare", f"{_dens:.2f} MWh/(m·a)",
-                      help="sotto ~1,2 la rete fatica a ripagarsi; sopra ~2,0 e buona (QM)")
+                      help=f"soglia potatura: {soglia_dens:.1f} · sotto ~1,2 la rete fatica a ripagarsi; "
+                           f"sopra ~2,0 e buona (QM)")
 
             # --- breakdown ---
             b1, b2, b3 = st.columns(3)
             b1.metric("da pubblici", f"{_E_pub:,.0f} MWh/a".replace(",", "."),
-                      help=f"{len(bmap)} edifici")
+                      help=f"{len(_bmap_srv_e)} edifici serviti"
+                           + (f" ({len(_nomi_pub_esclusi)} esclusi)" if _nomi_pub_esclusi else ""))
             b2.metric("da condomini", f"{_E_cond:,.0f} MWh/a".replace(",", "."),
                       help=f"adesione {tasso_cond}%")
             _n_priv_dentro = len(_priv_in) if not _priv_in.empty else 0
