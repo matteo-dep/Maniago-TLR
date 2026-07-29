@@ -717,6 +717,45 @@ def archi_a_coords(archi_nodi, strade_data):
     return out
 
 
+def buffer_su_rete(G, nodi_tubo, nodi_snap, dist_snap, raggio_m):
+    """Lunghezza di allaccio di ciascun edificio misurata LUNGO LE STRADE.
+
+    Il buffer geometrico (distanza in linea d'aria dalla polilinea del tubo)
+    sbaglia dove il tracciato compie salti rettilinei su aree non mappate:
+    quella retta attraversa campi e cortili, quindi esclude gli edifici che
+    stanno lungo la strada vera e includerebbe case irraggiungibili.
+    Qui invece si misura il tubo che servirebbe davvero:
+
+        allaccio = tratto edificio->strada  +  percorso stradale fino al tubo
+
+    Un solo Dijkstra multi-sorgente dal tubo verso tutta la rete, quindi il
+    costo non cresce col numero di edifici.
+
+    Args:
+        G: grafo stradale (pesi in metri)
+        nodi_tubo: insieme dei nodi gia' attraversati dalla condotta
+        nodi_snap: per ogni edificio, il nodo stradale su cui e' agganciato
+        dist_snap: per ogni edificio, i metri tra edificio e quel nodo
+        raggio_m: soglia di allaccio
+
+    Ritorna: array con la lunghezza di allaccio (inf se irraggiungibile).
+    """
+    import networkx as nx
+    if not nodi_tubo or len(nodi_snap) == 0:
+        return np.full(len(nodi_snap), np.inf)
+    sorgenti = set(n for n in nodi_tubo if n in G)
+    if not sorgenti:
+        return np.full(len(nodi_snap), np.inf)
+    dist_da_tubo = nx.multi_source_dijkstra_path_length(
+        G, sources=sorgenti, cutoff=float(raggio_m), weight="weight")
+    out = np.full(len(nodi_snap), np.inf)
+    for i, (n, d_s) in enumerate(zip(nodi_snap, dist_snap)):
+        d_rete = dist_da_tubo.get(n)
+        if d_rete is not None:
+            out[i] = float(d_s) + float(d_rete)
+    return out
+
+
 def dijkstra_stub_al_tubo(G, nodi_tubo, nodo_partenza):
     """Percorso minimo da nodo_partenza al set di nodi_tubo (l'arrivo e il tubo piu vicino).
     Ritorna: lista di archi, lunghezza totale, nodo di aggancio sul tubo.
@@ -1982,12 +2021,14 @@ with tab_domanda:
             tc1, tc2, tc3, tc4 = st.columns(4)
             tort = tc1.slider("Fattore di tortuosità", 1.0, 2.0, 1.35, step=0.05, key="dom_tort")
             costo_m_tr = tc2.slider("Costo rete (\u20ac/m)", 200, 1500, 600, step=50, key="dom_costo_tr")
-            buffer_m = tc3.slider("Buffer privati dal tubo pubblico (m)", 20, 150, 50, step=5,
+            buffer_m = tc3.slider("Lunghezza max allaccio privati (m)", 20, 200, 50, step=5,
                                   key="dom_buffer",
-                                  help="Un privato viene allacciato solo se si trova entro questa "
-                                       "distanza dal tubo del tratto pubblico. Piu il buffer e "
-                                       "piccolo, piu selettivo diventa (meno stub, densità lineare "
-                                       "piu alta).")
+                                  help="Metri di tubo che si e disposti a posare per allacciare "
+                                       "un privato, misurati LUNGO LE STRADE: tratto "
+                                       "edificio→strada più percorso stradale fino alla condotta "
+                                       "già posata. Non è una distanza in linea d'aria, quindi "
+                                       "un edificio dall'altra parte di un fiume o di una ferrovia "
+                                       "non viene agganciato solo perché è vicino sulla mappa.")
             soglia_dens = tc4.slider("Soglia densità ramo (MWh/(m·a))", 0.3, 3.0, 1.0, step=0.1,
                                      key="dom_soglia_dens",
                                      help="QM: se un ramo del tratto pubblico porta meno di questa "
@@ -1997,12 +2038,19 @@ with tab_domanda:
                                           "localmente). 1.0 = soglia critica QM standard.")
 
             # Scelta metodo: OSM (Dijkstra su strade) con fallback MST + tortuosita
-            usa_strade = st.checkbox(
+            _cb1, _cb2 = st.columns(2)
+            usa_strade = _cb1.checkbox(
                 "\U0001F6E3\ufe0f Tracciato sulle strade reali (OSM)", value=True, key="dom_usa_osm",
                 help="Al primo avvio scarica la rete stradale di Maniago da OpenStreetMap "
                      "(qualche decina di secondi). Poi la cache resta locale in "
                      "`maniago_strade_cache.json`. Se disattivato o se il download fallisce, "
                      "si usa l'MST in linea d'aria con tortuosita.")
+            mostra_strade = _cb2.checkbox(
+                "\U0001F441\ufe0f Mostra la viabilità nota al grafo", value=False,
+                key="dom_mostra_strade",
+                help="Disegna in azzurro tutte le strade presenti nel grafo OSM. "
+                     "Serve a capire dove la mappa è completa e dove invece il tracciato "
+                     "è costretto a procedere in linea retta per mancanza di dati.")
 
             _strade_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=2.5) if usa_strade else (None, None)
             _strade, _osm_err = _strade_res if isinstance(_strade_res, tuple) else (_strade_res, None)
@@ -2113,17 +2161,27 @@ with tab_domanda:
             if sel_priv_zone and not privati.empty and _archi_pub:
                 _pv = privati[privati["cluster"].isin(sel_priv_zone)].dropna(subset=["lat", "lon"]).copy()
                 if not _pv.empty:
-                    _dmin, _idx_arco, _lat_tubo, _lon_tubo = buffer_tracciato(
-                        _archi_pub, _pv["lat"].values, _pv["lon"].values, raggio_m=buffer_m)
+                    if _uso_osm:
+                        # Buffer misurato LUNGO LE STRADE: allaccio = tratto
+                        # edificio->strada + percorso stradale fino al tubo.
+                        # Evita l'errore del buffer in linea d'aria dove il
+                        # tracciato compie salti rettilinei su aree non mappate.
+                        _nodi_pv_all, _dsnap_pv_all = snap_a_strade(
+                            _pv["lat"].values, _pv["lon"].values, _strade)
+                        _dmin = buffer_su_rete(_G, _nodi_tubo, _nodi_pv_all,
+                                               _dsnap_pv_all, buffer_m)
+                    else:
+                        _dmin, _idx_arco, _lat_tubo, _lon_tubo = buffer_tracciato(
+                            _archi_pub, _pv["lat"].values, _pv["lon"].values, raggio_m=buffer_m)
                     _pv["dist_tubo_m"] = _dmin
                     _in_buffer = _dmin <= buffer_m
                     _priv_in = _pv[_in_buffer].copy()
                     if not _priv_in.empty:
                         if _uso_osm:
-                            # per ogni privato, dijkstra dal suo nodo strada al set dei nodi-tubo
                             _lat_pv = _priv_in["lat"].values
                             _lon_pv = _priv_in["lon"].values
-                            _nodi_pv, _dsnap_pv = snap_a_strade(_lat_pv, _lon_pv, _strade)
+                            _nodi_pv = [n for n, ok in zip(_nodi_pv_all, _in_buffer) if ok]
+                            _dsnap_pv = _dsnap_pv_all[_in_buffer]
                             _lat_stub_flat, _lon_stub_flat = [], []
                             _len_stub_m = 0.0
                             _n_priv_snap_lungo = 0
@@ -2172,6 +2230,20 @@ with tab_domanda:
                 _lon_l += [a[1], b[1], None]
 
             fig_tr = go.Figure()
+            # sfondo opzionale: la viabilita' effettivamente presente nel grafo.
+            # Serve a capire dove OSM e' completo e dove invece il tracciato e'
+            # costretto a procedere in linea retta.
+            if _uso_osm and mostra_strade:
+                _sl_lat, _sl_lon = [], []
+                for _w in _strade["strade"]:
+                    for _a, _b in zip(_w[:-1], _w[1:]):
+                        if _a in _strade["nodi"] and _b in _strade["nodi"]:
+                            _sl_lat += [_strade["nodi"][_a][0], _strade["nodi"][_b][0], None]
+                            _sl_lon += [_strade["nodi"][_a][1], _strade["nodi"][_b][1], None]
+                fig_tr.add_trace(go.Scattermapbox(
+                    lat=_sl_lat, lon=_sl_lon, mode="lines",
+                    line=dict(width=1, color="#7FB3D5"),
+                    name="Viabilità nota al grafo", opacity=0.45, hoverinfo="skip"))
             # tracciato pubblico (rosso, spesso)
             _label_pub = (f"Tratto obbligato (strade OSM): {_len_pub_t / 1000:.2f} km" if _uso_osm
                           else f"Tratto obbligato (MST x{tort}): {_len_pub_t / 1000:.2f} km")
@@ -2252,11 +2324,11 @@ with tab_domanda:
             if not _priv_in.empty:
                 fig_tr.add_trace(go.Scattermapbox(
                     lat=_priv_in["lat"], lon=_priv_in["lon"], mode="markers",
-                    name=f"Privati agganciabili ({len(_priv_in)})",
+                    name=f"Privati agganciati ({len(_priv_in)})",
                     marker=dict(size=5, color="#3FA34D", opacity=0.85),
                     text=(_priv_in.get("nome", pd.Series([""] * len(_priv_in))).fillna("").astype(str)
-                          + "<br>dist. tubo: " + _priv_in["dist_tubo_m"].round(0).astype(int).astype(str)
-                          + " m · " + _priv_in["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a"),
+                          + "<br>allaccio: " + _priv_in["dist_tubo_m"].round(0).astype(int).astype(str)
+                          + " m di tubo · " + _priv_in["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a"),
                     hoverinfo="text"))
             # privati FUORI dal buffer (grigi trasparenti, per contesto)
             if sel_priv_zone and not privati.empty:
