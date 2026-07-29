@@ -2043,6 +2043,7 @@ with tab_domanda:
                             "edificio": _obb["edificio"].iloc[i] if "edificio" in _obb.columns else f"edif {i}",
                             "dist. da strada mappata (m)": round(_d),
                         })
+                _target_nodi = _nodi_obb[1:]
 
                 # mappa nodo_stradale -> MWh dell'edificio agganciato (per la potatura).
                 # Se piu edifici snappano sullo stesso nodo, sommo i loro MWh.
@@ -2087,6 +2088,9 @@ with tab_domanda:
                         _obb_servi_mask.append(True)
                     else:
                         # unico motivo di esclusione: convenienza economica del ramo
+                        _len_ultimi += float(_dsnap_obb[i + 1])
+                        _obb_servi_mask.append(True)
+                    else:
                         _obb_servi_mask.append(False)
                         _obb_esclusi_info.append({"edificio": _lab,
                                                   "tipo": _tipo,
@@ -2335,6 +2339,18 @@ with tab_domanda:
                         f"serviti**: è solo un avviso sulla precisione del tracciato.")
                     st.dataframe(pd.DataFrame(_snap_lunghi), use_container_width=True,
                                  hide_index=True)
+            # --- pannello edifici esclusi dalla soglia di densita' ---
+            if _uso_osm and _obb_esclusi_info:
+                _tot_mwh_escl = sum(r["MWh/a"] for r in _obb_esclusi_info)
+                st.warning(
+                    f"⛔ **{len(_obb_esclusi_info)} edifici esclusi dalla rete** per soglia densità "
+                    f"< {soglia_dens:.1f} MWh/(m·a): il ramo per servirli sarebbe troppo lungo "
+                    f"per il calore che portano. Potenziale non allacciato: "
+                    f"**{_tot_mwh_escl:.0f} MWh/a**. Andrebbero serviti localmente."
+                )
+                with st.expander(f"📋 Dettaglio {len(_obb_esclusi_info)} edifici esclusi"):
+                    _df_esc = pd.DataFrame(_obb_esclusi_info)
+                    st.dataframe(_df_esc, use_container_width=True, hide_index=True)
 
             # --- energia servita ---
             # Energia SERVITA: escludo gli edifici potati dalla soglia densita'.
