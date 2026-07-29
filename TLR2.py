@@ -285,14 +285,27 @@ def stima_lunghezza_rete(lat, lon, fattore_tortuosita=1.35):
     return tot * fattore_tortuosita
 
 
+# Origine della proiezione locale metrica. Tenerla FISSA e' essenziale: se il
+# fattore di scala dipendesse dalla media delle latitudini passate di volta in
+# volta, due proiezioni fatte su insiemi diversi non sarebbero confrontabili.
+# Con x,y assoluti dell'ordine di 10^6 m bastava uno scarto di 0.03% sul coseno
+# per generare errori di 200 m sulle distanze (bug osservato sugli snap OSM).
+_PROJ_LAT0 = 46.150
+_PROJ_LON0 = 12.720
+
+
 def _latlon_a_xy(lat, lon):
-    """Proiezione locale metrica (equirettangolare centrata sulla media)."""
+    """Proiezione equirettangolare locale (metri) con origine fissa su Maniago.
+
+    Ritorna coordinate piccole (ordine dei km) riferite a (_PROJ_LAT0, _PROJ_LON0),
+    coerenti tra chiamate diverse.
+    """
     lat = np.asarray(lat, dtype=float)
     lon = np.asarray(lon, dtype=float)
     R = 6371000.0
-    la0 = np.radians(lat.mean()) if len(lat) else 0.0
-    x = R * np.radians(lon) * np.cos(la0)
-    y = R * np.radians(lat)
+    cos0 = np.cos(np.radians(_PROJ_LAT0))
+    x = R * np.radians(lon - _PROJ_LON0) * cos0
+    y = R * np.radians(lat - _PROJ_LAT0)
     return x, y
 
 
@@ -432,11 +445,10 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
     if not _HAS_SCIPY:
         return None, "scipy non disponibile in questo processo streamlit"
     node_ids = list(nodi.keys())
-    coords_xy = np.array([_latlon_a_xy(np.array([nodi[i][0]]),
-                                       np.array([nodi[i][1]]))[0][0] for i in node_ids])
-    ys = np.array([_latlon_a_xy(np.array([nodi[i][0]]),
-                                np.array([nodi[i][1]]))[1][0] for i in node_ids])
-    pts = np.column_stack([coords_xy, ys])
+    _lat_nodi = np.array([nodi[i][0] for i in node_ids], dtype=float)
+    _lon_nodi = np.array([nodi[i][1] for i in node_ids], dtype=float)
+    _x_nodi, _y_nodi = _latlon_a_xy(_lat_nodi, _lon_nodi)
+    pts = np.column_stack([_x_nodi, _y_nodi])
     kd = cKDTree(pts)
     return {"nodi": nodi, "strade": strade, "kd": kd,
             "node_ids": node_ids, "pts_xy": pts}, None
@@ -732,6 +744,63 @@ def cop_singola(T_src, T_mand, eta, lift_min_K=8.0, cop_max=6.5):
     lift = np.maximum(Th - Tc, lift_min_K)
     cop = eta * Th / lift
     return np.minimum(cop, cop_max)
+
+
+# =============================================================================
+# DIMENSIONAMENTO IDRAULICO DELLE CONDOTTE
+# =============================================================================
+# Serie DN commerciale per tubazioni preisolate di teleriscaldamento, con
+# diametro interno indicativo (mm) del tubo di servizio in acciaio.
+SERIE_DN = [
+    (20, 21.7), (25, 28.5), (32, 37.2), (40, 43.1), (50, 54.5),
+    (65, 70.3), (80, 82.5), (100, 107.1), (125, 132.5), (150, 159.3),
+    (200, 210.1), (250, 263.0), (300, 312.7), (350, 344.4), (400, 393.8),
+    (450, 444.6), (500, 495.4), (600, 595.8),
+]
+CP_ACQUA_KJ_KG_K = 4.186
+RHO_ACQUA_KG_M3 = 977.0        # ~70 C, valore medio mandata/ritorno
+
+
+def dimensiona_dn(potenza_kw, dT_K, v_max_m_s=1.5):
+    """Diametro nominale della condotta a partire dalla potenza trasportata.
+
+    Q = m_punto * cp * dT  ->  portata massica
+    A = V_punto / v        ->  sezione, quindi diametro
+
+    Args:
+        potenza_kw: potenza termica di picco che attraversa il tratto (kW)
+        dT_K: salto termico mandata-ritorno (K)
+        v_max_m_s: velocita' massima ammessa. Riferimenti QM/Verenum:
+                   0,5-1,0 allacci d'utenza; 1,0-2,0 distribuzione;
+                   2,0-3,0 dorsali di trasporto.
+
+    Ritorna: (DN, diametro_interno_mm, velocita_effettiva_m_s, portata_m3_h)
+    Se la potenza e' nulla ritorna (0, 0, 0, 0).
+    """
+    if potenza_kw <= 0 or dT_K <= 0:
+        return 0, 0.0, 0.0, 0.0
+    m_punto = potenza_kw / (CP_ACQUA_KJ_KG_K * dT_K)          # kg/s
+    v_punto = m_punto / RHO_ACQUA_KG_M3                        # m3/s
+    area_min = v_punto / v_max_m_s                             # m2
+    d_min_mm = np.sqrt(4.0 * area_min / np.pi) * 1000.0
+    for dn, d_int in SERIE_DN:
+        if d_int >= d_min_mm:
+            area_reale = np.pi * (d_int / 1000.0) ** 2 / 4.0
+            return dn, d_int, v_punto / area_reale, v_punto * 3600.0
+    dn, d_int = SERIE_DN[-1]
+    area_reale = np.pi * (d_int / 1000.0) ** 2 / 4.0
+    return dn, d_int, v_punto / area_reale, v_punto * 3600.0
+
+
+def potenza_da_energia(mwh_anno, ore_equivalenti=1900.0, f_contemporaneita=1.0):
+    """Potenza di picco stimata (kW) da energia annua (MWh).
+
+    ore_equivalenti: ore di funzionamento a pieno carico. Per il riscaldamento
+    residenziale in clima alpino/prealpino 1.700-2.200 h/a e' il campo tipico.
+    """
+    if ore_equivalenti <= 0:
+        return 0.0
+    return mwh_anno * 1000.0 / ore_equivalenti * f_contemporaneita
 
 
 def crf(rate, anni):
@@ -1466,9 +1535,23 @@ with tab_domanda:
             "Mesi", options=list(range(1, 13)), value=(1, 12),
             format_func=lambda m: MONTH_NAMES[m - 1], key="dom_mesi")
 
+    # ------------------------------------------------------------------
+    # Selezione per SINGOLO edificio pubblico.
+    # Le checkbox vere sono disegnate piu sotto (area centrale), qui leggo
+    # il loro stato da session_state: al primo giro non esiste ancora e il
+    # default e' "tutti attivi".
+    # ------------------------------------------------------------------
+    _pub_candidati = buildings[(buildings["tipo_utenza"] == "Pubblico")
+                               & buildings["cluster"].isin(selected_clusters)
+                               & buildings["tipologia"].isin(selected_tip)].copy()
+    _pub_candidati = _pub_candidati.sort_values("consumo_annuo_MWh", ascending=False)
+    _pub_scelti = [e for e in _pub_candidati["edificio"]
+                   if st.session_state.get(f"dom_ed_{e}", True)]
+    st.session_state["_dom_pub_scelti"] = _pub_scelti
+
     mask_building = (buildings["cluster"].isin(selected_clusters)
                      & (((buildings["tipo_utenza"] == "Pubblico") & pub_on
-                         & buildings["tipologia"].isin(selected_tip))
+                         & buildings["edificio"].isin(_pub_scelti))
                         | buildings["edificio"].isin(selected_privati)))
     selected_buildings = buildings.loc[mask_building, "edificio"].tolist()
 
@@ -1771,6 +1854,41 @@ with tab_domanda:
                                         "unita": "Unità"}).sort_values(["Zona", "Unità"],
                                                                             ascending=[True, False])
             st.dataframe(_tab, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("##### \U0001F3DB\ufe0f Edifici pubblici della dorsale")
+        st.caption("Spunta gli edifici che la **dorsale principale** deve raggiungere. "
+                   "Il tracciato viene ricostruito su questa selezione; condomini e privati "
+                   "si agganciano poi come rami secondari.")
+
+        if _pub_candidati.empty:
+            st.info("Nessun edificio pubblico nelle zone selezionate.")
+        else:
+            _bs1, _bs2, _bs3 = st.columns([1, 1, 3])
+            if _bs1.button("Seleziona tutti", key="dom_ed_all", use_container_width=True):
+                for _e in _pub_candidati["edificio"]:
+                    st.session_state[f"dom_ed_{_e}"] = True
+                st.rerun()
+            if _bs2.button("Deseleziona tutti", key="dom_ed_none", use_container_width=True):
+                for _e in _pub_candidati["edificio"]:
+                    st.session_state[f"dom_ed_{_e}"] = False
+                st.rerun()
+            _mwh_sel = float(_pub_candidati[_pub_candidati["edificio"].isin(_pub_scelti)]
+                             ["consumo_annuo_MWh"].sum())
+            _bs3.caption(f"**{len(_pub_scelti)}** di {len(_pub_candidati)} edifici selezionati "
+                         f"· **{_mwh_sel:,.0f} MWh/a**".replace(",", "."))
+
+            # griglia di checkbox, ordinate per consumo decrescente
+            _ncol = 3
+            _cols_ed = st.columns(_ncol)
+            for _i, _r in enumerate(_pub_candidati.itertuples()):
+                _c = _cols_ed[_i % _ncol]
+                _zona_breve = str(_r.cluster).split(" - ")[0] if _r.cluster else ""
+                _c.checkbox(
+                    f"{_r.edificio} · {_r.consumo_annuo_MWh:,.0f} MWh".replace(",", "."),
+                    value=st.session_state.get(f"dom_ed_{_r.edificio}", True),
+                    key=f"dom_ed_{_r.edificio}",
+                    help=f"{_r.tipologia} · {_zona_breve}")
 
         st.divider()
         st.markdown("##### \U0001F6E4\ufe0f Ipotesi di tracciato della rete")
@@ -2262,6 +2380,57 @@ with tab_domanda:
             elif _dens >= 2.0:
                 st.success(f"\u2705 Densità lineare {_dens:.2f} MWh/(m·a): rete favorevole (QM ≥ 2,0).")
 
+            # ----------------------------------------------------------
+            # DIMENSIONAMENTO DI MASSIMA DELLE CONDOTTE
+            # ----------------------------------------------------------
+            st.markdown("##### \U0001F527 Dimensionamento di massima delle condotte")
+            _dc1, _dc2, _dc3 = st.columns(3)
+            _ore_eq = _dc1.slider("Ore equivalenti a pieno carico (h/a)", 1200, 2600, 1900,
+                                  step=50, key="dom_ore_eq",
+                                  help="Serve a convertire l'energia annua in potenza di picco. "
+                                       "Clima prealpino: 1.700-2.200 h/a tipiche.")
+            _v_max = _dc2.slider("Velocità max acqua (m/s)", 0.5, 3.0, 1.5, step=0.1,
+                                 key="dom_vmax",
+                                 help="QM/Verenum: 0,5-1,0 negli allacci d'utenza; "
+                                      "1,0-2,0 in distribuzione; 2,0-3,0 sulle dorsali.")
+            _dT_rete = max(T_mandata_ideale - T_ritorno_ideale, 1)
+            _dc3.metric("Salto termico rete", f"{_dT_rete} K",
+                        help=f"mandata {T_mandata_ideale}°C - ritorno {T_ritorno_ideale}°C "
+                             f"(impostati in alto a sinistra)")
+
+            # potenza di picco alla partenza della dorsale, con contemporaneita QM
+            _n_ut_dim = max(_n_utenze_tot, 1)
+            _f_sim_rete = coeff_simultaneita_QM(_n_ut_dim)
+            _P_dorsale = potenza_da_energia(_E_tot, _ore_eq, _f_sim_rete)
+            _dn_d, _dint_d, _v_d, _q_d = dimensiona_dn(_P_dorsale, _dT_rete, _v_max)
+
+            _pd1, _pd2, _pd3, _pd4 = st.columns(4)
+            _pd1.metric("Potenza di picco dorsale", f"{_P_dorsale:,.0f} kW".replace(",", "."),
+                        help=f"{_E_tot:,.0f} MWh/a su {_ore_eq} h · contemporaneità {_f_sim_rete:.2f}".replace(",", "."))
+            _pd2.metric("Diametro dorsale", f"DN {_dn_d}",
+                        help=f"diametro interno {_dint_d:.1f} mm")
+            _pd3.metric("Velocità effettiva", f"{_v_d:.2f} m/s")
+            _pd4.metric("Portata", f"{_q_d:,.0f} m³/h".replace(",", "."))
+
+            # tabella per fasce di potenza: utile per capire i rami
+            with st.expander("📐 Diametri per fascia di potenza (stesso ΔT e velocità)"):
+                _righe_dn = []
+                for _quota in [1.0, 0.75, 0.5, 0.25, 0.1]:
+                    _p = _P_dorsale * _quota
+                    _dn, _di, _v, _q = dimensiona_dn(_p, _dT_rete, _v_max)
+                    _righe_dn.append({
+                        "Tratto": f"{_quota*100:.0f}% del carico",
+                        "Potenza (kW)": round(_p),
+                        "DN": _dn,
+                        "D interno (mm)": round(_di, 1),
+                        "Velocità (m/s)": round(_v, 2),
+                        "Portata (m³/h)": round(_q, 1),
+                    })
+                st.dataframe(pd.DataFrame(_righe_dn), use_container_width=True, hide_index=True)
+                st.caption("Dimensionamento indicativo sulla sola velocità. In progetto va "
+                           "verificato anche il gradiente di perdita di carico (QM: indicativamente "
+                           "≤ 100-250 Pa/m) e il bilanciamento idraulico dei rami.")
+
             st.session_state["_rete_info"] = {
                 "lunghezza_m": float(_len_totale),
                 "lunghezza_pubblico_m": float(_len_pub_t),
@@ -2278,6 +2447,11 @@ with tab_domanda:
                 "E_condomini": float(_E_cond),
                 "E_privati": float(_E_priv),
                 "E_totale": float(_E_tot),
+                "P_dorsale_kw": float(_P_dorsale),
+                "dn_dorsale": int(_dn_d),
+                "velocita_m_s": float(_v_d),
+                "portata_m3h": float(_q_d),
+                "ore_equivalenti": int(_ore_eq),
             }
 
             # espongo l'elenco dei privati effettivamente agganciati, per Dimensionamento
@@ -3019,6 +3193,8 @@ with tab_dimensionamento:
         "lunghezza_pubblico_m": round(float(_rete_info.get("lunghezza_pubblico_m", 0.0))),
         "lunghezza_stub_m": round(float(_rete_info.get("lunghezza_stub_m", 0.0))),
         "buffer_m": int(_rete_info.get("buffer_m", 0)),
+        "dn_dorsale": int(_rete_info.get("dn_dorsale", 0)),
+        "P_dorsale_kw": round(float(_rete_info.get("P_dorsale_kw", 0.0))),
         "n_privati_agganciati": int(_rete_info.get("n_privati_agganciati", 0)),
         "densita_lineare": round(_dens_lin, 2),
         "opex_annuo": round(opex),
@@ -3093,6 +3269,8 @@ with tab_confronto:
             ("lunghezza_pubblico_m", "di cui tratto obbligato (m)"),
             ("lunghezza_stub_m", "di cui allacci privati (m)"),
             ("buffer_m", "Buffer privati (m)"),
+            ("dn_dorsale", "DN dorsale"),
+            ("P_dorsale_kw", "Potenza dorsale (kW)"),
             ("n_privati_agganciati", "Privati agganciati"),
             ("tecnologie", "Assetto impianto"),
             ("P_alta_kw", "HP alta T (kW)"),
