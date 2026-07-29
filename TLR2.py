@@ -140,12 +140,43 @@ HOURS_2024 = pd.date_range("2024-01-01", "2024-12-31 23:00", freq="h")
 DAYS_2024 = pd.date_range("2024-01-01", "2024-12-31", freq="D")
 
 AZIENDE_COORD = {
-    "ZML": (46.1478, 12.7139),
-    "Pietro Rosa": (46.1432, 12.7215),
-    "Pandolfo": (46.1485, 12.7160),
-    "Inossman": (46.1501, 12.7145),
+    # Coordinate GPS reali degli stabilimenti (fornite da APE FVG, formato DMS convertito).
+    "Inossman":    (46.154511, 12.722867),  # Via dell'Industria 4, Molino di Campagna
+    "Pietro Rosa": (46.150386, 12.719578),  # Via Ponte Giulio 76, Maniago
+    "ZML":         (46.148400, 12.727597),  # Via dell'Industria 10, Maniago
+    "Pandolfo":    (46.146761, 12.719458),  # Via Ponte Giulio 45, Maniago
 }
-CENTRALE_LAT, CENTRALE_LON = 46.1479, 12.7151
+# Sottocentrale: punto intermedio tra il baricentro delle aziende sorgente e
+# il baricentro degli edifici pubblici serviti. E' un compromesso tra la
+# vicinanza alle fonti di calore e la distribuzione all'utenza.
+# Il valore hardcoded qui e' un fallback quando gli edifici non sono ancora
+# stati caricati; nel tab Domanda viene ricalcolato dinamicamente.
+_LAT_BAR_AZIENDE = sum(v[0] for v in AZIENDE_COORD.values()) / len(AZIENDE_COORD)
+_LON_BAR_AZIENDE = sum(v[1] for v in AZIENDE_COORD.values()) / len(AZIENDE_COORD)
+CENTRALE_LAT, CENTRALE_LON = 46.149000, 46.149000  # placeholder, ricalcolato
+
+# Distanza massima ammessa tra un edificio e il nodo stradale piu vicino del
+# grafo OSM. Oltre questa soglia l'edificio non viene considerato agganciabile:
+# senza il limite, edifici in zone con copertura stradale rada producevano
+# allacci rettilinei lunghi centinaia di metri che tagliavano l'abitato.
+MAX_SNAP_M = 120.0
+
+def calcola_sottocentrale(bmap_df):
+    """Calcola la sottocentrale come punto intermedio tra il baricentro
+    delle 4 aziende sorgente e il baricentro degli edifici pubblici passati.
+
+    Se bmap_df e' vuoto, ritorna il baricentro delle aziende (nessun utente
+    da servire -> la centrale sta comunque dove sono le fonti).
+    """
+    if bmap_df is None or bmap_df.empty:
+        return _LAT_BAR_AZIENDE, _LON_BAR_AZIENDE
+    _lat_pub = float(bmap_df["lat"].mean())
+    _lon_pub = float(bmap_df["lon"].mean())
+    return ((_LAT_BAR_AZIENDE + _lat_pub) / 2,
+            (_LON_BAR_AZIENDE + _lon_pub) / 2)
+
+# Valori di default globali (usati prima che il tab Domanda ne calcoli di aggiornati)
+CENTRALE_LAT, CENTRALE_LON = _LAT_BAR_AZIENDE, _LON_BAR_AZIENDE
 
 
 # =============================================================================
@@ -1743,12 +1774,23 @@ with tab_domanda:
 
         st.divider()
         st.markdown("##### \U0001F6E4\ufe0f Ipotesi di tracciato della rete")
+
+        # SOTTOCENTRALE: ricalcolo dinamico come punto intermedio tra baricentro
+        # aziende e baricentro pubblici selezionati (override delle costanti
+        # globali di modulo, valide solo dentro questa sezione).
+        CENTRALE_LAT, CENTRALE_LON = calcola_sottocentrale(bmap)
+
         st.caption(f"Rete progettata in **2 tempi**: prima il tratto *obbligato* che collega la "
                    f"**sottocentrale** ({CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}) agli **edifici pubblici** "
                    f"e ai **condomini censiti** selezionati; poi i **privati** vengono agganciati "
                    f"solo se cadono entro un raggio dal tubo pubblico. "
                    f"**Zone senza pubblici** (es. Zona 3) possono essere agganciate in modo "
                    f"opportunistico se il tubo di altre zone ci passa vicino.")
+        st.caption(f"\U0001F4CD **Posizione sottocentrale**: punto intermedio tra il baricentro "
+                   f"delle 4 aziende sorgente ({_LAT_BAR_AZIENDE:.4f}, {_LON_BAR_AZIENDE:.4f}) "
+                   f"e il baricentro degli edifici pubblici serviti. Si sposta dinamicamente al "
+                   f"variare della selezione. Va confermata in fase di progetto in base agli "
+                   f"spazi disponibili, all'antigelo del ground loop e ai vincoli urbanistici.")
 
         # --- 1. Tratto obbligato: pubblici + condomini censiti (opzione B) ---
         _pts_obb = []
@@ -1798,7 +1840,7 @@ with tab_domanda:
                      "`maniago_strade_cache.json`. Se disattivato o se il download fallisce, "
                      "si usa l'MST in linea d'aria con tortuosita.")
 
-            _strade_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=1.8) if usa_strade else (None, None)
+            _strade_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=2.5) if usa_strade else (None, None)
             _strade, _osm_err = _strade_res if isinstance(_strade_res, tuple) else (_strade_res, None)
             _uso_osm = _strade is not None
             if usa_strade and not _uso_osm:
@@ -1822,13 +1864,32 @@ with tab_domanda:
                 _lon_obb = np.concatenate([[CENTRALE_LON], _obb["lon"].values])
                 _nodi_obb, _dsnap_obb = snap_a_strade(_lat_obb, _lon_obb, _strade)
                 _rad_nodo = _nodi_obb[0]
-                _target_nodi = _nodi_obb[1:]
+
+                # LIMITE DI SNAP: se un edificio dista piu di MAX_SNAP_M dal nodo
+                # stradale piu vicino del grafo OSM, non lo consideriamo agganciabile.
+                # Senza questo controllo, edifici in zone con copertura OSM rada
+                # producevano rette lunghe centinaia di metri che tagliavano l'abitato.
+                _fuori_portata = []
+                _target_nodi = []
+                for i in range(len(_obb)):
+                    if float(_dsnap_obb[i + 1]) <= MAX_SNAP_M:
+                        _target_nodi.append(_nodi_obb[i + 1])
+                    else:
+                        _fuori_portata.append({
+                            "edificio": _obb["edificio"].iloc[i] if "edificio" in _obb.columns else f"edif {i}",
+                            "tipo": _obb["tipo"].iloc[i] if "tipo" in _obb.columns else "?",
+                            "MWh/a": round(float(_obb["consumo_annuo_MWh"].iloc[i]), 1)
+                                     if "consumo_annuo_MWh" in _obb.columns else 0.0,
+                            "dist. strada (m)": round(float(_dsnap_obb[i + 1])),
+                        })
 
                 # mappa nodo_stradale -> MWh dell'edificio agganciato (per la potatura).
                 # Se piu edifici snappano sullo stesso nodo, sommo i loro MWh.
                 _mwh_per_target = {}
                 _label_per_target = {}
                 for i in range(len(_obb)):
+                    if float(_dsnap_obb[i + 1]) > MAX_SNAP_M:
+                        continue
                     _n = _nodi_obb[i + 1]
                     _mwh = float(_obb["consumo_annuo_MWh"].iloc[i]) if "consumo_annuo_MWh" in _obb.columns else 0.0
                     _mwh_per_target[_n] = _mwh_per_target.get(_n, 0.0) + _mwh
@@ -1846,28 +1907,33 @@ with tab_domanda:
                 _archi_pub = archi_a_coords(_archi_G, _strade)
 
                 # linee "ultimo metro" solo per gli edifici EFFETTIVAMENTE serviti
+                # e comunque entro il limite di snap.
                 _um_lat, _um_lon = [], []
                 _len_ultimi = 0.0
                 _obb_servi_mask = []
                 _obb_esclusi_info = []
                 for i in range(len(_obb)):
                     _n = _nodi_obb[i + 1]
+                    _d_snap = float(_dsnap_obb[i + 1])
                     _lat_ed = float(_obb["lat"].iloc[i])
                     _lon_ed = float(_obb["lon"].iloc[i])
                     _lab = _obb["edificio"].iloc[i] if "edificio" in _obb.columns else f"edif {i}"
                     _mwh = float(_obb["consumo_annuo_MWh"].iloc[i]) if "consumo_annuo_MWh" in _obb.columns else 0.0
                     _tipo = _obb["tipo"].iloc[i] if "tipo" in _obb.columns else "?"
-                    if _n in _target_servi:
+                    if _d_snap <= MAX_SNAP_M and _n in _target_servi:
                         _lat_n, _lon_n = _strade["nodi"][_n]
                         _um_lat += [_lat_ed, _lat_n, None]
                         _um_lon += [_lon_ed, _lon_n, None]
-                        _len_ultimi += float(_dsnap_obb[i + 1])
+                        _len_ultimi += _d_snap
                         _obb_servi_mask.append(True)
                     else:
                         _obb_servi_mask.append(False)
+                        _motivo = ("fuori portata rete stradale" if _d_snap > MAX_SNAP_M
+                                   else "sotto soglia densità")
                         _obb_esclusi_info.append({"edificio": _lab,
                                                   "tipo": _tipo,
                                                   "MWh/a": round(_mwh, 1),
+                                                  "motivo": _motivo,
                                                   "lat": _lat_ed, "lon": _lon_ed})
                 _len_pub_t = _len_pub_osm + _len_ultimi
             else:
@@ -1901,7 +1967,14 @@ with tab_domanda:
                             _nodi_pv, _dsnap_pv = snap_a_strade(_lat_pv, _lon_pv, _strade)
                             _lat_stub_flat, _lon_stub_flat = [], []
                             _len_stub_m = 0.0
+                            _priv_ok = []          # indici dei privati effettivamente agganciabili
+                            _n_priv_fuori_snap = 0
                             for i in range(len(_priv_in)):
+                                # scarto i privati troppo lontani dalla rete stradale:
+                                # tracciarli produrrebbe rette lunghe e prive di senso
+                                if float(_dsnap_pv[i]) > MAX_SNAP_M:
+                                    _n_priv_fuori_snap += 1
+                                    continue
                                 # ultimo metro edificio -> nodo stradale
                                 _n = _nodi_pv[i]
                                 _lat_n, _lon_n = _strade["nodi"][_n]
@@ -1917,6 +1990,10 @@ with tab_domanda:
                                     _lat_stub_flat += [_la1, _la2, None]
                                     _lon_stub_flat += [_lo1, _lo2, None]
                                 _len_stub_m += _stub_len
+                                _priv_ok.append(i)
+                            # tengo solo i privati davvero collegati
+                            if _n_priv_fuori_snap > 0:
+                                _priv_in = _priv_in.iloc[_priv_ok].copy()
                             _stub_lat_l = _lat_stub_flat
                             _stub_lon_l = _lon_stub_flat
                             _len_stub_t = _len_stub_m
@@ -2052,26 +2129,58 @@ with tab_domanda:
                 lat=[CENTRALE_LAT], lon=[CENTRALE_LON], mode="markers+text", name="Sottocentrale",
                 marker=dict(size=18, color="#FF9F1C"), text=["CENTRALE"], textposition="top right",
                 textfont=dict(size=13, color="#FF9F1C")))
-            _clat = (float(_obb["lat"].mean()) + CENTRALE_LAT) / 2
-            _clon = (float(_obb["lon"].mean()) + CENTRALE_LON) / 2
+            # Centraggio mappa: includo la sottocentrale, gli edifici obbligati
+            # e le 4 aziende sorgente (che stanno nella zona industriale, spesso
+            # a est del centro urbano). Zoom out sufficiente per vederli tutti.
+            _lat_all = list(_obb["lat"].values) + [CENTRALE_LAT]
+            _lon_all = list(_obb["lon"].values) + [CENTRALE_LON]
+            for _la, _lo in AZIENDE_COORD.values():
+                _lat_all.append(_la)
+                _lon_all.append(_lo)
+            _clat = (min(_lat_all) + max(_lat_all)) / 2
+            _clon = (min(_lon_all) + max(_lon_all)) / 2
+            # zoom in base all'estensione spaziale
+            _span_lat = max(_lat_all) - min(_lat_all)
+            _span_lon = max(_lon_all) - min(_lon_all)
+            _span = max(_span_lat, _span_lon)
+            if _span > 0.025:
+                _zoom = 12.5
+            elif _span > 0.015:
+                _zoom = 13.0
+            else:
+                _zoom = 13.5
             fig_tr.update_layout(mapbox=dict(style="open-street-map",
-                                             center=dict(lat=_clat, lon=_clon), zoom=13.5),
+                                             center=dict(lat=_clat, lon=_clon), zoom=_zoom),
                                  height=580, margin=dict(t=10, b=0, l=0, r=0),
                                  legend=dict(orientation="h", yanchor="bottom", y=1.01))
             st.plotly_chart(fig_tr, use_container_width=True)
 
-            # --- pannello edifici esclusi dalla soglia di densita' ---
+            # --- pannello edifici esclusi (soglia densita' o fuori portata) ---
             if _uso_osm and _obb_esclusi_info:
                 _tot_mwh_escl = sum(r["MWh/a"] for r in _obb_esclusi_info)
+                _n_soglia = sum(1 for r in _obb_esclusi_info
+                                if r.get("motivo") == "sotto soglia densità")
+                _n_fuori = sum(1 for r in _obb_esclusi_info
+                               if r.get("motivo") == "fuori portata rete stradale")
+                _righe_msg = []
+                if _n_soglia:
+                    _righe_msg.append(
+                        f"**{_n_soglia}** per densità del ramo < {soglia_dens:.1f} MWh/(m·a) "
+                        f"(il tubo per servirli costerebbe più metri di quanto rendono)")
+                if _n_fuori:
+                    _righe_msg.append(
+                        f"**{_n_fuori}** perché distano oltre {MAX_SNAP_M:.0f} m dalla rete "
+                        f"stradale mappata (coordinate imprecise o zona non coperta da OSM)")
                 st.warning(
-                    f"⛔ **{len(_obb_esclusi_info)} edifici esclusi dalla rete** per soglia densità "
-                    f"< {soglia_dens:.1f} MWh/(m·a): il ramo per servirli sarebbe troppo lungo "
-                    f"per il calore che portano. Potenziale non allacciato: "
-                    f"**{_tot_mwh_escl:.0f} MWh/a**. Andrebbero serviti localmente."
+                    f"⛔ **{len(_obb_esclusi_info)} edifici esclusi dalla rete**: "
+                    + "; ".join(_righe_msg)
+                    + f". Potenziale non allacciato: **{_tot_mwh_escl:.0f} MWh/a**."
                 )
                 with st.expander(f"📋 Dettaglio {len(_obb_esclusi_info)} edifici esclusi"):
                     _df_esc = pd.DataFrame(_obb_esclusi_info)
-                    st.dataframe(_df_esc, use_container_width=True, hide_index=True)
+                    _cols = [c for c in ["edificio", "tipo", "MWh/a", "motivo",
+                                         "dist. strada (m)"] if c in _df_esc.columns]
+                    st.dataframe(_df_esc[_cols], use_container_width=True, hide_index=True)
 
             # --- energia servita ---
             # Energia SERVITA: escludo gli edifici potati dalla soglia densita'.
