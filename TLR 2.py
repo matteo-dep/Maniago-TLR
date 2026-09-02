@@ -28,6 +28,10 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P13 Flusso guidato in 4 passi nel dimensionamento, distinzione fra
+     "dimensiona" (ricerca automatica) e "calcola" (taglie imposte),
+     tetto ai volumi di accumulo, schema di massima dell'impianto in SVG
+     e scheda PDF di confronto degli scenari.
  P12 Pannelli solari ibridi PVT (Abora aH72 M2): resa termica ed elettrica
      calcolata ora per ora dai parametri certificati EN ISO 9806 (eta0, a1, a2)
      e dal modello NOCT, con la temperatura del fluido come variabile. L'energia
@@ -913,6 +917,195 @@ def dimensiona_dn(potenza_kw, dT_K, v_max_m_s=1.5):
     return dn, d_int, v_punto / area_reale, v_punto * 3600.0
 
 
+# =============================================================================
+# SCHEMA DI MASSIMA DELL'IMPIANTO
+# =============================================================================
+def schema_impianto_svg(cfg):
+    """Schema a blocchi dell'impianto dimensionato, in SVG.
+
+    Riproduce l'architettura a cascata: collettore dei flussi di scarto,
+    tre accumuli ai rispettivi livelli termici, le due pompe di calore con
+    evaporatore e condensatore, l'eventuale caldaia di supporto e la
+    mandata/ritorno verso la rete. Le taglie riportate sono quelle
+    effettivamente impostate nel dimensionamento.
+
+    cfg: dizionario con le chiavi usate sotto (tutte opzionali salvo le
+    temperature). Ritorna una stringa SVG.
+    """
+    T_mand = cfg.get("T_mandata", 80)
+    T_rit = cfg.get("T_ritorno", 50)
+    T_int = cfg.get("T_int", 50)
+    P_alta = cfg.get("P_alta_kw", 0)
+    P_bassa = cfg.get("P_bassa_kw", 0)
+    P_bk = cfg.get("P_backup_kw", 0)
+    tipo_bk = cfg.get("backup_tipo", "gas")
+    V_hot = cfg.get("V_hot", 0)
+    V_int = cfg.get("V_int", 0)
+    V_low = cfg.get("V_low", 0)
+    E_hot = cfg.get("E_hot", 0.0)
+    E_alta = cfg.get("E_alta", 0.0)
+    E_bassa = cfg.get("E_bassa", 0.0)
+    E_bk = cfg.get("E_backup", 0.0)
+    E_ground = cfg.get("E_ground", 0.0)
+    cop_a = cfg.get("cop_alta", 0.0)
+    cop_b = cfg.get("cop_bassa", 0.0)
+    dn = cfg.get("dn_dorsale", 0)
+    flussi_caldo = cfg.get("flussi_caldo", [])
+    flussi_int = cfg.get("flussi_int", [])
+    flussi_basso = cfg.get("flussi_basso", [])
+    solare_on = cfg.get("solare_on", False)
+    is_hp = (P_bassa > 0)
+
+    C_ACC = "#2D7DC0"
+    C_CALDO = "#C0522D"
+    C_HP = "#22C3DD"
+    C_HPB = "#B57EDC"
+    C_BK = "#FF9F1C"
+    C_TXT = "#E8E8E8"
+    C_LIN = "#9AA0A6"
+    C_SOL = "#F5C518"
+
+    p = []
+    a = p.append
+    a('<svg viewBox="0 0 1180 520" xmlns="http://www.w3.org/2000/svg" '
+      'style="background:#111418;font-family:system-ui,sans-serif">')
+    a('<defs><marker id="fr" markerWidth="9" markerHeight="7" refX="8" refY="3.5" '
+      f'orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="{C_LIN}"/></marker>'
+      '<marker id="frc" markerWidth="9" markerHeight="7" refX="8" refY="3.5" '
+      f'orient="auto"><polygon points="0 0, 9 3.5, 0 7" fill="{C_CALDO}"/></marker>'
+      '</defs>')
+
+    def txt(x, y, s, size=11, col=C_TXT, anchor="middle", weight="normal"):
+        s = (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+        a(f'<text x="{x}" y="{y}" font-size="{size}" fill="{col}" '
+          f'text-anchor="{anchor}" font-weight="{weight}">{s}</text>')
+
+    def cilindro(x, y, w, h, col, titolo, sotto1="", sotto2=""):
+        """Accumulo disegnato come serbatoio cilindrico."""
+        ry = 11
+        a(f'<path d="M{x} {y+ry} a{w/2} {ry} 0 0 1 {w} 0 v{h} a{w/2} {ry} 0 0 1 -{w} 0 z" '
+          f'fill="{col}" fill-opacity="0.30" stroke="{col}" stroke-width="2"/>')
+        a(f'<ellipse cx="{x+w/2}" cy="{y+ry}" rx="{w/2}" ry="{ry}" '
+          f'fill="{col}" fill-opacity="0.55" stroke="{col}" stroke-width="2"/>')
+        txt(x + w / 2, y + ry + 26, titolo, 12, "#FFFFFF", weight="bold")
+        if sotto1:
+            txt(x + w / 2, y + ry + 45, sotto1, 11)
+        if sotto2:
+            txt(x + w / 2, y + ry + 62, sotto2, 10, C_LIN)
+
+    def blocco(x, y, w, h, col, t1, t2="", t3=""):
+        a(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="6" '
+          f'fill="{col}" fill-opacity="0.22" stroke="{col}" stroke-width="2"/>')
+        txt(x + w / 2, y + 20, t1, 12, "#FFFFFF", weight="bold")
+        if t2:
+            txt(x + w / 2, y + 38, t2, 11)
+        if t3:
+            txt(x + w / 2, y + 54, t3, 10, C_LIN)
+
+    def linea(x1, y1, x2, y2, col=C_LIN, w=2, tratteggio=None, freccia=True):
+        d = f' stroke-dasharray="{tratteggio}"' if tratteggio else ""
+        m = ' marker-end="url(#fr)"' if freccia and col == C_LIN else (
+            ' marker-end="url(#frc)"' if freccia else "")
+        a(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{col}" '
+          f'stroke-width="{w}"{d}{m}/>')
+
+    # ---- intestazione
+    txt(590, 26, "Schema di massima dell'impianto", 16, "#FFFFFF", weight="bold")
+    txt(590, 46, f"mandata {T_mand} °C · ritorno {T_rit} °C · anello intermedio {T_int} °C",
+        11, C_LIN)
+
+    # ---- colonna sinistra: flussi in ingresso
+    txt(62, 76, "Flussi di scarto", 12, "#FFFFFF", weight="bold")
+    y0 = 100
+    for i, (nome, temp) in enumerate(flussi_caldo[:2]):
+        txt(62, y0 + i * 17, f"{nome} · {temp:.0f} °C", 10, C_CALDO)
+    y1 = y0 + max(len(flussi_caldo[:2]), 0) * 17 + 8
+    for i, (nome, temp) in enumerate(flussi_int[:3]):
+        txt(62, y1 + i * 17, f"{nome} · {temp:.0f} °C", 10, C_HP)
+    y2 = y1 + max(len(flussi_int[:3]), 0) * 17 + 8
+    for i, (nome, temp) in enumerate(flussi_basso[:3]):
+        txt(62, y2 + i * 17, f"{nome} · {temp:.0f} °C", 10, C_HPB)
+    if solare_on:
+        txt(62, y2 + max(len(flussi_basso[:3]), 0) * 17 + 20, "☀ solare", 10, C_SOL)
+
+    # ---- accumulo BASSO
+    cilindro(150, 300, 130, 90, C_HPB, "Accumulo BASSO",
+             f"{V_low:.0f} m³" if V_low else "assente",
+             f"< {T_int} °C")
+    linea(128, 345, 148, 345)
+
+    # ---- ground loop
+    if is_hp:
+        a(f'<rect x="150" y="440" width="130" height="46" rx="6" fill="#8C6D46" '
+          f'fill-opacity="0.22" stroke="#8C6D46" stroke-width="2"/>')
+        txt(215, 460, "Ground loop", 11, "#FFFFFF", weight="bold")
+        txt(215, 477, f"{E_ground:,.0f} MWh/a".replace(",", "."), 10, C_LIN)
+        linea(215, 438, 215, 400, "#8C6D46")
+
+    # ---- HP bassa T
+    if is_hp:
+        blocco(330, 310, 118, 70, C_HPB, "HP bassa T",
+               f"{P_bassa:.0f} kW",
+               f"COP {cop_b:.1f} · {E_bassa:,.0f} MWh/a".replace(",", "."))
+        linea(282, 345, 328, 345)
+        a(f'<path d="M448 345 H 500 V 300" stroke="{C_LIN}" stroke-width="2" '
+          f'fill="none" marker-end="url(#fr)"/>')
+    else:
+        txt(389, 340, "HP bassa T", 11, C_LIN)
+        txt(389, 357, "non prevista", 10, C_LIN)
+        a(f'<line x1="282" y1="345" x2="470" y2="345" stroke="{C_LIN}" '
+          f'stroke-width="1.5" stroke-dasharray="4 4" opacity="0.4"/>')
+
+    # ---- accumulo INTERMEDIO
+    cilindro(500, 190, 140, 100, C_ACC, "Accumulo INTERMEDIO",
+             f"{V_int:.0f} m³" if V_int else "assente",
+             f"{T_int} °C")
+    linea(128, 232, 498, 232)
+    txt(300, 224, "flussi tra " + f"{T_int} e {T_mand} °C", 10, C_HP, anchor="middle")
+
+    # ---- HP alta T
+    blocco(700, 200, 118, 74, C_HP, "HP alta T",
+           f"{P_alta:.0f} kW",
+           f"COP {cop_a:.1f} · {E_alta:,.0f} MWh/a".replace(",", "."))
+    linea(642, 237, 698, 237)
+    txt(670, 229, "evap.", 9, C_LIN)
+    linea(818, 237, 880, 237)
+    txt(850, 229, "cond.", 9, C_LIN)
+
+    # ---- caldaia di supporto
+    if not is_hp and P_bk > 0:
+        blocco(700, 330, 118, 74, C_BK, f"Caldaia {tipo_bk}",
+               f"{P_bk:.0f} kW",
+               f"{E_bk:,.0f} MWh/a".replace(",", "."))
+        linea(818, 367, 940, 367)
+        linea(940, 367, 940, 300)
+
+    # ---- accumulo CALDO
+    cilindro(880, 150, 140, 110, C_CALDO, "Accumulo CALDO",
+             f"{V_hot:.0f} m³" if V_hot else "assente",
+             f"{T_mand} °C")
+    # uso diretto dello scarto sopra mandata
+    if E_hot > 0:
+        a(f'<path d="M128 118 H 950 V 148" stroke="{C_CALDO}" stroke-width="2.5" '
+          f'fill="none" marker-end="url(#frc)"/>')
+        txt(520, 110, f"uso diretto: scarto ≥ {T_mand} °C  ·  "
+                      f"{E_hot:,.0f} MWh/a".replace(",", "."), 11, C_CALDO)
+
+    # ---- mandata e ritorno rete
+    a(f'<path d="M1020 205 H 1125" stroke="{C_CALDO}" stroke-width="5" '
+      f'fill="none" marker-end="url(#frc)"/>')
+    txt(1072, 196, f"mandata {T_mand} °C", 10, C_CALDO)
+    if dn:
+        txt(1072, 228, f"DN {dn}", 12, "#FFFFFF", weight="bold")
+    # il ritorno rientra sull'accumulo intermedio (recupero del residuo termico)
+    a(f'<path d="M1125 445 H 570 V 302" stroke="#2D7DC0" stroke-width="4" fill="none" '
+      f'marker-end="url(#fr)"/>')
+    txt(850, 437, f"ritorno dalla rete {T_rit} °C", 10, "#2D7DC0")
+
+    a('</svg>')
+    return "\n".join(p)
+
+
 def potenza_da_energia(mwh_anno, ore_equivalenti=1900.0, f_contemporaneita=1.0):
     """Potenza di picco stimata (kW) da energia annua (MWh).
 
@@ -1319,10 +1512,22 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
         P_bassa = 0.0
         P_bk = picco_kw
 
+    # Tetto ai volumi: oltre una certa taglia un serbatoio non e' piu' un
+    # componente di centrale ma un'opera civile a se', con costi e ingombri
+    # di altra natura. Il limite e' impostabile dall'utente.
+    v_max = float(kwargs.get("v_max_m3", 2000.0))
+
+    def _griglia(vmax, n=6):
+        """Volumi candidati fino a vmax, piu' fitti sui valori piccoli."""
+        if vmax <= 0:
+            return [0.0]
+        passi = np.unique(np.round(np.geomspace(50.0, max(vmax, 100.0), n) / 50.0) * 50.0)
+        return [0.0] + [float(v) for v in passi if v <= vmax]
+
     ha_hot = float(q_hot_arr.sum()) > 1e-6
-    v_hot_cands = [0.0, 300.0, 800.0] if ha_hot else [0.0]
-    v_int_cands = [0.0, 400.0, 800.0, 1500.0]
-    v_low_cands = [0.0, 400.0, 800.0] if is_hp else [0.0]
+    v_hot_cands = _griglia(v_max) if ha_hot else [0.0]
+    v_int_cands = _griglia(v_max)
+    v_low_cands = _griglia(v_max) if is_hp else [0.0]
 
     def _valuta(v_hot, v_int, v_low):
         r = dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
@@ -1694,6 +1899,164 @@ def genera_offerta_solare(pvgis_df, area_m2, efficienza):
 # =============================================================================
 # ECONOMIA
 # =============================================================================
+# =============================================================================
+# SCHEDA PDF DI CONFRONTO SCENARI
+# =============================================================================
+def genera_pdf_scenari(scenari, titolo="Confronto scenari"):
+    """Scheda PDF sinottica degli scenari salvati.
+
+    Ritorna i byte del PDF, oppure None se reportlab non e' disponibile.
+    Il formato e' orizzontale per far stare piu' scenari affiancati.
+    """
+    try:
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib import colors
+        from reportlab.lib.units import mm
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
+                                        Paragraph, Spacer)
+    except ImportError:
+        return None
+    import io
+    from datetime import date
+
+    if not scenari:
+        return None
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
+                            leftMargin=14 * mm, rightMargin=14 * mm,
+                            topMargin=12 * mm, bottomMargin=12 * mm,
+                            title=titolo, author="APE FVG - Interreg HEAT 35")
+    ss = getSampleStyleSheet()
+    h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=16, spaceAfter=2)
+    sub = ParagraphStyle("sub", parent=ss["Normal"], fontSize=8,
+                         textColor=colors.HexColor("#666666"))
+    sez = ParagraphStyle("sez", parent=ss["Normal"], fontSize=9,
+                         textColor=colors.HexColor("#1B4F72"), spaceBefore=6)
+    note = ParagraphStyle("note", parent=ss["Normal"], fontSize=7,
+                          textColor=colors.HexColor("#666666"), leading=9)
+
+    el = [Paragraph("Maniago · rete di teleriscaldamento", h1),
+          Paragraph(f"{titolo} — {len(scenari)} scenari a confronto · "
+                    f"elaborato il {date.today():%d/%m/%Y} · "
+                    f"progetto Interreg HEAT 35, APE FVG", sub),
+          Spacer(1, 6)]
+
+    nomi = list(scenari.keys())
+
+    # Le righe sono raggruppate per tema: cosi' la scheda si legge per blocchi
+    # invece che come un elenco piatto di numeri.
+    gruppi = [
+        ("Utenza e rete", [
+            ("carico_utenze_mwh", "Calore venduto", "MWh/a", 0),
+            ("carico_centrale_mwh", "Calore prodotto in centrale", "MWh/a", 0),
+            ("perdite_rete_pct", "Perdite di rete", "%", 1),
+            ("lunghezza_rete_m", "Lunghezza rete", "m", 0),
+            ("densita_lineare", "Densità lineare", "MWh/(m·a)", 2),
+            ("picco_dim_kw", "Picco di dimensionamento", "kW", 0),
+            ("dn_dorsale", "Diametro dorsale", "DN", 0),
+        ]),
+        ("Impianto", [
+            ("tecnologie", "Assetto", "", None),
+            ("P_alta_kw", "HP alta temperatura", "kW", 0),
+            ("P_bassa_kw", "HP bassa temperatura", "kW", 0),
+            ("P_backup_kw", "Caldaia di supporto", "kW", 0),
+            ("V_hot", "Accumulo caldo", "mc", 0),
+            ("V_int", "Accumulo intermedio", "mc", 0),
+            ("V_low", "Accumulo basso", "mc", 0),
+        ]),
+        ("Bilancio energetico", [
+            ("E_hot_diretto", "Scarto usato direttamente", "MWh/a", 0),
+            ("E_hp_alta", "Consegnato da HP alta T", "MWh/a", 0),
+            ("E_backup", "Da combustibile", "MWh/a", 0),
+            ("E_elettrica", "Elettricità assorbita", "MWh/a", 0),
+            ("cop_alta", "COP medio HP alta T", "", 2),
+            ("spf_sistema", "SPF di sistema", "", 2),
+            ("ore_non_coperte", "Ore non coperte", "h", 0),
+        ]),
+        ("Sostenibilità", [
+            ("quota_fer_pct", "Quota FER", "%", 1),
+            ("pct_scarto_su_domanda", "Scarto utilizzato / domanda", "%", 1),
+            ("pct_rinnovabile", "Rinnovabile / fornito", "%", 1),
+            ("co2_evitata_t", "CO2 evitata", "t/a", 0),
+        ]),
+        ("Economia", [
+            ("capex_sistema", "CAPEX centrale", "€", 0),
+            ("capex_rete", "CAPEX rete", "€", 0),
+            ("costo_calore_acquistato", "Acquisto calore di scarto", "€/a", 0),
+            ("opex_annuo", "OPEX", "€/a", 0),
+            ("lcoh", "LCOH di sistema", "€/MWh", 1),
+        ]),
+    ]
+
+    def fmt(v, dec):
+        if v is None or v == "—":
+            return "—"
+        if dec is None or isinstance(v, str):
+            # i testi lunghi vengono spezzati per non sbordare dalla colonna
+            t = str(v)
+            return t if len(t) <= 22 else t.replace(" + ", "\n+ ")
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return str(v)[:38]
+        s = f"{f:,.{dec}f}"
+        return s.replace(",", "@").replace(".", ",").replace("@", ".")
+
+    dati = [["Indicatore"] + nomi]
+    stile = [
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1B4F72")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+    ]
+    r = 1
+    for nome_gr, campi in gruppi:
+        dati.append([nome_gr] + [""] * len(nomi))
+        stile += [("BACKGROUND", (0, r), (-1, r), colors.HexColor("#D6EAF8")),
+                  ("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"),
+                  ("SPAN", (0, r), (-1, r))]
+        r += 1
+        for chiave, etichetta, unita, dec in campi:
+            eti = f"{etichetta} ({unita})" if unita else etichetta
+            dati.append([eti] + [fmt(scenari[n].get(chiave), dec) for n in nomi])
+            if r % 2 == 0:
+                stile.append(("BACKGROUND", (0, r), (-1, r), colors.HexColor("#FAFAFA")))
+            r += 1
+
+    larg = [72 * mm] + [(196 - 72) / max(len(nomi), 1) * mm] * len(nomi)
+    t = Table(dati, colWidths=larg, repeatRows=1)
+    t.setStyle(TableStyle(stile))
+    el.append(t)
+
+    el.append(Spacer(1, 8))
+    el.append(Paragraph(
+        "Metodologia: QM Holzheizwerke Planning Handbook (perdite di rete Fig. 12.3, "
+        "contemporaneità Fig. 12.2), Verenum Planungshandbuch Fernwärme, IEA DHC Annex TS5 "
+        "(COP e CAPEX delle pompe di calore, accumuli termici). "
+        "La CO2 evitata e' calcolata rispetto a caldaie a gas individuali "
+        "(0,20 t/MWh, rendimento 90 %) al netto delle emissioni del mix elettrico. "
+        "Il LCOH riportato è quello di sistema (sola centrale, riferito al calore prodotto): "
+        "non coincide con il LCOH completo della scheda di analisi economica, che include "
+        "rete, O&amp;M e personale ed è riferito al calore venduto.", note))
+    el.append(Spacer(1, 4))
+    el.append(Paragraph(
+        "Documento di supporto allo studio di fattibilità: i risultati dipendono dalla "
+        "qualità dei dati di ingresso e dalle ipotesi selezionate, e non sostituiscono "
+        "un progetto esecutivo.", note))
+
+    doc.build(el)
+    return buf.getvalue()
+
+
 def van(flussi_cassa, tasso):
     """Valore Attuale Netto. flussi_cassa[0] e l'investimento (negativo)."""
     return float(sum(f / (1.0 + tasso) ** t for t, f in enumerate(flussi_cassa)))
@@ -3437,20 +3800,35 @@ with tab_dimensionamento:
             q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low
 
     # ---------------------------------------------------------------- PASSO 3
+    # ---------------------------------------------------------------- PASSO 3
     with step3:
         st.markdown("#### Taglie delle macchine e volumi di accumulo")
-        _o1, _o2 = st.columns([1, 2])
+        st.caption("Due modi di procedere: **dimensionare** lascia che sia il programma "
+                   "a cercare la configurazione migliore, **calcolare** simula esattamente "
+                   "le taglie che imposti tu. In entrambi i casi i risultati compaiono "
+                   "nel passo 4.")
+
+        _o1, _o2 = st.columns([1, 1])
         with _o1:
-            st.caption("L'ottimizzatore cerca la combinazione a LCOH minimo che "
-                       "copre la domanda in tutte le ore.")
-            if st.button("🔎 Ottimizza", key="dim_btn_opt", width="stretch"):
-                with st.spinner("Ricerca del LCOH minimo..."):
+            st.markdown("**A · Dimensiona automaticamente**")
+            st.caption("Cerca la combinazione di potenze e volumi a costo del calore "
+                       "minimo, fra quelle che coprono la domanda in tutte le ore.")
+            v_max_acc = st.slider("Volume massimo per accumulo (m³)", 100, 5000, 1500,
+                                  step=100, key="dim_v_max",
+                                  help="Tetto imposto alla ricerca. Oltre qualche migliaio "
+                                       "di metri cubi un serbatoio non è più un componente "
+                                       "di centrale ma un'opera civile a sé, con costi e "
+                                       "ingombri di altra natura.")
+            if st.button("⚙️ Dimensiona", key="dim_btn_opt", width="stretch",
+                         type="primary"):
+                with st.spinner("Ricerca della configurazione a costo minimo..."):
                     best = ottimizza_cascata(
                         dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
                         float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
                         backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
                         prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func,
-                        float(antigelo), picco_kw_override=picco_kw)
+                        float(antigelo), picco_kw_override=picco_kw,
+                        v_max_m3=float(v_max_acc))
                 if best:
                     st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
                     st.session_state["dim_p_bassa"] = int(round(best["P_bassa"] / 100) * 100)
@@ -3460,47 +3838,78 @@ with tab_dimensionamento:
                     st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
                     st.session_state["_opt_casc"] = best
                     st.rerun()
-            st.metric("Picco di dimensionamento", f"{picco_kw:,.0f} kW".replace(",", "."),
-                      help=f"contemporaneità QM applicata: {_f_sim:.2f}")
-        with _o2:
             _ores = st.session_state.get("_opt_casc")
             if _ores:
-                st.success(f"Ottimo trovato: LCOH **{_ores['lcoh']:.1f} €/MWh**, "
-                           f"quota FER **{_ores['quota_fer']:.0f}%**")
+                st.success(f"Configurazione trovata · LCOH **{_ores['lcoh']:.1f} €/MWh** "
+                           f"· quota FER **{_ores['quota_fer']:.0f}%**")
+                st.caption("I valori sono stati scritti nei campi qui a destra: da lì "
+                           "puoi ritoccarli e vedere come cambiano i risultati.")
             else:
-                st.info("Premi **Ottimizza** per una prima configurazione, "
-                        "poi ritocca i valori qui sotto.")
+                st.info("Non ancora dimensionato: i valori a destra sono di primo tentativo.")
+
+        with _o2:
+            st.markdown("**B · Calcola con le tue taglie**")
+            st.caption("I risultati nel passo 4 si aggiornano a ogni modifica: "
+                       "non serve premere nulla.")
+            st.metric("Picco da coprire", f"{picco_kw:,.0f} kW".replace(",", "."),
+                      help=f"contemporaneità QM applicata: {_f_sim:.2f}")
+            _sugg = []
+            if _ores:
+                _sugg.append(f"HP alta consigliata {_ores['P_alta']:.0f} kW")
+                if is_hp_par:
+                    _sugg.append(f"HP bassa {_ores['P_bassa']:.0f} kW")
+                else:
+                    _sugg.append(f"caldaia {_ores['P_bk']:.0f} kW")
+                _sugg.append(f"accumuli {_ores['v_hot']:.0f}+{_ores['v_int']:.0f}"
+                             f"+{_ores['v_low']:.0f} m³")
+                st.caption("Valori consigliati: " + " · ".join(_sugg))
 
         st.divider()
+        _lim_v = int(st.session_state.get("dim_v_max", 1500))
         for k, dv in [("dim_p_alta", int(picco_kw)), ("dim_p_bassa", int(picco_kw * 0.8)),
                       ("dim_p_bk", int(picco_kw))]:
             st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), _maxp))
-        for k, dv in [("dim_v_hot", 0), ("dim_v_int", 800), ("dim_v_low", 400)]:
-            st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), 4000))
+        for k, dv in [("dim_v_hot", 0), ("dim_v_int", min(800, _lim_v)),
+                      ("dim_v_low", min(400, _lim_v))]:
+            st.session_state[k] = max(0, min(int(st.session_state.get(k, dv)), _lim_v))
 
         _p1, _p2 = st.columns(2)
         with _p1:
             st.markdown("**Potenze installate**")
-            P_alta = st.slider("HP alta T (kW)", 0, _maxp, step=100, key="dim_p_alta")
+            P_alta = st.slider("HP alta T (kW)", 0, _maxp, step=100, key="dim_p_alta",
+                               help="Macchina di base: solleva il calore dall'anello "
+                                    "intermedio alla mandata. Dimensionata sul picco "
+                                    "copre da sola tutta la domanda quando c'è scarto.")
             if is_hp_par:
-                P_bassa = st.slider("HP bassa T (kW)", 0, _maxp, step=100, key="dim_p_bassa")
+                P_bassa = st.slider("HP bassa T (kW)", 0, _maxp, step=100, key="dim_p_bassa",
+                                    help="Recupera il calore sotto l'anello intermedio e "
+                                         "quello del terreno. Serve solo la frazione di "
+                                         "potenza che alimenta l'evaporatore della HP alta.")
                 P_bk = 0
             else:
                 P_bassa = 0
                 P_bk = st.slider(f"Caldaia {backup_tipo} (kW)", 0, _maxp, step=100,
-                                 key="dim_p_bk")
+                                 key="dim_p_bk",
+                                 help="Interviene solo sul residuo che la pompa di calore "
+                                      "non copre. Va comunque dimensionata sul picco per "
+                                      "garantire il servizio a scarto nullo.")
         with _p2:
-            st.markdown("**Volumi di accumulo**")
-            V_hot = st.slider("Caldo (m³)", 0, 4000, step=50, key="dim_v_hot",
-                              help=f"a {T_mandata_ideale} °C, per l'uso diretto dello scarto")
-            V_int = st.slider("Intermedio (m³)", 0, 4000, step=50, key="dim_v_int",
-                              help=f"a {T_int} °C, alimenta l'evaporatore della HP alta T")
-            V_low = st.slider("Basso (m³)", 0, 4000, step=50, key="dim_v_low",
+            st.markdown(f"**Volumi di accumulo** (max {_lim_v:,} m³)".replace(",", "."))
+            V_hot = st.slider("Caldo (m³)", 0, _lim_v, step=50, key="dim_v_hot",
+                              help=f"a {T_mandata_ideale} °C. Serve solo se ci sono flussi "
+                                   f"di scarto già sopra la mandata.")
+            V_int = st.slider("Intermedio (m³)", 0, _lim_v, step=50, key="dim_v_int",
+                              help=f"a {T_int} °C, alimenta l'evaporatore della HP alta T. "
+                                   f"È di norma il più utile: disaccoppia la disponibilità "
+                                   f"dello scarto dalla domanda.")
+            V_low = st.slider("Basso (m³)", 0, _lim_v, step=50, key="dim_v_low",
                               help="sorgente della HP bassa T e del solare")
             _cap_tot = (V_hot + V_int + V_low) * RHO_CP * max(
                 T_mandata_ideale - T_ritorno_ideale, 1) / 1000.0
-            st.caption(f"Capacità termica complessiva: **{_cap_tot:.1f} MWh** "
-                       f"· CAPEX accumuli **{(V_hot + V_int + V_low) * costo_m3:,.0f} €**".replace(",", "."))
+            _ore_aut = _cap_tot / (dom_tot / 8784) if dom_tot > 0 else 0
+            st.caption(f"Capacità termica **{_cap_tot:.1f} MWh** — circa "
+                       f"**{_ore_aut:.1f} ore** di domanda media · CAPEX "
+                       f"**{(V_hot + V_int + V_low) * costo_m3:,.0f} €**".replace(",", "."))
 
 
     # ============================== CALCOLO ==============================
@@ -3689,6 +4098,44 @@ with tab_dimensionamento:
                      f"({E_nc:,.0f} MWh): ottimizza o aumenta le taglie.".replace(",", "."))
         else:
             st.success("\u2705 Copertura 100 % in tutte le ore.")
+
+        # ---- schema di massima dell'impianto dimensionato ----
+        st.markdown("##### \U0001F5A5\ufe0f Schema di massima dell'impianto")
+        _fl_caldo, _fl_int, _fl_basso = [], [], []
+        if not off_all.empty:
+            _agg_fl = (off_all[off_all["MWh"] > 0]
+                       .groupby("flusso")
+                       .agg(T=("T_disponibile", "mean"), E=("MWh", "sum"))
+                       .sort_values("E", ascending=False))
+            for _nm, _r in _agg_fl.iterrows():
+                _voce = (str(_nm)[:26], float(_r["T"]))
+                if _r["T"] >= T_mandata_ideale:
+                    _fl_caldo.append(_voce)
+                elif _r["T"] >= T_int:
+                    _fl_int.append(_voce)
+                else:
+                    _fl_basso.append(_voce)
+        _svg = schema_impianto_svg({
+            "T_mandata": T_mandata_ideale, "T_ritorno": T_ritorno_ideale, "T_int": T_int,
+            "P_alta_kw": P_alta, "P_bassa_kw": P_bassa, "P_backup_kw": P_bk,
+            "backup_tipo": backup_tipo,
+            "V_hot": V_hot, "V_int": V_int, "V_low": V_low,
+            "E_hot": E_hot, "E_alta": E_alta, "E_bassa": E_bassa,
+            "E_backup": E_bk, "E_ground": E_ground,
+            "cop_alta": sim["cop_alta_medio"], "cop_bassa": sim["cop_bassa_medio"],
+            "dn_dorsale": int((st.session_state.get("_rete_info", {}) or {}).get("dn_dorsale", 0)),
+            "flussi_caldo": _fl_caldo, "flussi_int": _fl_int, "flussi_basso": _fl_basso,
+            "solare_on": solare_on,
+        })
+        st.image(_svg, width="stretch")
+        st.download_button("⬇️ Scarica lo schema (SVG)", data=_svg,
+                           file_name="maniago_schema_impianto.svg",
+                           mime="image/svg+xml", key="dim_dl_schema")
+        st.caption("Schema a blocchi indicativo: riporta le taglie dimensionate e i "
+                   "livelli termici, non sostituisce uno schema funzionale di progetto "
+                   "(mancano valvole, circolatori, sicurezze, vaso di espansione, "
+                   "strumentazione).")
+        st.divider()
 
         # --- indicatori chiave richiesti ---
         st.markdown("##### \U0001F331 Indicatori chiave di sostenibilità")
@@ -4097,10 +4544,30 @@ with tab_confronto:
                              margin=dict(t=30, b=10), xaxis_tickangle=-20)
         st.plotly_chart(fig_cx, width="stretch")
 
-        st.download_button(
+        st.divider()
+        st.markdown("#### \U0001F4C4 Esporta il confronto")
+        _e1, _e2 = st.columns(2)
+        _e1.download_button(
             "\u2B07\ufe0f Scarica il confronto (CSV)",
             data=df_cf.to_csv(index=False).encode("utf-8"),
-            file_name="maniago_tlr_confronto_scenari.csv", mime="text/csv")
+            file_name="maniago_tlr_confronto_scenari.csv", mime="text/csv",
+            width="stretch")
+        _pdf = None
+        try:
+            _pdf = genera_pdf_scenari(_scen)
+        except Exception as _e:
+            st.caption(f"Scheda PDF non disponibile: {type(_e).__name__}")
+        if _pdf:
+            _e2.download_button(
+                "\U0001F4C4 Scarica la scheda di confronto (PDF)",
+                data=_pdf, file_name="maniago_tlr_confronto_scenari.pdf",
+                mime="application/pdf", width="stretch", type="primary")
+        else:
+            _e2.caption("Per la scheda PDF serve la libreria `reportlab`: "
+                        "aggiungila a `requirements.txt`.")
+        st.caption("La scheda PDF riporta gli scenari affiancati, raggruppati per "
+                   "utenza e rete, impianto, bilancio energetico, sostenibilità ed "
+                   "economia, con le note metodologiche in calce.")
 
 
 # =============================================================================
