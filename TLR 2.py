@@ -1006,6 +1006,64 @@ def routing_flussi(off_df, idx_h, mandata, T_int):
 # =============================================================================
 # P7 - DISPATCH A CASCATA CON MERIT ORDER
 # =============================================================================
+def utilizzo_per_azienda(off_df, idx_h, mandata, T_int, sim, dom_arr):
+    """Quanto del calore offerto da ciascuna azienda viene davvero valorizzato.
+
+    Il dispatch aggrega i flussi per livello termico e non distingue piu' la
+    provenienza: dentro un livello il calore e' indistinguibile. La quota persa
+    su ogni livello viene quindi ripartita fra le aziende in proporzione al loro
+    contributo su quel livello IN QUELLA ORA, il che rende l'attribuzione esatta
+    e non una media annua.
+
+    Ritorna un DataFrame per azienda con: energia offerta, utilizzata, scartata,
+    quota di utilizzo, ore in cui il flusso e' disponibile e ore in cui serve
+    davvero. Un flusso disponibile solo quando la domanda e' bassa vale poco,
+    per quanto grande sia sulla carta.
+    """
+    o = off_df[off_df["MWh"] > 0].copy()
+    if o.empty:
+        return pd.DataFrame(columns=["azienda", "offerta_mwh", "utilizzata_mwh",
+                                     "scartata_mwh", "quota_utilizzo_pct",
+                                     "ore_disponibile", "ore_utile", "livello"])
+    o["T"] = o["T_disponibile"]
+    o["livello"] = np.where(o["T"] >= mandata, "caldo",
+                            np.where(o["T"] >= T_int, "intermedio", "basso"))
+
+    perso = {"caldo": np.asarray(sim.get("perso_hot", np.zeros(len(idx_h)))),
+             "intermedio": np.asarray(sim.get("perso_int", np.zeros(len(idx_h)))),
+             "basso": np.asarray(sim.get("perso_low", np.zeros(len(idx_h))))}
+    dom_pos = np.asarray(dom_arr) > 1e-9
+
+    righe = []
+    for az, g_az in o.groupby("azienda"):
+        off_tot = float(g_az["MWh"].sum())
+        scartata = 0.0
+        for liv, g_liv in g_az.groupby("livello"):
+            # serie oraria dell'azienda su questo livello
+            s_az = g_liv.groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0.0).values
+            # totale offerto sul livello da TUTTE le aziende, ora per ora
+            s_tot = (o[o["livello"] == liv].groupby("datetime")["MWh"].sum()
+                     .reindex(idx_h, fill_value=0.0).values)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                quota = np.where(s_tot > 1e-12, s_az / s_tot, 0.0)
+            scartata += float((perso[liv] * quota).sum())
+        scartata = min(scartata, off_tot)
+        utilizzata = off_tot - scartata
+        s_az_tot = g_az.groupby("datetime")["MWh"].sum().reindex(idx_h, fill_value=0.0).values
+        disponibile = s_az_tot > 1e-9
+        righe.append({
+            "azienda": az,
+            "offerta_mwh": round(off_tot, 1),
+            "utilizzata_mwh": round(utilizzata, 1),
+            "scartata_mwh": round(scartata, 1),
+            "quota_utilizzo_pct": round(utilizzata / off_tot * 100, 1) if off_tot > 0 else 0.0,
+            "ore_disponibile": int(disponibile.sum()),
+            "ore_utile": int((disponibile & dom_pos).sum()),
+            "livello": ", ".join(sorted(g_az["livello"].unique())),
+        })
+    return pd.DataFrame(righe).sort_values("utilizzata_mwh", ascending=False)
+
+
 def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                      mandata, ritorno, T_int, dT_evap, eta_hp,
                      V_hot, V_int, V_low,
@@ -1048,6 +1106,11 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
     q_ground = np.zeros(n)
     non_cop = np.zeros(n)
     scarto_perso = np.zeros(n)
+    # scarto perso distinto per livello: consente di attribuire a ciascuna
+    # azienda la quota di calore realmente valorizzata (vedi utilizzo_per_azienda)
+    perso_hot = np.zeros(n)
+    perso_int = np.zeros(n)
+    perso_low = np.zeros(n)
     cop_alta_s = np.full(n, np.nan)
     cop_bassa_s = np.full(n, np.nan)
     ore_ground = 0
@@ -1086,7 +1149,9 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
         pool_low_bins = soc_low_bins + q_low_bins[i]
         if not is_hp:
             # senza HP bassa T il livello basso non ha utilizzatori
-            scarto_perso[i] += float(pool_low_bins.sum())
+            _pl = float(pool_low_bins.sum())
+            scarto_perso[i] += _pl
+            perso_low[i] += _pl
             pool_low_bins = np.zeros_like(pool_low_bins)
 
         dom = dom_arr[i]
@@ -1172,11 +1237,13 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
         # --- fine ora: quel che avanza va in accumulo, il resto e perso ---
         if pool_hot > C_hot:
             scarto_perso[i] += pool_hot - C_hot
+            perso_hot[i] += pool_hot - C_hot
             soc_hot = C_hot
         else:
             soc_hot = pool_hot
         if pool_int > C_int:
             scarto_perso[i] += pool_int - C_int
+            perso_int[i] += pool_int - C_int
             soc_int = C_int
         else:
             soc_int = pool_int
@@ -1185,6 +1252,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
             if tot_low > C_low:
                 over = tot_low - C_low
                 scarto_perso[i] += over
+                perso_low[i] += over
                 for k in range(n_bin):
                     drop = pool_low_bins[k]
                     if drop > over:
@@ -1197,6 +1265,8 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
         else:
             soc_low_bins = np.zeros(n_bin)
 
+    # traccia oraria dello scarto perso per livello: serve ad attribuire a
+    # ciascuna azienda la quota di calore effettivamente valorizzata
     E_hot = float(q_hot_direct.sum())
     E_alta = float(q_alta.sum())
     E_bassa = float(q_bassa.sum())
@@ -1213,6 +1283,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
         "E_hot_diretto": E_hot, "E_hp_alta": E_alta, "E_hp_bassa": E_bassa, "E_backup": E_bk,
         "E_el_alta": E_el_alta, "E_el_bassa": E_el_bassa, "E_el_tot": E_el_alta + E_el_bassa,
         "E_non_coperta": float(non_cop.sum()), "E_scarto_perso": float(scarto_perso.sum()),
+        "perso_hot": perso_hot, "perso_int": perso_int, "perso_low": perso_low,
         "cop_alta_medio": cop_alta_medio, "cop_bassa_medio": cop_bassa_medio,
         "ore_non_coperte": int((non_cop > 1e-6).sum()), "ore_ground": ore_ground,
     }
@@ -2995,6 +3066,74 @@ with tab_offerta:
         st.plotly_chart(fig_src, width="stretch")
         st.divider()
 
+        # =====================================================================
+        # QUANTO SCARTO VIENE DAVVERO VALORIZZATO, AZIENDA PER AZIENDA
+        # Non conta quanto calore c'e': conta quanto ne serve. Un flusso
+        # disponibile solo quando la domanda e' bassa, o su un livello termico
+        # che l'impianto non riesce a sfruttare, vale poco per quanto sia grande.
+        # =====================================================================
+        st.markdown("#### \U0001F4CA Utilizzo effettivo del calore di scarto")
+        _utz = st.session_state.get("_off_utilizzo_aziende")
+        if _utz is None or (hasattr(_utz, "empty") and _utz.empty):
+            st.info("Apri la scheda **Dimensionamento** e configura un assetto: "
+                    "qui comparirà quanto del calore offerto da ciascuna azienda "
+                    "viene effettivamente valorizzato dall'impianto.")
+        else:
+            _u = _utz.copy()
+            _tot_off = float(_u["offerta_mwh"].sum())
+            _tot_uso = float(_u["utilizzata_mwh"].sum())
+            _q1, _q2, _q3 = st.columns(3)
+            _q1.metric("Offerto dalle aziende", f"{_tot_off:,.0f} MWh/a".replace(",", "."))
+            _q2.metric("Effettivamente utilizzato", f"{_tot_uso:,.0f} MWh/a".replace(",", "."),
+                       delta=f"{_tot_uso / _tot_off * 100:.0f}% dell'offerto" if _tot_off > 0 else None,
+                       delta_color="off")
+            _q3.metric("Scartato", f"{_tot_off - _tot_uso:,.0f} MWh/a".replace(",", "."),
+                       help="Calore disponibile ma non utilizzabile: accumulo pieno, "
+                            "domanda già soddisfatta, o livello termico senza utilizzatori.")
+
+            _fu = go.Figure()
+            _fu.add_trace(go.Bar(y=_u["azienda"], x=_u["utilizzata_mwh"], orientation="h",
+                                 name="Utilizzato", marker_color=COLOR_OFFERTA,
+                                 text=_u["quota_utilizzo_pct"].map(lambda v: f"{v:.0f}%"),
+                                 textposition="inside", insidetextanchor="middle"))
+            _fu.add_trace(go.Bar(y=_u["azienda"], x=_u["scartata_mwh"], orientation="h",
+                                 name="Scartato", marker_color=COLOR_NONCOP))
+            _fu.update_layout(barmode="stack", height=max(220, 60 * len(_u)),
+                              xaxis_title="MWh/anno",
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                              margin=dict(t=30, b=10))
+            st.plotly_chart(_fu, width="stretch")
+
+            _tab_u = _u.rename(columns={
+                "azienda": "Azienda", "offerta_mwh": "Offerto (MWh/a)",
+                "utilizzata_mwh": "Utilizzato (MWh/a)", "scartata_mwh": "Scartato (MWh/a)",
+                "quota_utilizzo_pct": "Utilizzo (%)", "ore_disponibile": "Ore disponibile",
+                "ore_utile": "Ore con domanda", "livello": "Livello termico"})
+            st.dataframe(_tab_u, width="stretch", hide_index=True)
+
+            _scarse = _u[_u["quota_utilizzo_pct"] < 40]
+            if not _scarse.empty:
+                _nomi = ", ".join(f"**{r.azienda}** ({r.quota_utilizzo_pct:.0f}%)"
+                                  for r in _scarse.itertuples())
+                st.warning(
+                    f"⚠️ Utilizzo sotto il 40 % per: {_nomi}. Il costo dell'allacciamento "
+                    f"si ripartisce su poco calore: verifica nella scheda *Analisi economica* "
+                    f"se l'investimento su questi flussi si giustifica, oppure valuta un "
+                    f"accumulo maggiore per assorbire i picchi di disponibilità.")
+            _buone = _u[_u["quota_utilizzo_pct"] >= 80]
+            if not _buone.empty:
+                st.success(
+                    f"✅ Utilizzo sopra l'80 % per {len(_buone)} "
+                    f"{'azienda' if len(_buone) == 1 else 'aziende'}: "
+                    + ", ".join(_buone["azienda"]) + ".")
+            st.caption("La quota scartata di ogni azienda è calcolata ora per ora, "
+                       "ripartendo il calore in eccesso su ciascun livello termico in "
+                       "proporzione a quanto ogni azienda vi contribuisce in quel momento. "
+                       "La colonna *Ore con domanda* indica quante ore il flusso è "
+                       "disponibile mentre la rete ha effettivamente bisogno di calore.")
+
+        st.divider()
+
         if off.empty:
             st.warning("Nessuna fonte selezionata.")
         else:
@@ -3371,6 +3510,14 @@ with tab_dimensionamento:
                            V_hot, V_int, V_low, P_alta, P_bassa,
                            parallelo=backup_tipo, P_backup_kw=P_bk, backup_cop=backup_cop,
                            antigelo=float(antigelo), perdita_sett_pct=perd)
+    # attribuzione alle aziende del calore realmente valorizzato: il risultato
+    # viene mostrato nella scheda Offerta, dove si decide quali flussi allacciare
+    try:
+        st.session_state["_off_utilizzo_aziende"] = utilizzo_per_azienda(
+            off_all, idx_h, float(T_mandata_ideale), float(T_int), sim, dom_arr)
+    except Exception:
+        st.session_state["_off_utilizzo_aziende"] = None
+
     E_hot, E_alta, E_bassa = sim["E_hot_diretto"], sim["E_hp_alta"], sim["E_hp_bassa"]
     E_bk, E_nc = sim["E_backup"], sim["E_non_coperta"]
     E_fer = E_hot + E_alta + (E_bk if backup_tipo == "biomassa" else 0.0)
