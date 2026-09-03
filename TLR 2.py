@@ -28,6 +28,10 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P14 Stratificazione dell'accumulo intermedio: strati da 5 K, la pompa alta T
+     preleva dal piu' caldo disponibile. La temperatura utile e' la media fra
+     quella dello strato e quella di base dell'anello, perche' il fluido cede
+     calore raffreddandosi. Disattivabile per tornare al mescolamento perfetto.
  P13 Flusso guidato in 4 passi nel dimensionamento, distinzione fra
      "dimensiona" (ricerca automatica) e "calcola" (taglie imposte),
      tetto ai volumi di accumulo, schema di massima dell'impianto in SVG
@@ -1193,7 +1197,29 @@ def routing_flussi(off_df, idx_h, mandata, T_int):
         piv = low.pivot_table(index="datetime", columns="bin", values="MWh", aggfunc="sum", observed=False)
         piv = piv.reindex(index=idx_h, columns=range(K), fill_value=0.0).fillna(0.0)
         q_low_bins = piv.values
-    return hot.values, intm.values, q_low.values, q_low_bins, bin_T
+
+    # --- STRATIFICAZIONE DELL'ANELLO INTERMEDIO ---
+    # Un serbatoio reale non mescola: l'acqua piu' calda galleggia e viene
+    # prelevata per prima. Suddividendo anche il livello intermedio in strati
+    # da 5 K, l'evaporatore della HP alta T pesca dallo strato piu' caldo
+    # disponibile invece che da una media, con un COP piu' realistico.
+    edges_i = np.arange(float(T_int), float(mandata) + 5.0, 5.0)
+    if len(edges_i) < 2:
+        edges_i = np.array([float(T_int), float(mandata)])
+    bin_T_int = (edges_i[:-1] + edges_i[1:]) / 2.0
+    Ki = len(bin_T_int)
+    im = o[(o["T"] >= T_int) & (o["T"] < mandata)].copy()
+    if im.empty:
+        q_int_bins = np.zeros((len(idx_h), Ki))
+    else:
+        im["bin"] = np.clip(np.digitize(im["T"].values, edges_i) - 1, 0, Ki - 1)
+        pv = im.pivot_table(index="datetime", columns="bin", values="MWh",
+                            aggfunc="sum", observed=False)
+        pv = pv.reindex(index=idx_h, columns=range(Ki), fill_value=0.0).fillna(0.0)
+        q_int_bins = pv.values
+
+    return (hot.values, intm.values, q_low.values, q_low_bins, bin_T,
+            q_int_bins, bin_T_int)
 
 
 # =============================================================================
@@ -1262,7 +1288,8 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                      V_hot, V_int, V_low,
                      P_hp_alta_kw, P_hp_bassa_kw,
                      parallelo="HP bassa T", P_backup_kw=0.0, backup_cop=None,
-                     antigelo=0.0, perdita_sett_pct=1.0):
+                     antigelo=0.0, perdita_sett_pct=1.0,
+                     q_int_bins=None, bin_T_int=None, stratificato=True):
     """Dispatch orario dello schema a cascata con 3 accumuli stratificati.
 
     MERIT ORDER (P7) - ordine di merito rigido, indipendente dai prezzi:
@@ -1317,6 +1344,35 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
     # dal ciclo orario. Il COP della HP alta T, in particolare, dipende solo
     # da T_int, mandata e rendimento: e' costante su tutte le 8.784 ore.
     # ------------------------------------------------------------------
+    # --- accumulo intermedio: stratificato oppure a mescolamento ---
+    # Con la stratificazione l'evaporatore della HP alta T preleva dallo strato
+    # piu' caldo disponibile, quindi il COP varia ora per ora invece di essere
+    # fisso sulla temperatura nominale dell'anello. Senza flussi di scarto a
+    # temperature diverse la differenza si annulla da se'.
+    strat = bool(stratificato) and (q_int_bins is not None) and (bin_T_int is not None)
+    if strat:
+        q_int_b = np.asarray(q_int_bins, dtype=float)
+        bT_int = np.asarray(bin_T_int, dtype=float)
+        n_bin_int = len(bT_int)
+        idx_int_desc = list(range(n_bin_int - 1, -1, -1))   # dal piu' caldo
+        # COP per strato. Un flusso non cede calore restando alla propria
+        # temperatura: entra allo strato k e si raffredda scendendo verso la
+        # base dell'anello. La temperatura utile all'evaporatore e' quindi la
+        # media fra quella dello strato e quella di base, non quella d'ingresso:
+        # usare quest'ultima sovrastimerebbe il COP anche quando tutti i flussi
+        # arrivano alla stessa temperatura.
+        T_utile = (bT_int + float(T_int)) / 2.0
+        cop_strato = np.array([float(cop_singola(t - dT_evap, mandata, eta_hp))
+                               for t in T_utile])
+    else:
+        q_int_b = None
+        bT_int = None
+        n_bin_int = 0
+        idx_int_desc = []
+        cop_strato = None
+
+    soc_int_bins = np.zeros(n_bin_int) if strat else None
+
     cop_a = float(cop_singola(T_int - dT_evap, mandata, eta_hp))
     hp_alta_attiva = (P_alta > 0) and (cop_a > 1.0)
     frac_evap = 1.0 - 1.0 / cop_a if cop_a > 1.0 else 0.0
@@ -1335,10 +1391,16 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
             soc_hot *= fatt_perdita
             soc_int *= fatt_perdita
             soc_low_bins *= fatt_perdita
+            if strat:
+                soc_int_bins *= fatt_perdita
 
         # --- pool disponibili nell'ora: stock + flusso in ingresso (P7) ---
         pool_hot = soc_hot + q_hot_arr[i]
-        pool_int = soc_int + q_int_arr[i]
+        if strat:
+            pool_int_bins = soc_int_bins + q_int_b[i]
+            pool_int = float(pool_int_bins.sum())
+        else:
+            pool_int = soc_int + q_int_arr[i]
         pool_low_bins = soc_low_bins + q_low_bins[i]
         if not is_hp:
             # senza HP bassa T il livello basso non ha utilizzatori
@@ -1357,17 +1419,63 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
 
         # --- MERIT 2: HP alta T (precede SEMPRE il combustibile) ---
         if residuo > 1e-9 and hp_alta_attiva:
-            cop_alta_s[i] = cop_a
             q_a_want = residuo if residuo < P_alta else P_alta
-            E_a_want = q_a_want * frac_evap
-            # energia disponibile all'evaporatore: livello intermedio + eventuale
-            # ricarica in tempo reale dalla HP bassa T
-            E_a = min(E_a_want, pool_int + extra_bassa)
-            if E_a > 1e-12:
-                q_a = E_a / frac_evap
+
+            if strat:
+                # Prelievo dallo strato piu' caldo verso il basso. Ogni strato
+                # ha il proprio COP, quindi il calore reso e l'energia sottratta
+                # all'evaporatore vanno accumulati strato per strato: usare una
+                # temperatura media sottostimerebbe la resa della macchina.
+                q_a = 0.0
+                el_a = 0.0
+                from_int = 0.0
+                residuo_pot = q_a_want
+                for k in idx_int_desc:
+                    if residuo_pot <= 1e-12:
+                        break
+                    disp = pool_int_bins[k]
+                    if disp <= 1e-12:
+                        continue
+                    cop_k = cop_strato[k]
+                    if cop_k <= 1.0:
+                        continue
+                    fe_k = 1.0 - 1.0 / cop_k          # quota presa all'evaporatore
+                    # calore producibile con l'energia di questo strato
+                    q_k = disp / fe_k
+                    if q_k > residuo_pot:
+                        q_k = residuo_pot
+                    e_k = q_k * fe_k
+                    pool_int_bins[k] -= e_k
+                    from_int += e_k
+                    q_a += q_k
+                    el_a += q_k / cop_k
+                    residuo_pot -= q_k
+                pool_int = float(pool_int_bins.sum())
+
+                # se lo stratificato non basta, la HP bassa ricarica in tempo
+                # reale: quel contributo entra alla temperatura nominale T_int
+                from_bassa = 0.0
+                if residuo_pot > 1e-12 and extra_bassa > 0 and frac_evap > 0:
+                    e_want = residuo_pot * frac_evap
+                    from_bassa = e_want if e_want < extra_bassa else extra_bassa
+                    q_extra = from_bassa / frac_evap
+                    q_a += q_extra
+                    el_a += q_extra * inv_cop_a
+                E_a = from_int + from_bassa
+                cop_alta_s[i] = (q_a / el_a) if el_a > 1e-12 else np.nan
+            else:
+                cop_alta_s[i] = cop_a
+                E_a_want = q_a_want * frac_evap
+                # energia disponibile all'evaporatore: livello intermedio +
+                # eventuale ricarica in tempo reale dalla HP bassa T
+                E_a = min(E_a_want, pool_int + extra_bassa)
+                q_a = E_a / frac_evap if E_a > 1e-12 else 0.0
+                el_a = q_a * inv_cop_a
                 from_int = min(E_a, pool_int)
                 pool_int -= from_int
                 from_bassa = E_a - from_int
+
+            if E_a > 1e-12:
 
                 # --- MERIT 3: HP bassa T, ricarica il livello intermedio ---
                 if from_bassa > 1e-12 and is_hp and P_bassa > 0:
@@ -1413,7 +1521,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                     q_bassa[i] = q_b
                     el_bassa[i] = q_b / cop_b if cop_b > 0 else 0.0
 
-                el_alta[i] = q_a * inv_cop_a
+                el_alta[i] = el_a
                 q_alta[i] = q_a
                 residuo -= q_a
 
@@ -1434,7 +1542,24 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
             soc_hot = C_hot
         else:
             soc_hot = pool_hot
-        if pool_int > C_int:
+        if strat:
+            tot_i = float(pool_int_bins.sum())
+            if tot_i > C_int:
+                over_i = tot_i - C_int
+                scarto_perso[i] += over_i
+                perso_int[i] += over_i
+                # trabocca dallo strato piu' freddo: e' quello meno pregiato
+                for k in range(n_bin_int):
+                    drop = pool_int_bins[k]
+                    if drop > over_i:
+                        drop = over_i
+                    pool_int_bins[k] -= drop
+                    over_i -= drop
+                    if over_i <= 1e-12:
+                        break
+            soc_int_bins = pool_int_bins
+            soc_int = float(soc_int_bins.sum())
+        elif pool_int > C_int:
             scarto_perso[i] += pool_int - C_int
             perso_int[i] += pool_int - C_int
             soc_int = C_int
@@ -1486,7 +1611,8 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
                       mandata, ritorno, T_int, dT_evap, eta_hp, parallelo,
                       capex_hp_func, capex_backup_kw, opex_backup_mwh, backup_cop,
                       prezzo_el, costo_m3, capex_solare_fisso, fattore_crf,
-                      perdita_func, antigelo, **kwargs):
+                      perdita_func, antigelo, q_int_bins=None, bin_T_int=None,
+                      stratificato=True, **kwargs):
     """Dimensiona P_hp_alta, P_hp_bassa, V_hot, V_int, V_low a LCOH minimo.
 
     Vincolo: copertura 100 % delle ore (backup firm sul picco).
@@ -1535,7 +1661,9 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
                              v_hot, v_int, v_low, P_alta, P_bassa,
                              parallelo=parallelo, P_backup_kw=P_bk, backup_cop=backup_cop,
                              antigelo=antigelo,
-                             perdita_sett_pct=perdita_func(max(v_int, v_low, v_hot)))
+                             perdita_sett_pct=perdita_func(max(v_int, v_low, v_hot)),
+                             q_int_bins=q_int_bins, bin_T_int=bin_T_int,
+                             stratificato=stratificato)
         capex = (P_alta * capex_hp_func(P_alta)
                  + (P_bassa * capex_hp_func(P_bassa) if is_hp else P_bk * capex_backup_kw)
                  + (v_hot + v_int + v_low) * costo_m3 + capex_solare_fisso)
@@ -3668,7 +3796,8 @@ with tab_dimensionamento:
                                    "Piu' e' alto, meno lavora la pompa ma meno scarto "
                                    "risulta utilizzabile. 45-50 °C e' l'ottimo tipico.")
         with _t2:
-            _qh, _qi, _ql, _qlb, _bT = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
+            _qh, _qi, _ql, _qlb, _bT, _qib, _bTi = routing_flussi(
+                off_all, idx_h, T_mandata_ideale, T_int)
             _tot_scarto = float(_qh.sum() + _qi.sum() + _ql.sum())
             st.markdown("**Dove finisce il calore di scarto disponibile**")
             _r1, _r2, _r3 = st.columns(3)
@@ -3765,10 +3894,30 @@ with tab_dimensionamento:
                 st.metric("Costo del calore di supporto", f"{opex_bk_mwh:.0f} €/MWh")
         backup_cop = None
         st.divider()
-        costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 1000, step=20,
-                             key="dim_costo_m3",
+        _a1, _a2 = st.columns(2)
+        with _a1:
+            costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 1000, step=20,
+                                 key="dim_costo_m3",
                              help="IEA DHC F1 Tab.3: 110-200 €/m³ sopra i 2.000 m³; "
-                                  "1.000 €/m³ è conservativo per serbatoi in acciaio piccoli.")
+                                      "1.000 €/m³ è conservativo per serbatoi in acciaio piccoli.")
+        with _a2:
+            strat_on = st.checkbox("Accumulo intermedio stratificato", value=True,
+                                   key="dim_strat",
+                                   help="Un serbatoio ben progettato non mescola: l'acqua "
+                                        "più calda resta in alto e viene prelevata per prima, "
+                                        "così l'evaporatore della pompa alta T lavora sullo "
+                                        "strato migliore invece che su una media. Conta solo "
+                                        "quando arrivano flussi di scarto a temperature "
+                                        "diverse; a parità di temperatura non cambia nulla. "
+                                        "Disattivalo per simulare un accumulo a mescolamento.")
+            if strat_on:
+                st.caption("Strati da 5 K tra l'anello intermedio e la mandata. "
+                           "Il calore in eccesso trabocca dallo strato più freddo, "
+                           "che è il meno pregiato.")
+            else:
+                st.caption("⚠️ Modello a mescolamento perfetto: il COP della pompa alta T "
+                           "viene calcolato sulla temperatura nominale dell'anello. "
+                           "È l'ipotesi conservativa.")
 
         # Il solare e' stato spostato nella scheda Offerta, dove si confrontano
         # termico, fotovoltaico e ibrido a parita' di superficie disponibile.
@@ -3793,8 +3942,8 @@ with tab_dimensionamento:
                            "HP bassa T non ha utilizzatori: verrebbe scartato mentre "
                            "il CAPEX resta a bilancio.")
 
-        q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T = routing_flussi(
-            off_all, idx_h, T_mandata_ideale, T_int)
+        (q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T,
+         q_int_bins, bin_T_int) = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
         q_low_bins_eff = q_low_bins.copy()
         if solare_on:
             q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low
@@ -3827,7 +3976,8 @@ with tab_dimensionamento:
                         float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
                         backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
                         prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func,
-                        float(antigelo), picco_kw_override=picco_kw,
+                        float(antigelo), q_int_bins=q_int_bins, bin_T_int=bin_T_int,
+                        stratificato=strat_on, picco_kw_override=picco_kw,
                         v_max_m3=float(v_max_acc))
                 if best:
                     st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
@@ -3918,7 +4068,9 @@ with tab_dimensionamento:
                            float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
                            V_hot, V_int, V_low, P_alta, P_bassa,
                            parallelo=backup_tipo, P_backup_kw=P_bk, backup_cop=backup_cop,
-                           antigelo=float(antigelo), perdita_sett_pct=perd)
+                           antigelo=float(antigelo), perdita_sett_pct=perd,
+                           q_int_bins=q_int_bins, bin_T_int=bin_T_int,
+                           stratificato=strat_on)
     # attribuzione alle aziende del calore realmente valorizzato: il risultato
     # viene mostrato nella scheda Offerta, dove si decide quali flussi allacciare
     try:
@@ -4189,6 +4341,27 @@ with tab_dimensionamento:
         bb[3].metric("Combustibile", f"{E_bk:,.0f} MWh".replace(",", "."),
                      help=(f"{backup_tipo}" if not is_hp_par else "nessuno"))
 
+        if strat_on and q_int_bins is not None and float(q_int_bins.sum()) > 1:
+            with st.expander("\U0001F321\ufe0f Stratificazione dell'accumulo intermedio"):
+                _e_str = q_int_bins.sum(axis=0)
+                _T_ut = (np.asarray(bin_T_int) + float(T_int)) / 2.0
+                _cop_str = [float(cop_singola(t - 5, T_mandata_ideale, eta_hp)) for t in _T_ut]
+                _df_str = pd.DataFrame({
+                    "Strato (°C)": [f"{t - 2.5:.0f}–{t + 2.5:.0f}" for t in bin_T_int],
+                    "Energia in ingresso (MWh/a)": np.round(_e_str, 1),
+                    "T utile all'evaporatore (°C)": np.round(_T_ut, 1),
+                    "COP dello strato": np.round(_cop_str, 2)})
+                _df_str = _df_str[_df_str["Energia in ingresso (MWh/a)"] > 0.5]
+                st.dataframe(_df_str, width="stretch", hide_index=True)
+                _cop_nom = float(cop_singola(T_int - 5, T_mandata_ideale, eta_hp))
+                st.caption(
+                    f"La pompa alta T preleva dallo strato più caldo disponibile. "
+                    f"Con l'accumulo a mescolamento perfetto lavorerebbe sempre a "
+                    f"COP {_cop_nom:.2f}; qui il COP medio effettivo risulta "
+                    f"**{sim['cop_alta_medio']:.2f}**. La temperatura utile è la media "
+                    f"fra quella dello strato e quella di base dell'anello, perché il "
+                    f"fluido cede calore raffreddandosi.")
+
         st.markdown("**\U0001F4C8 Curva di durata del COP delle pompe di calore**")
         st.caption("COP con vincoli realistici: lift minimo 8 K e tetto 6,5 (IEA DHC F6/F10).")
         fig_cop = go.Figure()
@@ -4315,6 +4488,7 @@ with tab_dimensionamento:
         "T_ritorno": int(T_ritorno_ideale),
         "T_int": int(T_int),
         "supporto": backup_tipo,
+        "accumulo_stratificato": "sì" if strat_on else "no",
         "carico_utenze_mwh": round(dom_tot_utenze),
         "carico_centrale_mwh": round(dom_tot),
         "perdite_rete_pct": round(_perd_pct, 1),
@@ -4437,6 +4611,7 @@ with tab_confronto:
             ("V_hot", "Accumulo caldo (m³)"),
             ("V_int", "Accumulo intermedio (m³)"),
             ("V_low", "Accumulo basso (m³)"),
+            ("accumulo_stratificato", "Accumulo stratificato"),
             ("E_hot_diretto", "Scarto diretto (MWh/a)"),
             ("E_hp_alta", "Consegnato da HP alta T (MWh/a)"),
             ("E_backup", "Da combustibile (MWh/a)"),
