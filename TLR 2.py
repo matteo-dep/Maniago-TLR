@@ -1007,6 +1007,8 @@ def schema_impianto_svg(cfg):
             txt(x + w / 2, y + 54, t3, 10, C_LIN)
 
     def linea(x1, y1, x2, y2, col=C_LIN, w=2, tratteggio=None, freccia=True):
+        # la freccia segue sempre il verso x1->x2, cosi' il flusso disegnato
+        # coincide con quello fisico anche nei tratti da destra a sinistra
         d = f' stroke-dasharray="{tratteggio}"' if tratteggio else ""
         m = ' marker-end="url(#fr)"' if freccia and col == C_LIN else (
             ' marker-end="url(#frc)"' if freccia else "")
@@ -1018,25 +1020,35 @@ def schema_impianto_svg(cfg):
     txt(590, 46, f"mandata {T_mand} °C · ritorno {T_rit} °C · anello intermedio {T_int} °C",
         11, C_LIN)
 
-    # ---- colonna sinistra: flussi in ingresso
-    txt(62, 76, "Flussi di scarto", 12, "#FFFFFF", weight="bold")
-    y0 = 100
-    for i, (nome, temp) in enumerate(flussi_caldo[:2]):
-        txt(62, y0 + i * 17, f"{nome} · {temp:.0f} °C", 10, C_CALDO)
-    y1 = y0 + max(len(flussi_caldo[:2]), 0) * 17 + 8
-    for i, (nome, temp) in enumerate(flussi_int[:3]):
-        txt(62, y1 + i * 17, f"{nome} · {temp:.0f} °C", 10, C_HP)
-    y2 = y1 + max(len(flussi_int[:3]), 0) * 17 + 8
-    for i, (nome, temp) in enumerate(flussi_basso[:3]):
-        txt(62, y2 + i * 17, f"{nome} · {temp:.0f} °C", 10, C_HPB)
+    # ---- colonna sinistra: flussi in ingresso, allineati a sinistra
+    #      con un riquadro di sfondo per staccarli dalla mappa dei blocchi
+    _x0 = 16
+    a(f'<rect x="{_x0 - 6}" y="66" width="200" height="250" rx="6" '
+      f'fill="#1A1F26" stroke="#333B45" stroke-width="1"/>')
+    txt(_x0, 86, "FLUSSI DI SCARTO", 11, "#FFFFFF", anchor="start", weight="bold")
+    _y = 108
+    for _lbl, _lst, _col in [("uso diretto", flussi_caldo[:3], C_CALDO),
+                             ("anello intermedio", flussi_int[:4], C_HP),
+                             ("anello basso", flussi_basso[:4], C_HPB)]:
+        if not _lst:
+            continue
+        txt(_x0, _y, _lbl, 9, _col, anchor="start", weight="bold")
+        _y += 15
+        for nome, temp in _lst:
+            a(f'<circle cx="{_x0 + 4}" cy="{_y - 4}" r="3" fill="{_col}"/>')
+            txt(_x0 + 13, _y, f"{nome[:22]}", 9.5, C_TXT, anchor="start")
+            txt(188, _y, f"{temp:.0f}°C", 9.5, _col, anchor="end")
+            _y += 15
+        _y += 6
     if solare_on:
-        txt(62, y2 + max(len(flussi_basso[:3]), 0) * 17 + 20, "☀ solare", 10, C_SOL)
+        a(f'<circle cx="{_x0 + 4}" cy="{_y - 4}" r="3" fill="{C_SOL}"/>')
+        txt(_x0 + 13, _y, "solare termico", 9.5, C_SOL, anchor="start")
 
     # ---- accumulo BASSO
     cilindro(150, 300, 130, 90, C_HPB, "Accumulo BASSO",
              f"{V_low:.0f} m³" if V_low else "assente",
              f"< {T_int} °C")
-    linea(128, 345, 148, 345)
+    linea(200, 345, 146, 345)
 
     # ---- ground loop
     if is_hp:
@@ -1064,7 +1076,7 @@ def schema_impianto_svg(cfg):
     cilindro(500, 190, 140, 100, C_ACC, "Accumulo INTERMEDIO",
              f"{V_int:.0f} m³" if V_int else "assente",
              f"{T_int} °C")
-    linea(128, 232, 498, 232)
+    linea(200, 232, 498, 232)
     txt(300, 224, "flussi tra " + f"{T_int} e {T_mand} °C", 10, C_HP, anchor="middle")
 
     # ---- HP alta T
@@ -1090,17 +1102,17 @@ def schema_impianto_svg(cfg):
              f"{T_mand} °C")
     # uso diretto dello scarto sopra mandata
     if E_hot > 0:
-        a(f'<path d="M128 118 H 950 V 148" stroke="{C_CALDO}" stroke-width="2.5" '
+        a(f'<path d="M200 96 H 950 V 148" stroke="{C_CALDO}" stroke-width="2.5" '
           f'fill="none" marker-end="url(#frc)"/>')
-        txt(520, 110, f"uso diretto: scarto ≥ {T_mand} °C  ·  "
+        txt(560, 88, f"uso diretto: scarto ≥ {T_mand} °C  ·  "
                       f"{E_hot:,.0f} MWh/a".replace(",", "."), 11, C_CALDO)
 
     # ---- mandata e ritorno rete
-    a(f'<path d="M1020 205 H 1125" stroke="{C_CALDO}" stroke-width="5" '
+    a(f'<path d="M1020 215 H 1128" stroke="{C_CALDO}" stroke-width="5" '
       f'fill="none" marker-end="url(#frc)"/>')
-    txt(1072, 196, f"mandata {T_mand} °C", 10, C_CALDO)
+    txt(1074, 200, f"mandata {T_mand} °C", 10, C_CALDO)
     if dn:
-        txt(1072, 228, f"DN {dn}", 12, "#FFFFFF", weight="bold")
+        txt(1074, 240, f"DN {dn}", 12, "#FFFFFF", weight="bold")
     # il ritorno rientra sull'accumulo intermedio (recupero del residuo termico)
     a(f'<path d="M1125 445 H 570 V 302" stroke="#2D7DC0" stroke-width="4" fill="none" '
       f'marker-end="url(#fr)"/>')
@@ -3347,6 +3359,47 @@ with tab_offerta:
                 help="0 = calore ceduto gratuitamente; valori tipici 5-20 \u20ac/MWh.")
         st.session_state["_off_prezzi_scarto"] = _prezzi_scarto
 
+    with st.expander("\u2139\ufe0f Come sono costruiti i profili orari"):
+        st.markdown("""
+**Domanda**
+
+| utenza | profilo orario |
+|---|---|
+| Edifici pubblici | dato reale dal CSV, edificio per edificio, riscaldamento e ACS separati, calibrato sui gradi giorno |
+| Privati | il totale annuo è distribuito sul **profilo normalizzato degli edifici pubblici** (RSA se presenti). Non hanno una forma propria |
+| Condomini | stesso profilo dei privati, con ripartizione fissa **85 % riscaldamento / 15 % ACS** |
+
+Il limite dei privati: una casa ha due picchi (mattina e sera) e di giorno è vuota,
+una RSA è occupata 24 ore. L'energia annua è corretta, la forma del picco no.
+La contemporaneità QM corregge il valore massimo, non la distribuzione oraria.
+
+**Calore di scarto** — dalle colonne `profilo`, `giorni_sett`, `chiusura_gg` del CSV:
+
+| profilo | comportamento |
+|---|---|
+| `continuo` | potenza nominale costante nelle ore attive |
+| `notturno_18_08` | attivo dalle 18 alle 8 |
+| `ore_giorno_N` | N ore consecutive a partire dalle 6 del mattino |
+| `cf_random` | ore accese estratte a caso, con probabilità pari al fattore di carico |
+| `ciclico_colate` | rampa da `T_alta_C` a `T_out_C` ripetuta n volte al giorno |
+
+Tre avvertenze:
+
+- la **temperatura è costante** in tutti i profili tranne `ciclico_colate`: nella
+  realtà un camino industriale oscilla col carico;
+- le **fermate sono casuali**: `chiusura_gg` dice quanti giorni l'impianto è fermo,
+  non quali. Metà finiscono a Natale, metà ad agosto, il resto è estratto a sorte
+  con un seme fisso. Sull'energia annua l'effetto è trascurabile, sulle date no;
+- `cf_random` distribuisce le ore a caso, quindi il flusso risulta **scorrelato
+  dalla domanda**: la quota valorizzata che compare nel grafico per azienda è
+  indicativa.
+
+**Solare** — il PVGIS orario reale viene mediato per mese e ora, ottenendo un
+giorno tipo mensile che si ripete. Si perde la variabilità giorno per giorno,
+quindi non compaiono le sequenze di giorni nuvolosi consecutivi, che sono
+proprio quelle che dimensionerebbero l'accumulo.
+""")
+
     with st.expander("\U0001F4CB Dettaglio flussi da CSV (dati grezzi)"):
         st.dataframe(flussi[["azienda", "flusso", "destinazione", "fluido", "T_alta_C",
                              "T_out_C", "P_kW", "profilo"]],
@@ -3526,36 +3579,90 @@ with tab_offerta:
     with col_contenuto2:
         st.markdown("#### \U0001F3ED Sorgenti di scarto e sottocentrale")
         _pw = (off.groupby("azienda")["MWh"].sum() if not off.empty else pd.Series(dtype=float))
+        _tot_pw = float(_pw.sum()) if len(_pw) else 0.0
+
+        # Percorso delle condotte di adduzione dalle aziende alla sottocentrale,
+        # calcolato sulle strade reali come nella scheda Domanda. In mancanza
+        # del grafo OSM si ripiega sul collegamento diretto.
+        _str_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=2.5)
+        _str_off, _ = _str_res if isinstance(_str_res, tuple) else (_str_res, None)
+        _G_off = build_grafo_stradale(_str_off) if _str_off is not None else None
+
         fig_src = go.Figure()
+        _len_add = {}
         for _n, (_la, _lo) in AZIENDE_COORD.items():
             _match = [k for k in _pw.index if str(k).startswith(_n)]
             _e = float(_pw[_match].sum()) if _match else 0.0
             _att = _e > 0
+            _w = (2.5 + 6 * min(_e / max(_tot_pw, 1), 1)) if _att else 1.2
+            _col = COLOR_OFFERTA if _att else "#666666"
+            _tracciato = None
+            if _G_off is not None:
+                try:
+                    _nodi_ad, _dsn = snap_a_strade([_la, CENTRALE_LAT],
+                                                   [_lo, CENTRALE_LON], _str_off)
+                    import networkx as _nx
+                    _path = _nx.dijkstra_path(_G_off, _nodi_ad[0], _nodi_ad[1],
+                                              weight="weight")
+                    _lt = [_la] + [_str_off["nodi"][k][0] for k in _path] + [CENTRALE_LAT]
+                    _ln = [_lo] + [_str_off["nodi"][k][1] for k in _path] + [CENTRALE_LON]
+                    _lung = _nx.dijkstra_path_length(_G_off, _nodi_ad[0], _nodi_ad[1],
+                                                     weight="weight") + float(_dsn.sum())
+                    _tracciato = (_lt, _ln, _lung)
+                except Exception:
+                    _tracciato = None
+            if _tracciato is None:
+                _x, _y = _latlon_a_xy(np.array([_la, CENTRALE_LAT]),
+                                      np.array([_lo, CENTRALE_LON]))
+                _tracciato = ([_la, CENTRALE_LAT], [_lo, CENTRALE_LON],
+                              float(np.hypot(_x[1] - _x[0], _y[1] - _y[0])) * 1.35)
+            _lt, _ln, _lung = _tracciato
+            _len_add[_n] = _lung
             fig_src.add_trace(go.Scattermap(
-                lat=[_la, CENTRALE_LAT], lon=[_lo, CENTRALE_LON], mode="lines",
-                line=dict(width=(2 + 6 * min(_e / max(_pw.sum(), 1), 1)) if _att else 1,
-                          color=COLOR_OFFERTA if _att else "#666666"),
-                showlegend=False, hoverinfo="skip", opacity=0.9 if _att else 0.35))
+                lat=_lt, lon=_ln, mode="lines",
+                line=dict(width=_w, color=_col),
+                showlegend=False, opacity=0.9 if _att else 0.35,
+                hovertext=f"{_n} → sottocentrale: {_lung:,.0f} m".replace(",", "."),
+                hoverinfo="text"))
             fig_src.add_trace(go.Scattermap(
                 lat=[_la], lon=[_lo], mode="markers+text",
-                marker=dict(size=(12 + 22 * min(_e / max(_pw.sum(), 1), 1)) if _att else 10,
-                            color=COLOR_OFFERTA if _att else "#777777"),
+                marker=dict(size=(13 + 20 * min(_e / max(_tot_pw, 1), 1)) if _att else 10,
+                            color=_col),
                 text=[_n], textposition="top right", textfont=dict(size=12, color="#DDDDDD"),
-                name=_n, hovertext=[f"{_n}<br>{_e:,.0f} MWh/a nel periodo".replace(",", ".")
-                                    if _att else f"{_n}<br>nessun flusso selezionato"],
+                name=_n,
+                hovertext=[f"{_n}<br>{_e:,.0f} MWh/a nel periodo<br>"
+                           f"adduzione {_lung:,.0f} m".replace(",", ".")
+                           if _att else f"{_n}<br>nessun flusso selezionato"],
                 hoverinfo="text", showlegend=False))
         fig_src.add_trace(go.Scattermap(
             lat=[CENTRALE_LAT], lon=[CENTRALE_LON], mode="markers+text",
-            marker=dict(size=20, color="#FF9F1C"), text=["SOTTOCENTRALE"], textposition="bottom center",
+            marker=dict(size=20, color="#FF9F1C"), text=["SOTTOCENTRALE"],
+            textposition="bottom center",
             textfont=dict(size=13, color="#FF9F1C"), name="Sottocentrale",
-            hovertext=[f"Sottocentrale<br>{CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}"], hoverinfo="text",
-            showlegend=False))
+            hovertext=[f"Sottocentrale<br>{CENTRALE_LAT:.4f}, {CENTRALE_LON:.4f}"],
+            hoverinfo="text", showlegend=False))
+        _lat_tutte = [v[0] for v in AZIENDE_COORD.values()] + [CENTRALE_LAT]
+        _lon_tutte = [v[1] for v in AZIENDE_COORD.values()] + [CENTRALE_LON]
         fig_src.update_layout(
-            **layout_mappa(np.mean([v[0] for v in AZIENDE_COORD.values()] + [CENTRALE_LAT]),
-                           np.mean([v[1] for v in AZIENDE_COORD.values()] + [CENTRALE_LON]), 14.2),
-            height=430, margin=dict(t=10, b=0, l=0, r=0))
+            **layout_mappa((min(_lat_tutte) + max(_lat_tutte)) / 2,
+                           (min(_lon_tutte) + max(_lon_tutte)) / 2, 13.6),
+            height=470, margin=dict(t=10, b=0, l=0, r=0))
         st.plotly_chart(fig_src, width="stretch")
+        if _G_off is not None:
+            _att_len = {k: v for k, v in _len_add.items()
+                        if any(str(x).startswith(k) for x in _pw.index)}
+            if _att_len:
+                st.caption("Condotte di adduzione lungo le strade: "
+                           + " · ".join(f"**{k}** {v:,.0f} m".replace(",", ".")
+                                        for k, v in sorted(_att_len.items(),
+                                                           key=lambda x: x[1]))
+                           + f" — in totale **{sum(_att_len.values()):,.0f} m**".replace(",", "."))
+                st.session_state["_off_lunghezze_adduzione"] = _att_len
+        else:
+            st.caption("Rete stradale non disponibile: i collegamenti sono mostrati "
+                       "in linea d'aria con tortuosità 1,35.")
         st.divider()
+
 
         # =====================================================================
         # QUANTO SCARTO VIENE DAVVERO VALORIZZATO, AZIENDA PER AZIENDA
@@ -3950,71 +4057,61 @@ with tab_dimensionamento:
 
     # ---------------------------------------------------------------- PASSO 3
     # ---------------------------------------------------------------- PASSO 3
+    # ---------------------------------------------------------------- PASSO 3
     with step3:
         st.markdown("#### Taglie delle macchine e volumi di accumulo")
-        st.caption("Due modi di procedere: **dimensionare** lascia che sia il programma "
-                   "a cercare la configurazione migliore, **calcolare** simula esattamente "
-                   "le taglie che imposti tu. In entrambi i casi i risultati compaiono "
-                   "nel passo 4.")
+        st.caption("Prima si lascia che il programma cerchi la configurazione migliore, "
+                   "poi si può ritoccarla. I risultati nel passo 4 si aggiornano a ogni "
+                   "modifica, senza premere nulla.")
 
-        _o1, _o2 = st.columns([1, 1])
-        with _o1:
-            st.markdown("**A · Dimensiona automaticamente**")
-            st.caption("Cerca la combinazione di potenze e volumi a costo del calore "
-                       "minimo, fra quelle che coprono la domanda in tutte le ore.")
+        _d1, _d2 = st.columns([1, 1])
+        with _d1:
             v_max_acc = st.slider("Volume massimo per accumulo (m³)", 100, 5000, 1500,
                                   step=100, key="dim_v_max",
                                   help="Tetto imposto alla ricerca. Oltre qualche migliaio "
                                        "di metri cubi un serbatoio non è più un componente "
                                        "di centrale ma un'opera civile a sé, con costi e "
                                        "ingombri di altra natura.")
-            if st.button("⚙️ Dimensiona", key="dim_btn_opt", width="stretch",
-                         type="primary"):
-                with st.spinner("Ricerca della configurazione a costo minimo..."):
-                    best = ottimizza_cascata(
-                        dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
-                        float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
-                        backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
-                        prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func,
-                        float(antigelo), q_int_bins=q_int_bins, bin_T_int=bin_T_int,
-                        stratificato=strat_on, picco_kw_override=picco_kw,
-                        v_max_m3=float(v_max_acc))
-                if best:
-                    st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
-                    st.session_state["dim_p_bassa"] = int(round(best["P_bassa"] / 100) * 100)
-                    st.session_state["dim_p_bk"] = int(round(best["P_bk"] / 100) * 100)
-                    st.session_state["dim_v_hot"] = int(round(best["v_hot"] / 50) * 50)
-                    st.session_state["dim_v_int"] = int(round(best["v_int"] / 50) * 50)
-                    st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
-                    st.session_state["_opt_casc"] = best
-                    st.rerun()
-            _ores = st.session_state.get("_opt_casc")
-            if _ores:
-                st.success(f"Configurazione trovata · LCOH **{_ores['lcoh']:.1f} €/MWh** "
-                           f"· quota FER **{_ores['quota_fer']:.0f}%**")
-                st.caption("I valori sono stati scritti nei campi qui a destra: da lì "
-                           "puoi ritoccarli e vedere come cambiano i risultati.")
-            else:
-                st.info("Non ancora dimensionato: i valori a destra sono di primo tentativo.")
-
-        with _o2:
-            st.markdown("**B · Calcola con le tue taglie**")
-            st.caption("I risultati nel passo 4 si aggiornano a ogni modifica: "
-                       "non serve premere nulla.")
+        with _d2:
             st.metric("Picco da coprire", f"{picco_kw:,.0f} kW".replace(",", "."),
                       help=f"contemporaneità QM applicata: {_f_sim:.2f}")
-            _sugg = []
-            if _ores:
-                _sugg.append(f"HP alta consigliata {_ores['P_alta']:.0f} kW")
-                if is_hp_par:
-                    _sugg.append(f"HP bassa {_ores['P_bassa']:.0f} kW")
-                else:
-                    _sugg.append(f"caldaia {_ores['P_bk']:.0f} kW")
-                _sugg.append(f"accumuli {_ores['v_hot']:.0f}+{_ores['v_int']:.0f}"
-                             f"+{_ores['v_low']:.0f} m³")
-                st.caption("Valori consigliati: " + " · ".join(_sugg))
+
+        if st.button("⚙️ Dimensiona a costo minimo", key="dim_btn_opt", width="stretch",
+                     type="primary"):
+            with st.spinner("Ricerca della configurazione a costo minimo..."):
+                best = ottimizza_cascata(
+                    dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
+                    float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
+                    backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
+                    prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func,
+                    float(antigelo), q_int_bins=q_int_bins, bin_T_int=bin_T_int,
+                    stratificato=strat_on, picco_kw_override=picco_kw,
+                    v_max_m3=float(v_max_acc))
+            if best:
+                st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
+                st.session_state["dim_p_bassa"] = int(round(best["P_bassa"] / 100) * 100)
+                st.session_state["dim_p_bk"] = int(round(best["P_bk"] / 100) * 100)
+                st.session_state["dim_v_hot"] = int(round(best["v_hot"] / 50) * 50)
+                st.session_state["dim_v_int"] = int(round(best["v_int"] / 50) * 50)
+                st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
+                st.session_state["_opt_casc"] = best
+                st.rerun()
+
+        _ores = st.session_state.get("_opt_casc")
+        if _ores:
+            _sg = [f"HP alta **{_ores['P_alta']:.0f} kW**"]
+            _sg.append(f"HP bassa **{_ores['P_bassa']:.0f} kW**" if is_hp_par
+                       else f"caldaia **{_ores['P_bk']:.0f} kW**")
+            _sg.append(f"accumuli **{_ores['v_hot']:.0f}+{_ores['v_int']:.0f}"
+                       f"+{_ores['v_low']:.0f} m³**")
+            st.success(f"Configurazione a costo minimo · LCOH **{_ores['lcoh']:.1f} €/MWh** "
+                       f"· quota FER **{_ores['quota_fer']:.0f}%** — " + " · ".join(_sg))
+        else:
+            st.info("Non ancora dimensionato: i valori qui sotto sono di primo tentativo. "
+                    "Premi **Dimensiona** per la configurazione a costo minimo.")
 
         st.divider()
+        st.markdown("##### Ritocca le taglie")
         _lim_v = int(st.session_state.get("dim_v_max", 1500))
         for k, dv in [("dim_p_alta", int(picco_kw)), ("dim_p_bassa", int(picco_kw * 0.8)),
                       ("dim_p_bk", int(picco_kw))]:
@@ -4410,37 +4507,49 @@ with tab_dimensionamento:
                        f"({pvt_el_mwh:,.0f} MWh/a), che si porta in detrazione dei consumi "
                        f"delle pompe di calore.".replace(",", "."))
 
-        fig_co = go.Figure(go.Pie(labels=["CAPEX (annualizzato)", "OPEX (annuo)"],
-                                  values=[capex_sistema * fattore_crf, opex], hole=0.5,
-                                  marker=dict(colors=["#5B8DEF", "#F4A259"]), sort=False))
-        fig_co.update_layout(title=f"Costo annuo · {costo_annuo:,.0f} \u20ac/a".replace(",", "."),
-                             height=300, margin=dict(t=45, b=10), legend=dict(orientation="h", y=-0.1))
-        st.plotly_chart(fig_co, width="stretch")
-
+        # --- scomposizione del costo del calore ---
+        # Il grafico a torta dice solo quanto pesa una voce sul totale; qui
+        # invece ogni voce e' espressa in euro per MWh prodotto, cioe' nella
+        # stessa unita' del prezzo di vendita: si legge subito quanto incide
+        # ciascun componente sul costo finale del calore.
         df_c = pd.DataFrame(righe)
-        _pal = [COLOR_HP, (COLOR_HP_BASSA if is_hp_par else COLOR_BACKUP), COLOR_ACCUMULO, COLOR_SOLARE]
-        pc1, pc2 = st.columns(2)
-        with pc1:
-            fig_capex = go.Figure(go.Pie(labels=df_c["Voce"], values=df_c["CAPEX (\u20ac)"], hole=0.5,
-                                         marker=dict(colors=_pal[:len(df_c)]), sort=False))
-            fig_capex.update_layout(title=f"CAPEX totale · {capex_sistema:,.0f} \u20ac".replace(",", "."),
-                                    height=330, margin=dict(t=45, b=10),
-                                    legend=dict(orientation="h", y=-0.1))
-            st.plotly_chart(fig_capex, width="stretch")
-        with pc2:
-            df_o = df_c[df_c["OPEX (\u20ac/a)"] > 0]   # le voci negative (ricavi) non entrano in torta
-            fig_opex = go.Figure(go.Pie(labels=df_o["Voce"], values=df_o["OPEX (\u20ac/a)"], hole=0.5,
-                                        marker=dict(colors=_pal[:len(df_o)]), sort=False))
-            fig_opex.update_layout(title=f"OPEX annuo · {opex:,.0f} \u20ac/a".replace(",", "."),
-                                   height=330, margin=dict(t=45, b=10),
-                                   legend=dict(orientation="h", y=-0.1))
-            st.plotly_chart(fig_opex, width="stretch")
+        _voci_lcoh = []
+        for _r in righe:
+            _cap_ann = float(_r["CAPEX (\u20ac)"]) * fattore_crf
+            _op = float(_r["OPEX (\u20ac/a)"])
+            if abs(_cap_ann) > 1:
+                _voci_lcoh.append((f"{_r['Voce']} · capitale", _cap_ann / dom_tot, "#5B8DEF"))
+            if abs(_op) > 1:
+                _voci_lcoh.append((f"{_r['Voce']} · esercizio", _op / dom_tot, "#F4A259"))
+        if _voci_lcoh:
+            _fig_l = go.Figure()
+            _nomi_l = [v[0] for v in _voci_lcoh]
+            _val_l = [v[1] for v in _voci_lcoh]
+            _col_l = [v[2] for v in _voci_lcoh]
+            _fig_l.add_trace(go.Bar(
+                y=_nomi_l, x=_val_l, orientation="h", marker_color=_col_l,
+                text=[f"{v:+.1f}" if v < 0 else f"{v:.1f}" for v in _val_l],
+                textposition="outside"))
+            _fig_l.update_layout(
+                height=max(200, 42 * len(_voci_lcoh) + 90),
+                xaxis_title="€ per MWh di calore prodotto",
+                margin=dict(t=36, b=10, l=10, r=40), showlegend=False,
+                title=f"Come si compone il costo del calore · totale {lcoh:.1f} €/MWh")
+            _fig_l.update_yaxes(autorange="reversed")
+            st.plotly_chart(_fig_l, width="stretch")
+            st.caption("In blu il capitale annualizzato (CAPEX × CRF), in arancio i costi "
+                       "di esercizio. Le voci negative sono ricavi che si portano in "
+                       "detrazione. Il totale coincide con il LCOH di sistema.")
 
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("CAPEX di sistema", f"{capex_sistema:,.0f} \u20ac".replace(",", "."))
-        s2.metric("Costo annuo", f"{costo_annuo:,.0f} \u20ac/a".replace(",", "."))
-        s3.metric("LCOH di sistema", f"{lcoh:.1f} \u20ac/MWh" if not np.isnan(lcoh) else "n/d")
+        s2.metric("Costo annuo", f"{costo_annuo:,.0f} \u20ac/a".replace(",", "."),
+                  help=f"capitale {capex_sistema * fattore_crf:,.0f} + esercizio {opex:,.0f}".replace(",", "."))
+        s3.metric("LCOH di sistema", f"{lcoh:.1f} \u20ac/MWh" if not np.isnan(lcoh) else "n/d",
+                  help="Costo del calore alla centrale. Non comprende rete, O&M e "
+                       "personale: quelli sono nella scheda Analisi economica.")
         s4.metric("Quota FER", f"{quota_fer:.0f}%")
+
 
     # ---------------------------------------------------------------------
     # COSTO DEL CALORE DI SCARTO ACQUISTATO (per azienda) + CO2 EVITATA
@@ -4924,14 +5033,31 @@ with tab_economia:
                    ("Assicurazioni e varie", assicuraz, "#9AA0A6"),
                    ("CAPEX annualizzato", capex_netto * _crf_eco, "#5B8DEF")]
         _voci_c = [(n, v, c) for n, v, c in _voci_c if v > 0]
-        fig_str = go.Figure(go.Pie(labels=[n for n, _, _ in _voci_c],
-                                   values=[v for _, v, _ in _voci_c], hole=0.5,
-                                   marker=dict(colors=[c for _, _, c in _voci_c]), sort=False))
-        fig_str.update_layout(title=f"Costo annuo completo · "
-                                    f"{costo_annuo_completo:,.0f} \u20ac/a".replace(",", "."),
-                              height=400, margin=dict(t=50, b=10),
-                              legend=dict(orientation="h", y=-0.15))
-        st.plotly_chart(fig_str, width="stretch")
+        # A barre e non a torta: ogni voce e' espressa anche in euro per MWh
+        # venduto, cioe' nella stessa unita' del prezzo di vendita, cosi' si
+        # legge subito quanto incide sul costo finale del calore.
+        _fig_str = go.Figure()
+        _nm = [n for n, _, _ in _voci_c]
+        _vl = [v for _, v, _ in _voci_c]
+        _cl = [c for _, _, c in _voci_c]
+        _inc = [v / E_venduto if E_venduto > 0 else 0 for v in _vl]
+        _fig_str.add_trace(go.Bar(
+            y=_nm, x=_vl, orientation="h", marker_color=_cl,
+            text=[f"{v/1000:,.0f} k€  ({i:.1f} €/MWh)".replace(",", ".")
+                  for v, i in zip(_vl, _inc)],
+            textposition="outside",
+            hovertemplate="%{y}<br>%{x:,.0f} €/a<extra></extra>"))
+        _fig_str.update_layout(
+            height=max(240, 44 * len(_voci_c) + 90),
+            xaxis_title="€/anno",
+            title=f"Costo annuo completo · {costo_annuo_completo:,.0f} €/a "
+                  f"· {lcoh_completo:.1f} €/MWh".replace(",", "."),
+            margin=dict(t=44, b=10, l=10, r=150), showlegend=False)
+        _fig_str.update_yaxes(autorange="reversed")
+        st.plotly_chart(_fig_str, width="stretch")
+        st.caption("Fra parentesi l'incidenza di ciascuna voce sul calore venduto: "
+                   "sommate danno il costo pieno del calore, confrontabile "
+                   "direttamente col prezzo di vendita.")
 
         # --- sensitivita ---
         st.markdown("#### Sensitività del VAN")
