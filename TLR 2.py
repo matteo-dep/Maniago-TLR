@@ -28,6 +28,13 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P15 Profili orari rivisti: i privati e i condomini hanno una forma
+     residenziale propria (due punte giornaliere, distinzione feriale/festivo)
+     invece di ereditare quella degli edifici pubblici; le fermate degli
+     impianti industriali seguono il calendario reale invece di essere
+     estratte a sorte; l'anno solare conserva la sequenza reale dei giorni,
+     quindi le sequenze di giornate coperte che dimensionano l'accumulo.
+     La potenza dei flussi e' limitata allo scambiatore quotato dove noto.
  P14 Stratificazione dell'accumulo intermedio: strati da 5 K, la pompa alta T
      preleva dal piu' caldo disponibile. La temperatura utile e' la media fra
      quella dello strato e quella di base dell'anello, perche' il fluido cede
@@ -1710,22 +1717,136 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
 # =============================================================================
 # GENERAZIONE PROFILI DI OFFERTA
 # =============================================================================
-def _giorni_chiusura_set(giorni_chiusura_annui, seed):
+# =============================================================================
+# PROFILI DI CARICO RESIDENZIALE
+# =============================================================================
+# Un'abitazione non consuma come un edificio pubblico: ha due picchi (mattino
+# e sera) e nelle ore centrali e' spesso vuota, mentre una scuola o un ufficio
+# scaldano in modo continuo durante l'orario di apertura e una RSA 24 ore su 24.
+# Usare il profilo dei pubblici per i privati falsa la forma del picco, che e'
+# proprio la grandezza su cui si dimensionano macchine e accumuli.
+#
+# Coefficienti orari (media = 1.0) da profili di carico residenziale italiani
+# per riscaldamento con caldaia autonoma e per acqua calda sanitaria.
+PROFILO_SH_RESIDENZIALE = np.array([
+    0.55, 0.45, 0.40, 0.40, 0.45, 0.75,   # 00-05  notte, attenuazione
+    1.35, 1.60, 1.45, 1.10, 0.95, 0.90,   # 06-11  punta del mattino
+    0.95, 0.90, 0.85, 0.90, 1.10, 1.40,   # 12-17  ripresa pomeridiana
+    1.55, 1.45, 1.25, 1.05, 0.85, 0.65,   # 18-23  punta della sera
+])
+PROFILO_ACS_RESIDENZIALE = np.array([
+    0.25, 0.15, 0.10, 0.10, 0.15, 0.45,   # 00-05
+    1.30, 1.95, 1.75, 1.15, 0.85, 0.80,   # 06-11  docce del mattino
+    0.95, 0.85, 0.65, 0.60, 0.75, 1.15,   # 12-17
+    1.70, 1.90, 1.60, 1.20, 0.75, 0.40,   # 18-23  docce della sera
+])
+# Nel fine settimana la punta del mattino si sposta piu' tardi e si attenua.
+PROFILO_SH_WEEKEND = np.roll(PROFILO_SH_RESIDENZIALE, 2) * 0.5 + PROFILO_SH_RESIDENZIALE * 0.5
+PROFILO_ACS_WEEKEND = np.roll(PROFILO_ACS_RESIDENZIALE, 2) * 0.6 + PROFILO_ACS_RESIDENZIALE * 0.4
+
+
+def profilo_residenziale(idx_h, energia_annua_mwh, hdd_orari=None, quota_acs=0.0):
+    """Serie oraria di una utenza residenziale.
+
+    Combina due componenti:
+      - la stagionalita', presa dai gradi giorno orari se disponibili (cosi' il
+        riscaldamento segue il clima reale e si spegne d'estate);
+      - la forma giornaliera tipica dell'abitazione, con le due punte.
+
+    Args:
+        idx_h: indice orario
+        energia_annua_mwh: energia da distribuire
+        hdd_orari: peso stagionale per ora (tipicamente il fabbisogno orario
+            aggregato degli edifici gia' noti). Se assente si usa un andamento
+            sinusoidale con stagione di riscaldamento 15/10 - 15/04.
+        quota_acs: se > 0, la serie e' ACS e non segue la stagionalita' del
+            riscaldamento ma resta pressoche' costante nell'anno.
+
+    Ritorna un array di MWh orari la cui somma e' esattamente energia_annua_mwh.
+    """
+    ore = idx_h.hour.values
+    festivo = idx_h.dayofweek.values >= 5
+    if quota_acs > 0:
+        forma = np.where(festivo, PROFILO_ACS_WEEKEND[ore], PROFILO_ACS_RESIDENZIALE[ore])
+        # l'ACS ha una lieve stagionalita': in inverno l'acqua di rete e' piu'
+        # fredda e serve piu' calore per portarla in temperatura
+        doy = idx_h.dayofyear.values
+        stag = 1.0 + 0.15 * np.cos(2 * np.pi * (doy - 15) / 365.25)
+        peso = forma * stag
+    else:
+        forma = np.where(festivo, PROFILO_SH_WEEKEND[ore], PROFILO_SH_RESIDENZIALE[ore])
+        if hdd_orari is not None and float(np.nansum(hdd_orari)) > 0:
+            stag = np.asarray(hdd_orari, dtype=float)
+            stag = np.where(np.isfinite(stag), stag, 0.0)
+        else:
+            doy = idx_h.dayofyear.values
+            stag = np.clip(np.cos(2 * np.pi * (doy - 15) / 365.25), 0.0, None)
+        peso = forma * stag
+    tot = float(peso.sum())
+    if tot <= 0:
+        return np.zeros(len(idx_h))
+    return peso / tot * float(energia_annua_mwh)
+
+
+# Festivita' civili e religiose infrasettimanali del calendario 2024, piu' il
+# patrono di Maniago (San Mauro, 15 gennaio). Sono i giorni in cui gli impianti
+# industriali si fermano al di fuori delle ferie programmate.
+FESTIVITA_2024 = [
+    "2024-01-01",  # Capodanno
+    "2024-01-06",  # Epifania
+    "2024-01-15",  # San Mauro, patrono di Maniago
+    "2024-04-01",  # Lunedi dell'Angelo
+    "2024-04-25",  # Liberazione
+    "2024-05-01",  # Festa del lavoro
+    "2024-06-02",  # Festa della Repubblica
+    "2024-08-15",  # Ferragosto
+    "2024-11-01",  # Ognissanti
+    "2024-12-08",  # Immacolata
+    "2024-12-25",  # Natale
+    "2024-12-26",  # Santo Stefano
+]
+
+
+def _giorni_chiusura_set(giorni_chiusura_annui, seed=0, natale_acceso=False):
+    """Giorni di fermata dell'impianto, su calendario reale.
+
+    Le fermate non sono distribuite a caso: seguono l'ordine con cui si fermano
+    davvero gli stabilimenti, cioe' ferie estive centrali di agosto, chiusura
+    fra Natale e l'Epifania, festivita' infrasettimanali. Solo un eventuale
+    residuo viene collocato nei venerdi, giorno tipico di manutenzione.
+
+    natale_acceso: per gli impianti a ciclo continuo che non si spengono a
+    Natale (e' il caso dei forni di Pietro Rosa).
+    """
     if not giorni_chiusura_annui or giorni_chiusura_annui <= 0:
         return set()
-    rng = np.random.default_rng(seed)
     n = int(giorni_chiusura_annui)
-    natale = pd.date_range("2024-12-20", "2024-12-31")
-    agosto = pd.date_range("2024-08-05", "2024-08-25")
-    n_natale = min(n // 2, len(natale))
-    n_agosto = min(n - n_natale, len(agosto))
-    chiusi = list(natale[:n_natale]) + list(agosto[:n_agosto])
-    resto = n - len(chiusi)
-    if resto > 0:
-        altri = [d for d in DAYS_2024 if d not in chiusi]
-        scelti = rng.choice(len(altri), size=min(resto, len(altri)), replace=False)
-        chiusi += [altri[i] for i in scelti]
-    return set(pd.Timestamp(d).normalize() for d in chiusi)
+    chiusi = []
+
+    # 1) ferie estive: due settimane centrali di agosto, il blocco piu' lungo
+    agosto = list(pd.date_range("2024-08-05", "2024-08-18"))
+    chiusi += agosto[:min(n, len(agosto))]
+
+    # 2) chiusura invernale, salvo impianti a ciclo continuo
+    if len(chiusi) < n and not natale_acceso:
+        natale = list(pd.date_range("2024-12-24", "2024-12-31"))
+        chiusi += natale[:n - len(chiusi)]
+
+    # 3) festivita' infrasettimanali
+    if len(chiusi) < n:
+        fest = [pd.Timestamp(d) for d in FESTIVITA_2024]
+        fest = [d for d in fest if d not in chiusi and d.weekday() < 5]
+        if natale_acceso:
+            fest = [d for d in fest if not (d.month == 12 and d.day in (25, 26))]
+        chiusi += fest[:n - len(chiusi)]
+
+    # 4) residuo: manutenzioni programmate, tipicamente di venerdi
+    if len(chiusi) < n:
+        ven = [d for d in DAYS_2024 if d.weekday() == 4 and d not in chiusi]
+        passo = max(len(ven) // max(n - len(chiusi), 1), 1)
+        chiusi += ven[::passo][:n - len(chiusi)]
+
+    return set(pd.Timestamp(d).normalize() for d in chiusi[:n])
 
 
 def genera_flusso(row, pinch=5.0, seed=0):
@@ -1734,7 +1855,10 @@ def genera_flusso(row, pinch=5.0, seed=0):
     T_disp = row["T_alta_C"] - pinch
     profilo = row["profilo"]
     giorni_sett = int(row["giorni_sett"]) if not pd.isna(row.get("giorni_sett")) else 7
-    chiusi = _giorni_chiusura_set(row.get("chiusura_gg", 0), seed)
+    # alcuni impianti a ciclo continuo non si fermano a Natale: si dichiara
+    # con la colonna facoltativa natale_acceso del CSV dei flussi
+    _nat = str(row.get("natale_acceso", "")).strip().lower() in ("1", "si", "sì", "true", "x")
+    chiusi = _giorni_chiusura_set(row.get("chiusura_gg", 0), seed, natale_acceso=_nat)
 
     P = np.zeros(len(HOURS_2024))
     Td = np.full(len(HOURS_2024), np.nan)
@@ -1815,6 +1939,24 @@ def load_data():
                             on="edificio", how="left")
     flussi = pd.read_csv("maniago_flussi_offerta.csv")
     flussi["id_flusso"] = flussi["azienda"] + " · " + flussi["flusso"]
+
+    # POTENZA EFFETTIVA DEL FLUSSO
+    # P_kW e' il calore teoricamente presente nel flusso, ma il recupero e'
+    # limitato dallo scambiatore che si installa davvero. Dove esiste una
+    # quotazione (P_scambiatore_kW) si usa quella: e' il collo di bottiglia
+    # reale. Es. Pandolfo 4.187 kW recuperabili su 5.931 disponibili.
+    flussi["P_disponibile_kW"] = pd.to_numeric(flussi["P_kW"], errors="coerce").fillna(0.0)
+    if "P_scambiatore_kW" in flussi.columns:
+        _phe = pd.to_numeric(flussi["P_scambiatore_kW"], errors="coerce")
+        flussi["P_kW"] = np.where(_phe.notna() & (_phe > 0), _phe,
+                                  flussi["P_disponibile_kW"])
+        flussi["limitato_da_HE"] = (_phe.notna() & (_phe > 0)).values
+    else:
+        flussi["P_scambiatore_kW"] = np.nan
+        flussi["limitato_da_HE"] = False
+    for _c in ("costo_allacciamento_eur", "modello_HE", "note"):
+        if _c not in flussi.columns:
+            flussi[_c] = np.nan
     pvgis = pd.read_csv("pvgis_maniago_pulito.csv", parse_dates=["datetime"])
     buildings = buildings[~buildings["edificio"].str.startswith("Residenziale Zona")].copy()
 
@@ -1848,21 +1990,22 @@ def load_data():
         priv = pd.DataFrame(columns=["edificio", "cluster", "anello", "lat", "lon",
                                      "MWh_SH", "MWh_ACS", "consumo_annuo_MWh", "tipo_utenza"])
     if not priv.empty:
-        _res = domanda[domanda["tipologia"].astype(str).str.contains("RSA", na=False)]
-        _base = _res if not _res.empty else domanda
-        _p = _base.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
+        # I privati NON ereditano piu' il profilo dei pubblici: usano una forma
+        # residenziale propria, con le due punte giornaliere. La stagionalita'
+        # resta quella reale, ricavata dal fabbisogno orario aggregato degli
+        # edifici gia' noti (che incorpora i gradi giorno di Maniago).
+        _p = domanda.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
         _p = _p.reindex(domanda["datetime"].drop_duplicates().sort_values(), fill_value=0.0)
-        _f_sh = (_p["MWh_riscaldamento"] / _p["MWh_riscaldamento"].sum()).values
-        _f_acs_src = domanda.groupby("datetime")["MWh_ACS"].sum()
-        _f_acs = (_f_acs_src / _f_acs_src.sum()).values
         _idx = _p.index
+        _hdd_h = _p["MWh_riscaldamento"].values
         _agg = priv.groupby(["cluster", "anello"])[["MWh_SH", "MWh_ACS"]].sum().reset_index()
         _righe = []
         for r in _agg.itertuples():
             _nome = f"Privati {r.cluster} · est.{int(r.anello)}"
             _righe.append(pd.DataFrame({
                 "datetime": _idx, "edificio": _nome,
-                "MWh_riscaldamento": _f_sh * r.MWh_SH, "MWh_ACS": _f_acs * r.MWh_ACS,
+                "MWh_riscaldamento": profilo_residenziale(_idx, r.MWh_SH, _hdd_h),
+                "MWh_ACS": profilo_residenziale(_idx, r.MWh_ACS, quota_acs=1.0),
                 "cluster": r.cluster, "tipologia": "Residenziale privato",
                 "tipo_utenza": "Privato (potenziale)"}))
             buildings = pd.concat([buildings, pd.DataFrame([{
@@ -1876,14 +2019,14 @@ def load_data():
     except Exception:
         cond = pd.DataFrame(columns=["cluster", "unita"])
     if not cond.empty and not priv.empty:
+        # Anche i condomini seguono la forma residenziale. Rispetto alle case
+        # singole la punta e' un po' piu' smussata perche' le utenze interne
+        # sono gia' molte: se ne tiene conto con la contemporaneita' QM, che
+        # agisce a valle sul picco di dimensionamento.
         _pubb = domanda[domanda["tipo_utenza"] == "Pubblico"]
-        _res2 = _pubb[_pubb["tipologia"].astype(str).str.contains("RSA", na=False)]
-        _b2 = _res2 if not _res2.empty else _pubb
-        _p = _b2.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
+        _p = _pubb.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum()
         _idx = _p.index
-        _f_sh = (_p["MWh_riscaldamento"] / _p["MWh_riscaldamento"].sum()).values
-        _acs_src = _pubb.groupby("datetime")["MWh_ACS"].sum().reindex(_idx, fill_value=0.0)
-        _f_acs = (_acs_src / _acs_src.sum()).values
+        _hdd_h = _p["MWh_riscaldamento"].values
         _righe_c = []
         for _z, _g in cond.groupby("cluster"):
             _u = float(_g["unita"].sum())
@@ -1891,7 +2034,8 @@ def load_data():
             _nome = f"Condomini {_z}"
             _righe_c.append(pd.DataFrame({
                 "datetime": _idx, "edificio": _nome,
-                "MWh_riscaldamento": _f_sh * _e * 0.85, "MWh_ACS": _f_acs * _e * 0.15,
+                "MWh_riscaldamento": profilo_residenziale(_idx, _e * 0.85, _hdd_h),
+                "MWh_ACS": profilo_residenziale(_idx, _e * 0.15, quota_acs=1.0),
                 "cluster": _z, "tipologia": "Condominio censito", "tipo_utenza": "Condominio"}))
             buildings = pd.concat([buildings, pd.DataFrame([{
                 "edificio": _nome, "cluster": _z, "tipologia": "Condominio censito",
@@ -2002,14 +2146,8 @@ def genera_offerta_pvt(pvgis_df, n_pannelli, T_fluido_c, pvt_nome="Abora aH72 M2
     """
     p = PVT_ABORA
     area = n_pannelli * p["area_lorda_m2"]
-    df = pvgis_df.copy()
-    df["hour"] = df["datetime"].dt.hour
-    prof = df.groupby(["month", "hour"])[["G_totale", "T2m"]].mean().reset_index()
-    out = pd.DataFrame({"datetime": HOURS_2024})
-    out["month"] = out["datetime"].dt.month
-    out["hour"] = out["datetime"].dt.hour
-    out = out.merge(prof, on=["month", "hour"], how="left")
-    out[["G_totale", "T2m"]] = out[["G_totale", "T2m"]].fillna(0.0)
+    # anno meteorologico con la variabilita' giorno per giorno conservata
+    out = serie_meteo_annua(pvgis_df).copy()
     q_th, q_el = resa_pvt_oraria(out["G_totale"].values, out["T2m"].values, T_fluido_c)
     out["MWh_term"] = q_th * area / 1000.0
     out["MWh_el"] = q_el * area / 1000.0
@@ -2021,16 +2159,82 @@ def genera_offerta_pvt(pvgis_df, n_pannelli, T_fluido_c, pvt_nome="Abora aH72 M2
 
 
 @st.cache_data
+def serie_meteo_annua(pvgis_df):
+    """Anno meteorologico orario che conserva la sequenza reale dei giorni.
+
+    La media per mese e ora produce un giorno tipo che si ripete uguale per
+    tutto il mese: sparisce l'alternanza fra giornate serene e coperte, e con
+    essa le sequenze di piu' giorni nuvolosi consecutivi. Ma sono proprio
+    quelle a dimensionare l'accumulo: con un giorno tipo l'accumulo risulta
+    sempre sufficiente e la taglia viene sottostimata.
+
+    Qui si sceglie invece, per ciascun mese, un mese reale della serie storica:
+    quello con irraggiamento piu' vicino alla media di lungo periodo (criterio
+    del Typical Meteorological Year). La variabilita' giorno per giorno resta
+    intatta, mentre i totali mensili restano rappresentativi.
+
+    Ritorna un DataFrame sul calendario di HOURS_2024 con G_totale e T2m.
+    """
+    df = pvgis_df.copy()
+    df["month"] = df["datetime"].dt.month
+    df["anno"] = df["datetime"].dt.year
+    df["day"] = df["datetime"].dt.day
+    df["hour"] = df["datetime"].dt.hour
+
+    anni = sorted(df["anno"].unique())
+    if len(anni) <= 1:
+        # una sola annata disponibile: la si usa cosi' com'e'
+        scelta = {m: anni[0] for m in range(1, 13)}
+    else:
+        scelta = {}
+        for m in range(1, 13):
+            gm = df[df["month"] == m]
+            if gm.empty:
+                scelta[m] = anni[0]
+                continue
+            somme = gm.groupby("anno")["G_totale"].sum()
+            # scarto gli anni incompleti, che falserebbero il confronto
+            attese = somme.max() * 0.8
+            somme = somme[somme >= attese] if (somme >= attese).any() else somme
+            scelta[m] = int((somme - somme.median()).abs().idxmin())
+
+    pezzi = []
+    for m in range(1, 13):
+        gm = df[(df["month"] == m) & (df["anno"] == scelta[m])]
+        pezzi.append(gm[["month", "day", "hour", "G_totale", "T2m"]])
+    tipo = pd.concat(pezzi, ignore_index=True).drop_duplicates(
+        subset=["month", "day", "hour"])
+
+    out = pd.DataFrame({"datetime": HOURS_2024})
+    out["month"] = out["datetime"].dt.month
+    out["day"] = out["datetime"].dt.day
+    out["hour"] = out["datetime"].dt.hour
+    out = out.merge(tipo, on=["month", "day", "hour"], how="left")
+
+    # 29 febbraio e altri buchi: ricopio il giorno precedente disponibile
+    if out["G_totale"].isna().any():
+        media_mh = tipo.groupby(["month", "hour"])[["G_totale", "T2m"]].mean()
+        for col in ("G_totale", "T2m"):
+            mask = out[col].isna()
+            if mask.any():
+                out.loc[mask, col] = [
+                    media_mh.loc[(m, h), col] if (m, h) in media_mh.index else 0.0
+                    for m, h in zip(out.loc[mask, "month"], out.loc[mask, "hour"])]
+    return out[["datetime", "month", "hour", "G_totale", "T2m"]]
+
+
+@st.cache_data
 def genera_offerta_solare(pvgis_df, area_m2, efficienza):
-    pvgis_df = pvgis_df.copy()
-    pvgis_df["hour"] = pvgis_df["datetime"].dt.hour
-    profilo_tipo = pvgis_df.groupby(["month", "hour"])["G_totale"].mean().reset_index()
-    profilo_tipo["P_kW"] = profilo_tipo["G_totale"] * area_m2 * efficienza / 1000
-    df_h = pd.DataFrame({"datetime": HOURS_2024})
-    df_h["month"] = df_h["datetime"].dt.month
-    df_h["hour"] = df_h["datetime"].dt.hour
-    df_h = df_h.merge(profilo_tipo[["month", "hour", "P_kW"]], on=["month", "hour"], how="left")
-    df_h["MWh"] = df_h["P_kW"] / 1000
+    """Serie oraria di un campo solare termico tradizionale.
+
+    Usa l'anno meteorologico con la variabilita' giorno per giorno conservata:
+    una sequenza di giornate coperte produce davvero un buco di piu' giorni,
+    che e' cio' che mette alla prova l'accumulo.
+    """
+    meteo = serie_meteo_annua(pvgis_df)
+    df_h = meteo[["datetime"]].copy()
+    df_h["P_kW"] = meteo["G_totale"].values * area_m2 * efficienza / 1000.0
+    df_h["MWh"] = df_h["P_kW"] / 1000.0
     df_h["fonte"] = "Solare termico"
     df_h["T_disponibile"] = np.nan
     return df_h[["datetime", "fonte", "MWh", "P_kW", "T_disponibile"]]
@@ -3365,39 +3569,47 @@ with tab_offerta:
 
 | utenza | profilo orario |
 |---|---|
-| Edifici pubblici | dato reale dal CSV, edificio per edificio, riscaldamento e ACS separati, calibrato sui gradi giorno |
-| Privati | il totale annuo è distribuito sul **profilo normalizzato degli edifici pubblici** (RSA se presenti). Non hanno una forma propria |
-| Condomini | stesso profilo dei privati, con ripartizione fissa **85 % riscaldamento / 15 % ACS** |
+| Edifici pubblici | dato reale dal CSV, edificio per edificio, riscaldamento e ACS separati, calibrato sui gradi giorno di Maniago |
+| Privati | forma **residenziale** propria, con le due punte giornaliere (mattino e sera); la stagionalità segue il fabbisogno reale degli edifici noti |
+| Condomini | stessa forma residenziale, ripartizione 85 % riscaldamento / 15 % ACS |
 
-Il limite dei privati: una casa ha due picchi (mattina e sera) e di giorno è vuota,
-una RSA è occupata 24 ore. L'energia annua è corretta, la forma del picco no.
-La contemporaneità QM corregge il valore massimo, non la distribuzione oraria.
+Il profilo residenziale distingue giorni feriali e festivi (nel fine settimana
+la punta del mattino si sposta più tardi e si attenua). L'ACS ha una punta
+serale marcata e una lieve stagionalità, perché d'inverno l'acqua di rete è più
+fredda. La contemporaneità QM agisce a valle sul picco di dimensionamento.
 
-**Calore di scarto** — dalle colonne `profilo`, `giorni_sett`, `chiusura_gg` del CSV:
+**Calore di scarto** — dalle colonne del CSV dei flussi:
 
 | profilo | comportamento |
 |---|---|
-| `continuo` | potenza nominale costante nelle ore attive |
+| `continuo` | potenza costante nelle ore attive |
 | `notturno_18_08` | attivo dalle 18 alle 8 |
-| `ore_giorno_N` | N ore consecutive a partire dalle 6 del mattino |
+| `ore_giorno_N` | N ore consecutive dalle 6 del mattino |
 | `cf_random` | ore accese estratte a caso, con probabilità pari al fattore di carico |
 | `ciclico_colate` | rampa da `T_alta_C` a `T_out_C` ripetuta n volte al giorno |
 
-Tre avvertenze:
+La **potenza** utilizzata è quella dello scambiatore quotato (`P_scambiatore_kW`)
+dove disponibile, altrimenti quella teorica del flusso: è lo scambiatore a
+determinare quanto calore si recupera davvero.
 
-- la **temperatura è costante** in tutti i profili tranne `ciclico_colate`: nella
-  realtà un camino industriale oscilla col carico;
-- le **fermate sono casuali**: `chiusura_gg` dice quanti giorni l'impianto è fermo,
-  non quali. Metà finiscono a Natale, metà ad agosto, il resto è estratto a sorte
-  con un seme fisso. Sull'energia annua l'effetto è trascurabile, sulle date no;
-- `cf_random` distribuisce le ore a caso, quindi il flusso risulta **scorrelato
-  dalla domanda**: la quota valorizzata che compare nel grafico per azienda è
-  indicativa.
+Le **fermate** seguono il calendario reale: ferie centrali di agosto, chiusura
+fra Natale e l'Epifania, festività infrasettimanali (compreso San Mauro,
+patrono di Maniago), e solo per il residuo i venerdì di manutenzione. Gli
+impianti a ciclo continuo che non si fermano a Natale si dichiarano con la
+colonna `natale_acceso`.
 
-**Solare** — il PVGIS orario reale viene mediato per mese e ora, ottenendo un
-giorno tipo mensile che si ripete. Si perde la variabilità giorno per giorno,
-quindi non compaiono le sequenze di giorni nuvolosi consecutivi, che sono
-proprio quelle che dimensionerebbero l'accumulo.
+Resta una semplificazione: la **temperatura è costante** in tutti i profili
+tranne `ciclico_colate`, mentre un camino industriale oscilla col carico. E
+`cf_random` distribuisce le ore a caso, quindi quel flusso risulta scorrelato
+dalla domanda.
+
+**Solare** — l'anno meteorologico conserva la **sequenza reale dei giorni**: per
+ogni mese si sceglie, fra le annate della serie PVGIS, quella con irraggiamento
+più vicino alla mediana. Restano così le alternanze fra giornate serene e
+coperte e le sequenze di più giorni nuvolosi consecutivi, che sono proprio
+quelle che mettono alla prova l'accumulo. Con la media mensile, che produce un
+giorno tipo sempre uguale, l'accumulo risulterebbe sempre sufficiente e la
+taglia verrebbe sottostimata.
 """)
 
     with st.expander("\U0001F4CB Dettaglio flussi da CSV (dati grezzi)"):
@@ -4932,7 +5144,74 @@ with tab_economia:
         # ---------------------------------------------------------------------
         capex_centrale = float(_snap["capex_sistema"])
         capex_rete = float(_snap["capex_rete"])
-        capex_tot = capex_centrale + capex_rete
+        # fattore di annualizzazione provvisorio, per l'incidenza degli allacci
+        _crf_pre = crf(float(st.session_state.get("eco_wacc", 4.0)) / 100.0,
+                       int(st.session_state.get("eco_anni", 25)))
+
+        # --- CAPEX di allacciamento delle aziende cedenti ---
+        # Comprende scambiatore, opere in situ e condotta di adduzione fino
+        # alla sottocentrale. Le quotazioni note arrivano dal CSV dei flussi,
+        # le lunghezze delle adduzioni dal routing stradale della scheda Offerta.
+        _fl_sel = st.session_state.get("_off_flussi", []) or []
+        _q_all = flussi[flussi["id_flusso"].isin(_fl_sel)].copy()
+        _cq = pd.to_numeric(_q_all.get("costo_allacciamento_eur"), errors="coerce")
+        _costo_he_noto = float(_cq.fillna(0).sum())
+        _n_senza = int(_cq.isna().sum())
+        _lung_add = st.session_state.get("_off_lunghezze_adduzione", {}) or {}
+        _m_add = float(sum(_lung_add.values()))
+
+        with st.expander(f"🔌 Allacciamento delle aziende cedenti "
+                         f"({len(_q_all)} flussi, {len(_lung_add)} stabilimenti)"):
+            _ac1, _ac2 = st.columns(2)
+            _costo_m_add = _ac1.slider("Costo condotta di adduzione (€/m)", 200, 1500, 700,
+                                       step=50, key="eco_costo_add",
+                                       help="Comprende scavo, tubazione preisolata e "
+                                            "ripristini. Le adduzioni industriali sono "
+                                            "di norma più costose della distribuzione "
+                                            "perché a diametro maggiore.")
+            _costo_he_stima = _ac2.slider("Scambiatore, dove non quotato (€/kW)", 10, 200, 60,
+                                          step=5, key="eco_costo_he",
+                                          help=f"{_n_senza} flussi non hanno ancora una "
+                                               f"quotazione: si stimano a potenza.")
+            _p_senza = float(pd.to_numeric(_q_all.loc[_cq.isna(), "P_kW"],
+                                           errors="coerce").fillna(0).sum())
+            _costo_he_tot = _costo_he_noto + _p_senza * _costo_he_stima
+            _costo_add_tot = _m_add * _costo_m_add
+            capex_allacci = _costo_he_tot + _costo_add_tot
+            _r1, _r2, _r3 = st.columns(3)
+            _r1.metric("Scambiatori e opere", f"{_costo_he_tot / 1000:,.0f} k€".replace(",", "."),
+                       help=f"quotati {_costo_he_noto:,.0f} € · stimati "
+                            f"{_p_senza * _costo_he_stima:,.0f} € su {_p_senza:,.0f} kW".replace(",", "."))
+            _r2.metric("Condotte di adduzione", f"{_costo_add_tot / 1000:,.0f} k€".replace(",", "."),
+                       help=f"{_m_add:,.0f} m lungo le strade".replace(",", "."))
+            _r3.metric("Totale allacciamenti", f"{capex_allacci / 1e6:.2f} M€")
+            if not _q_all.empty:
+                _tb = _q_all[["azienda", "flusso", "P_kW", "costo_allacciamento_eur",
+                              "modello_HE"]].copy()
+                _tb["costo_allacciamento_eur"] = _cq.fillna(
+                    pd.to_numeric(_q_all["P_kW"], errors="coerce") * _costo_he_stima).round(0)
+                _tb.columns = ["Azienda", "Flusso", "Potenza (kW)", "Scambiatore (€)", "Modello"]
+                st.dataframe(_tb, width="stretch", hide_index=True)
+            _utz_ec = st.session_state.get("_off_utilizzo_aziende")
+            if _utz_ec is not None and not _utz_ec.empty and capex_allacci > 0:
+                _u2 = _utz_ec.copy()
+                _u2["quota"] = _u2["utilizzata_mwh"] / max(_u2["utilizzata_mwh"].sum(), 1e-9)
+                _u2["capex_att"] = _u2["quota"] * capex_allacci
+                _u2["eur_per_mwh"] = np.where(
+                    _u2["utilizzata_mwh"] > 1e-9,
+                    _u2["capex_att"] * _crf_pre / _u2["utilizzata_mwh"], np.nan)
+                _tb2 = _u2[["azienda", "utilizzata_mwh", "capex_att", "eur_per_mwh"]].copy()
+                _tb2.columns = ["Azienda", "Calore utilizzato (MWh/a)",
+                                "CAPEX attribuito (€)", "Incidenza (€/MWh)"]
+                _tb2 = _tb2.round(1)
+                st.markdown("**Quanto costa il calore di ciascuna azienda**")
+                st.dataframe(_tb2, width="stretch", hide_index=True)
+                st.caption("Il CAPEX è ripartito in proporzione al calore effettivamente "
+                           "valorizzato e annualizzato al tasso indicato. L'incidenza in "
+                           "€/MWh si somma al prezzo pagato all'azienda: se supera il costo "
+                           "delle alternative, quell'allacciamento non conviene.")
+
+        capex_tot = capex_centrale + capex_rete + capex_allacci
         contributo = capex_tot * contributo_pct / 100.0
         capex_netto = capex_tot - contributo
 
@@ -4989,7 +5268,8 @@ with tab_economia:
 
         n1, n2, n3, n4 = st.columns(4)
         n1.metric("CAPEX totale", f"{capex_tot / 1e6:.2f} M\u20ac",
-                  help=f"centrale {capex_centrale / 1e6:.2f} M\u20ac + rete {capex_rete / 1e6:.2f} M\u20ac")
+                  help=f"centrale {capex_centrale / 1e6:.2f} M€ + rete {capex_rete / 1e6:.2f} M€ "
+                       f"+ allacciamenti aziende {capex_allacci / 1e6:.2f} M€")
         n2.metric("Contributo pubblico", f"{contributo / 1e6:.2f} M\u20ac",
                   help=f"{contributo_pct}% del CAPEX")
         n3.metric("Investimento netto", f"{capex_netto / 1e6:.2f} M\u20ac")
@@ -5032,6 +5312,7 @@ with tab_economia:
                    ("Personale e gestione", personale, "#F4A259"),
                    ("Assicurazioni e varie", assicuraz, "#9AA0A6"),
                    ("CAPEX annualizzato", capex_netto * _crf_eco, "#5B8DEF")]
+        # nota: il CAPEX comprende centrale, rete e allacciamenti industriali
         _voci_c = [(n, v, c) for n, v, c in _voci_c if v > 0]
         # A barre e non a torta: ogni voce e' espressa anche in euro per MWh
         # venduto, cioe' nella stessa unita' del prezzo di vendita, cosi' si
