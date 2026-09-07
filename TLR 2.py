@@ -428,54 +428,115 @@ def buffer_tracciato(archi_pubblici, priv_lat, priv_lon, raggio_m=50.0):
 # =============================================================================
 # ROUTING SU RETE STRADALE OSM
 # =============================================================================
-def _osm_download_strade(centro_lat, centro_lon, raggio_km=1.5, timeout=90):
-    """Scarica il grafo stradale attorno al centro tramite Overpass API.
-    Ritorna (dict, None) se ok, (None, str_errore) se fallisce.
+# Tipi di viabilita' utili al tracciato di una rete di teleriscaldamento.
+# Il filtro viene applicato in Python e non nella query: un'espressione
+# regolare lunga rallenta Overpass e in certi casi fa scadere il timeout,
+# restituendo una risposta vuota.
+STRADE_UTILI = {
+    "motorway", "trunk", "primary", "secondary", "tertiary", "unclassified",
+    "residential", "service", "living_street", "pedestrian", "road", "track",
+    "motorway_link", "trunk_link", "primary_link", "secondary_link",
+    "tertiary_link",
+}
+
+
+def _bbox(centro_lat, centro_lon, raggio_km):
+    """Riquadro (sud, ovest, nord, est) attorno al centro.
+
+    Il grado di longitudine vale 111 km solo all'equatore: a 46 N sono ~77 km,
+    quindi senza il coseno il riquadro risulterebbe schiacciato in est-ovest.
     """
-    try:
-        import requests
-    except ImportError:
-        return None, "modulo 'requests' non installato (pip install requests)"
-    # Il grado di longitudine vale 111 km SOLO all'equatore: a 46 N sono ~77 km.
-    # Senza il coseno il riquadro risultava schiacciato in est-ovest (69% del
-    # raggio voluto) e gli edifici ai bordi restavano fuori dal grafo.
     d_lat = raggio_km / 111.0
     d_lon = raggio_km / (111.0 * np.cos(np.radians(centro_lat)))
-    bbox = (centro_lat - d_lat, centro_lon - d_lon,
+    return (centro_lat - d_lat, centro_lon - d_lon,
             centro_lat + d_lat, centro_lon + d_lon)
-    # Filtro ampio: servono anche trunk/motorway (spesso unici assi di
-    # collegamento tra zone), i rispettivi _link, e track/road per le aree
-    # artigianali e periurbane dove i civici stanno su viabilita' minore.
-    _tipi = ("motorway|trunk|primary|secondary|tertiary|unclassified|residential|"
-             "service|living_street|pedestrian|road|track|"
-             "motorway_link|trunk_link|primary_link|secondary_link|tertiary_link")
-    q = f"""
-[out:json][timeout:{timeout}];
-(
-  way["highway"~"^({_tipi})$"]
-    ({bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]});
-);
-out body;
->;
-out skel qt;
-"""
-    # provo 3 endpoint Overpass in cascata
+
+
+def _osm_da_overpass(bb, timeout=60):
+    """Scarica da Overpass. Ritorna (dict, None) oppure (None, errore)."""
+    import requests
+    # Query volutamente semplice: si chiedono tutte le highway del riquadro e
+    # si filtra dopo. Le espressioni regolari lunghe appesantiscono il server.
+    q = (f"[out:json][timeout:{timeout}];"
+         f'(way["highway"]({bb[0]:.5f},{bb[1]:.5f},{bb[2]:.5f},{bb[3]:.5f}););'
+         f"out body;>;out skel qt;")
     endpoints = [
         "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
         "https://overpass.osm.ch/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
     ]
-    ultimo_errore = None
+    ultimo = None
     for url in endpoints:
         try:
-            r = requests.get(url, params={"data": q}, timeout=timeout + 30,
-                             headers={"User-Agent": "TLR-Maniago/1.0"})
-            r.raise_for_status()
-            return r.json(), None
+            r = requests.post(url, data={"data": q}, timeout=timeout + 30,
+                              headers={"User-Agent": "TLR-Maniago/1.0"})
+            if r.status_code != 200:
+                ultimo = f"{url.split('//')[1].split('/')[0]}: HTTP {r.status_code}"
+                continue
+            js = r.json()
+            if sum(1 for e in js.get("elements", []) if e.get("type") == "node") > 0:
+                return js, None
+            ultimo = f"{url.split('//')[1].split('/')[0]}: risposta senza nodi"
         except Exception as e:
-            ultimo_errore = f"{url.split('//')[1].split('/')[0]}: {type(e).__name__}: {str(e)[:120]}"
+            ultimo = f"{url.split('//')[1].split('/')[0]}: {type(e).__name__}"
+    return None, ultimo
+
+
+def _osm_da_api_ufficiale(bb, timeout=90):
+    """Scarica dall'API ufficiale OpenStreetMap (XML).
+
+    E' il canale piu' affidabile quando Overpass e' sovraccarico: restituisce
+    tutti gli elementi del riquadro, senza filtri. Il limite di 0,25 gradi
+    quadrati e' ampiamente rispettato dall'area di Maniago (~0,004).
+    Il risultato viene convertito nella stessa struttura di Overpass.
+    """
+    import requests
+    import xml.etree.ElementTree as ET
+    url = (f"https://api.openstreetmap.org/api/0.6/map?"
+           f"bbox={bb[1]:.5f},{bb[0]:.5f},{bb[3]:.5f},{bb[2]:.5f}")
+    try:
+        r = requests.get(url, timeout=timeout,
+                         headers={"User-Agent": "TLR-Maniago/1.0"})
+        if r.status_code != 200:
+            return None, f"api.openstreetmap.org: HTTP {r.status_code}"
+        root = ET.fromstring(r.content)
+    except Exception as e:
+        return None, f"api.openstreetmap.org: {type(e).__name__}: {str(e)[:80]}"
+
+    elementi = []
+    for nd in root.findall("node"):
+        elementi.append({"type": "node", "id": int(nd.get("id")),
+                         "lat": float(nd.get("lat")), "lon": float(nd.get("lon"))})
+    for w in root.findall("way"):
+        tags = {t.get("k"): t.get("v") for t in w.findall("tag")}
+        if "highway" not in tags:
             continue
-    return None, ultimo_errore or "tutti gli endpoint Overpass hanno fallito"
+        elementi.append({"type": "way", "id": int(w.get("id")),
+                         "nodes": [int(n.get("ref")) for n in w.findall("nd")],
+                         "tags": tags})
+    if not any(e["type"] == "way" for e in elementi):
+        return None, "api.openstreetmap.org: nessuna strada nel riquadro"
+    return {"elements": elementi}, None
+
+
+def _osm_download_strade(centro_lat, centro_lon, raggio_km=1.5, timeout=60):
+    """Rete stradale del riquadro, da Overpass o dall'API ufficiale OSM.
+
+    Ritorna (dict, None) se va a buon fine, (None, messaggio) altrimenti.
+    """
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        return None, "modulo 'requests' non installato (pip install requests)"
+    bb = _bbox(centro_lat, centro_lon, raggio_km)
+    data, err1 = _osm_da_overpass(bb, timeout)
+    if data is not None:
+        return data, None
+    data, err2 = _osm_da_api_ufficiale(bb)
+    if data is not None:
+        return data, None
+    return None, f"Overpass ({err1}); API OSM ({err2})"
 
 
 @st.cache_data(show_spinner="Scarico la rete stradale di Maniago (una volta sola)...")
@@ -528,16 +589,25 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
         except Exception:
             pass
 
-    # parse: nodi + strade
+    # parse: nodi + strade. Il filtro sui tipi di viabilita' si applica qui e
+    # non nella query, perche' un'espressione regolare lunga rallenta Overpass
+    # fino a farlo scadere restituendo una risposta vuota.
     nodi = {}
     strade = []
     for el in data.get("elements", []):
-        if el["type"] == "node":
+        if el.get("type") == "node":
             nodi[el["id"]] = (el["lat"], el["lon"])
-        elif el["type"] == "way":
-            strade.append(el.get("nodes", []))
+        elif el.get("type") == "way":
+            _tags = el.get("tags") or {}
+            _hw = _tags.get("highway")
+            # se il tag non e' disponibile (Overpass con "out skel") si tiene
+            # la strada: meglio qualche sentiero in piu' che un buco nel grafo
+            if _hw is None or _hw in STRADE_UTILI:
+                strade.append(el.get("nodes", []))
     if not nodi:
-        return None, "risposta OSM senza nodi (bbox vuoto o filtro errato)"
+        return None, "risposta senza nodi: riquadro vuoto o filtro troppo stretto"
+    if not strade:
+        return None, "nessuna strada utile nel riquadro"
 
     # ------------------------------------------------------------------
     # DENSIFICAZIONE DEL GRAFO
@@ -3042,10 +3112,54 @@ with tab_domanda:
                     except Exception:
                         pass
                     st.rerun()
-                _w2.caption("Cause più frequenti: Overpass momentaneamente sovraccarico "
-                            "(riprova fra un minuto), assenza di connessione, oppure un "
-                            "proxy aziendale che blocca la richiesta. Le dipendenze "
-                            "necessarie sono `networkx`, `scipy` e `requests`.")
+                _w2.caption("Il programma prova prima Overpass su quattro server, poi "
+                            "l'API ufficiale di OpenStreetMap. Se falliscono entrambi si "
+                            "tratta quasi sempre di un sovraccarico temporaneo o di un "
+                            "proxy aziendale che blocca la richiesta.")
+                with st.expander("Scaricare la mappa manualmente"):
+                    _bbm = _bbox(GRAFO_CENTRO_LAT, GRAFO_CENTRO_LON, GRAFO_RAGGIO_KM)
+                    _url_m = (f"https://api.openstreetmap.org/api/0.6/map?"
+                              f"bbox={_bbm[1]:.5f},{_bbm[0]:.5f},{_bbm[3]:.5f},{_bbm[2]:.5f}")
+                    st.markdown(
+                        f"Da una rete senza restrizioni, apri [questo indirizzo]({_url_m}) "
+                        f"e salva il file `.osm` che viene restituito, poi caricalo qui "
+                        f"sotto: viene convertito e messo in cache, e da quel momento il "
+                        f"tracciato segue le strade senza bisogno di connessione.")
+                    _up = st.file_uploader("File .osm o .xml", type=["osm", "xml"],
+                                           key="dom_osm_upload")
+                    if _up is not None:
+                        try:
+                            import xml.etree.ElementTree as _ET
+                            _root = _ET.fromstring(_up.getvalue())
+                            _els = []
+                            for _nd in _root.findall("node"):
+                                _els.append({"type": "node", "id": int(_nd.get("id")),
+                                             "lat": float(_nd.get("lat")),
+                                             "lon": float(_nd.get("lon"))})
+                            for _w in _root.findall("way"):
+                                _tg = {t.get("k"): t.get("v") for t in _w.findall("tag")}
+                                if "highway" not in _tg:
+                                    continue
+                                _els.append({"type": "way", "id": int(_w.get("id")),
+                                             "nodes": [int(x.get("ref"))
+                                                       for x in _w.findall("nd")],
+                                             "tags": _tg})
+                            _n_way = sum(1 for e in _els if e["type"] == "way")
+                            if _n_way == 0:
+                                st.error("Nel file non ci sono strade.")
+                            else:
+                                with open("maniago_strade_cache.json", "w",
+                                          encoding="utf-8") as _f:
+                                    json.dump({"elements": _els}, _f)
+                                try:
+                                    carica_grafo_strade.clear()
+                                except Exception:
+                                    pass
+                                st.success(f"Mappa caricata: {_n_way} strade. "
+                                           f"Ricarico la pagina.")
+                                st.rerun()
+                        except Exception as _e:
+                            st.error(f"File non leggibile: {type(_e).__name__}")
             if _uso_osm and build_grafo_stradale(_strade) is None:
                 st.warning("⚠️ modulo `networkx` non installato "
                            "(pip install networkx). Uso il tracciato in linea d'aria.")
