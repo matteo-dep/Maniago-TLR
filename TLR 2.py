@@ -212,6 +212,16 @@ CENTRALE_LAT, CENTRALE_LON = 46.149000, 46.149000  # placeholder, ricalcolato
 # allacci rettilinei lunghi centinaia di metri che tagliavano l'abitato.
 MAX_SNAP_M = 120.0
 
+# Centro attorno a cui si scarica la rete stradale. E' volutamente FISSO e
+# indipendente dalla posizione della sottocentrale, che invece si sposta con
+# le selezioni dell'utente: se cambiasse, ogni spostamento farebbe ripartire
+# un download da Overpass, con il rischio di incappare nel limite di richieste.
+# Il raggio e' ampio abbastanza da coprire sia il centro urbano sia la zona
+# industriale in qualunque configurazione.
+GRAFO_CENTRO_LAT = 46.1495
+GRAFO_CENTRO_LON = 12.7175
+GRAFO_RAGGIO_KM = 3.0
+
 def calcola_sottocentrale(bmap_df):
     """Calcola la sottocentrale come punto intermedio tra il baricentro
     delle 4 aziende sorgente e il baricentro degli edifici pubblici passati.
@@ -475,25 +485,49 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
 
     Ritorna (grafo_dict, None) se ok oppure (None, messaggio_errore).
     """
+    if not _HAS_SCIPY:
+        return None, "scipy non disponibile in questo processo streamlit"
+
+    def _conta_nodi(d):
+        if not isinstance(d, dict):
+            return 0
+        return sum(1 for e in d.get("elements", []) if e.get("type") == "node")
+
+    # La cache viene riletta solo se contiene davvero dei nodi: se un tentativo
+    # precedente ha salvato una risposta vuota (Overpass sovraccarico, limite di
+    # richieste raggiunto), il file resterebbe corrotto e ogni avvio successivo
+    # fallirebbe allo stesso modo. In quel caso si riscarica.
     data = None
     err = None
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            err = f"cache locale illeggibile: {e}"
+                _c = json.load(f)
+            if _conta_nodi(_c) > 0:
+                data = _c
+            else:
+                os.remove(cache_file)
+        except Exception:
+            try:
+                os.remove(cache_file)
+            except Exception:
+                pass
             data = None
+
     if data is None:
         data, err = _osm_download_strade(centro_lat, centro_lon, raggio_km)
         if data is None:
             return None, err
+        if _conta_nodi(data) == 0:
+            return None, ("Overpass ha risposto senza dati: di solito è un limite "
+                          "di richieste temporaneo. Riprova fra qualche minuto.")
+        # si salva solo una risposta valida
         try:
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(data, f)
-        except Exception as e:
-            # non fatale
+        except Exception:
             pass
+
     # parse: nodi + strade
     nodi = {}
     strade = []
@@ -504,8 +538,6 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
             strade.append(el.get("nodes", []))
     if not nodi:
         return None, "risposta OSM senza nodi (bbox vuoto o filtro errato)"
-    if not _HAS_SCIPY:
-        return None, "scipy non disponibile in questo processo streamlit"
 
     # ------------------------------------------------------------------
     # DENSIFICAZIONE DEL GRAFO
@@ -2988,20 +3020,35 @@ with tab_domanda:
                      "Serve a capire dove la mappa è completa e dove invece il tracciato "
                      "è costretto a procedere in linea retta per mancanza di dati.")
 
-            _strade_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=2.5) if usa_strade else (None, None)
+            _strade_res = carica_grafo_strade(GRAFO_CENTRO_LAT, GRAFO_CENTRO_LON,
+                                              raggio_km=GRAFO_RAGGIO_KM) if usa_strade else (None, None)
             _strade, _osm_err = _strade_res if isinstance(_strade_res, tuple) else (_strade_res, None)
             _uso_osm = _strade is not None
             if usa_strade and not _uso_osm:
                 _msg_err = f" — causa: `{_osm_err}`" if _osm_err else ""
-                st.warning(f"\u26a0\ufe0f Rete stradale OSM non disponibile{_msg_err}. "
-                           f"Uso il metodo MST + tortuosita. "
-                           f"**Suggerimenti**: (1) verifica connessione internet; "
-                           f"(2) installa dipendenze con `pip install networkx scipy requests`; "
-                           f"(3) se sei dietro proxy/VPN aziendale, disattivalo temporaneamente per "
-                           f"scaricare la cache la prima volta.")
+                st.warning(f"⚠️ Rete stradale non disponibile{_msg_err}. "
+                           f"Il tracciato è calcolato in linea d'aria con tortuosità, "
+                           f"quindi le condotte appaiono come segmenti rettilinei.")
+                _w1, _w2 = st.columns([1, 3])
+                if _w1.button("🔄 Riprova il download", key="dom_retry_osm",
+                              width="stretch"):
+                    try:
+                        if os.path.exists("maniago_strade_cache.json"):
+                            os.remove("maniago_strade_cache.json")
+                    except Exception:
+                        pass
+                    try:
+                        carica_grafo_strade.clear()
+                    except Exception:
+                        pass
+                    st.rerun()
+                _w2.caption("Cause più frequenti: Overpass momentaneamente sovraccarico "
+                            "(riprova fra un minuto), assenza di connessione, oppure un "
+                            "proxy aziendale che blocca la richiesta. Le dipendenze "
+                            "necessarie sono `networkx`, `scipy` e `requests`.")
             if _uso_osm and build_grafo_stradale(_strade) is None:
-                st.warning("\u26a0\ufe0f modulo `networkx` non installato "
-                           "(pip install networkx). Uso il metodo MST.")
+                st.warning("⚠️ modulo `networkx` non installato "
+                           "(pip install networkx). Uso il tracciato in linea d'aria.")
                 _uso_osm = False
 
             if _uso_osm:
@@ -3796,7 +3843,8 @@ taglia verrebbe sottostimata.
         # Percorso delle condotte di adduzione dalle aziende alla sottocentrale,
         # calcolato sulle strade reali come nella scheda Domanda. In mancanza
         # del grafo OSM si ripiega sul collegamento diretto.
-        _str_res = carica_grafo_strade(CENTRALE_LAT, CENTRALE_LON, raggio_km=2.5)
+        _str_res = carica_grafo_strade(GRAFO_CENTRO_LAT, GRAFO_CENTRO_LON,
+                                       raggio_km=GRAFO_RAGGIO_KM)
         _str_off, _ = _str_res if isinstance(_str_res, tuple) else (_str_res, None)
         _G_off = build_grafo_stradale(_str_off) if _str_off is not None else None
 
@@ -3871,8 +3919,20 @@ taglia verrebbe sottostimata.
                            + f" — in totale **{sum(_att_len.values()):,.0f} m**".replace(",", "."))
                 st.session_state["_off_lunghezze_adduzione"] = _att_len
         else:
-            st.caption("Rete stradale non disponibile: i collegamenti sono mostrati "
-                       "in linea d'aria con tortuosità 1,35.")
+            st.warning("⚠️ Rete stradale non disponibile: i collegamenti sono mostrati "
+                       "in linea d'aria con tortuosità 1,35, quindi come segmenti "
+                       "rettilinei. Le lunghezze delle adduzioni sono approssimate.")
+            if st.button("🔄 Riprova a scaricare la rete stradale", key="off_retry_osm"):
+                try:
+                    if os.path.exists("maniago_strade_cache.json"):
+                        os.remove("maniago_strade_cache.json")
+                except Exception:
+                    pass
+                try:
+                    carica_grafo_strade.clear()
+                except Exception:
+                    pass
+                st.rerun()
         st.divider()
 
 
