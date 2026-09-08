@@ -28,6 +28,12 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P16 Sorgente fredda della HP bassa T dimensionata davvero (sonde verticali,
+     serpentine orizzontali o acqua di falda) con superficie, numero di pozzi
+     e costo; nuova scheda "Carico elettrico" con autoconsumo, accumulo e
+     valorizzazione ai prezzi zonali orari; solare governabile da superficie
+     o da potenza richiesta; soglia di densita' azzerabile per includere
+     tutti gli edifici.
  P15 Profili orari rivisti: i privati e i condomini hanno una forma
      residenziale propria (due punte giornaliere, distinzione feriale/festivo)
      invece di ereditare quella degli edifici pubblici; le fermate degli
@@ -1229,6 +1235,95 @@ def schema_impianto_svg(cfg):
 
     a('</svg>')
     return "\n".join(p)
+
+
+# =============================================================================
+# CIRCUITO GEOTERMICO / SORGENTE DELLA POMPA A BASSA TEMPERATURA
+# =============================================================================
+# Il terreno non e' una sorgente illimitata: ogni kW estratto richiede una
+# quantita' precisa di scambio, e a potenze da teleriscaldamento le opere
+# diventano rilevanti quanto la centrale. 1.500 kW estratti significano
+# 300-400 pozzi da 100 m su circa due ettari, oppure sei ettari di terreno
+# libero con le serpentine.
+SORGENTI_BASSA_T = {
+    "sonde verticali": {
+        "unita": "m di perforazione",
+        "resa_min": 30.0, "resa_tip": 45.0, "resa_max": 60.0,   # W per metro
+        "costo_min": 35.0, "costo_tip": 60.0, "costo_max": 90.0,  # EUR/m
+        "prof_sonda_m": 100.0,
+        "passo_m": 7.0,          # interasse tipico fra le sonde
+        "note": ("Resa 30-60 W/m secondo la conducibilita' del terreno e la falda. "
+                 "Nell'alta pianura friulana, con ghiaie sature, si sta nella parte "
+                 "alta della forchetta. Richiede indagine geognostica e, sopra i "
+                 "certi volumi, autorizzazione allo scarico termico."),
+    },
+    "serpentine orizzontali": {
+        "unita": "m² di terreno",
+        "resa_min": 15.0, "resa_tip": 25.0, "resa_max": 35.0,   # W per m2
+        "costo_min": 12.0, "costo_tip": 22.0, "costo_max": 35.0,  # EUR/m2
+        "prof_posa_m": 1.5,
+        "note": ("Posa a 1,5 m di profondita'. Il terreno sopra le serpentine resta "
+                 "libero solo per prato o coltivazioni superficiali: niente edifici "
+                 "ne' alberi. La resa cala molto in terreni asciutti."),
+    },
+    "acqua di falda": {
+        "unita": "l/s di portata",
+        "dt_k": 4.0,             # salto termico ammesso sul prelievo
+        # il costo si conta a pozzo, non a portata: un pozzo attrezzato in
+        # alta pianura rende 30-80 l/s e costa fra 40 e 120 mila euro fra
+        # perforazione, colonna, elettropompa, filtri e opere di resa
+        "costo_min": 40000.0, "costo_tip": 75000.0, "costo_max": 130000.0,
+        "resa_min": 25.0, "resa_tip": 50.0, "resa_max": 80.0,   # l/s per pozzo
+        "note": ("Soluzione piu' compatta ed efficiente dove la falda e' ricca, come "
+                 "nell'alta pianura pordenonese. Richiede concessione di derivazione "
+                 "e pozzo di resa: il vincolo non e' la superficie ma il salto "
+                 "termico ammesso allo scarico e la disponibilita' idrica."),
+    },
+}
+
+
+def dimensiona_sorgente_bassa_t(potenza_kw, tipo="sonde verticali", resa=None,
+                                costo_unitario=None):
+    """Opere necessarie per estrarre una data potenza dalla sorgente fredda.
+
+    Ritorna un dizionario con la grandezza dimensionante (metri di perforazione,
+    superficie o portata), il numero di pozzi dove ha senso, la superficie
+    complessivamente impegnata e il costo.
+    """
+    p = SORGENTI_BASSA_T.get(tipo, SORGENTI_BASSA_T["sonde verticali"])
+    out = {"tipo": tipo, "potenza_kw": float(potenza_kw), "note": p["note"]}
+    if potenza_kw <= 0:
+        return {**out, "quantita": 0.0, "unita": p["unita"], "n_pozzi": 0,
+                "superficie_m2": 0.0, "costo": 0.0, "costo_unitario": 0.0}
+    W = float(potenza_kw) * 1000.0
+
+    if tipo == "acqua di falda":
+        # Q = m_punto * cp * dT  ->  portata necessaria al prelievo
+        dt = p["dt_k"]
+        cu = float(costo_unitario if costo_unitario is not None else p["costo_tip"])
+        resa_pozzo = float(resa if resa is not None else p["resa_tip"])   # l/s
+        m_punto = float(potenza_kw) / (CP_ACQUA_KJ_KG_K * dt)             # kg/s
+        portata_ls = m_punto / 1000.0 * 1000.0                            # l/s
+        n_pozzi = int(np.ceil(portata_ls / max(resa_pozzo, 1e-6)))
+        # ai pozzi di presa si aggiunge sempre almeno un pozzo di resa
+        n_tot = n_pozzi + max(1, n_pozzi // 2)
+        return {**out, "quantita": portata_ls, "unita": p["unita"],
+                "n_pozzi": n_tot, "superficie_m2": n_tot * 150.0,
+                "costo": n_tot * cu, "costo_unitario": cu, "dt_k": dt,
+                "resa": resa_pozzo,
+                "portata_m3h": portata_ls * 3.6}
+
+    r = float(resa if resa is not None else p["resa_tip"])
+    cu = float(costo_unitario if costo_unitario is not None else p["costo_tip"])
+    q = W / r                      # metri di sonda oppure m2 di terreno
+    if tipo == "sonde verticali":
+        n_pozzi = int(np.ceil(q / p["prof_sonda_m"]))
+        sup = n_pozzi * p["passo_m"] ** 2
+    else:
+        n_pozzi = 0
+        sup = q
+    return {**out, "quantita": q, "unita": p["unita"], "n_pozzi": n_pozzi,
+            "superficie_m2": sup, "costo": q * cu, "costo_unitario": cu, "resa": r}
 
 
 def potenza_da_energia(mwh_anno, ore_equivalenti=1900.0, f_contemporaneita=1.0):
@@ -2503,6 +2598,116 @@ def genera_pdf_scenari(scenari, titolo="Confronto scenari"):
     return buf.getvalue()
 
 
+# =============================================================================
+# COPERTURA DEL CARICO ELETTRICO
+# =============================================================================
+def dispatch_elettrico(produzione, consumo, batteria_mwh=0.0, p_batt_mw=None,
+                       eff_batt=0.90, soc_iniziale=0.2):
+    """Bilancio elettrico orario fra produzione rinnovabile e consumo.
+
+    Ordine di merito, come nel toolkit H2Ready: la produzione copre prima il
+    consumo istantaneo, l'eccedenza carica la batteria, cio' che resta viene
+    immesso in rete; il deficit viene coperto dalla batteria e infine prelevato
+    dalla rete.
+
+    Il rendimento di ciclo si applica meta' in carica e meta' in scarica
+    (radice quadrata), cosi' il rendimento complessivo di andata e ritorno
+    coincide con quello dichiarato.
+
+    Args:
+        produzione: serie oraria di generazione (MWh)
+        consumo: serie oraria di assorbimento (MWh)
+        batteria_mwh: capacita' utile dell'accumulo
+        p_batt_mw: potenza massima in carica e scarica; se assente si assume
+            una taglia da un'ora (C-rate 1)
+        eff_batt: rendimento di ciclo completo
+
+    Ritorna un dizionario con le serie orarie e gli aggregati annui.
+    """
+    prod = np.asarray(produzione, dtype=float)
+    cons = np.asarray(consumo, dtype=float)
+    n = len(cons)
+    if len(prod) != n:
+        prod = np.resize(prod, n)
+
+    autoc_diretto = np.minimum(prod, cons)
+    surplus = prod - autoc_diretto
+    deficit = cons - autoc_diretto
+
+    carica = np.zeros(n)
+    scarica = np.zeros(n)
+    soc_serie = np.zeros(n)
+
+    if batteria_mwh > 0:
+        p_max = float(p_batt_mw) if p_batt_mw else float(batteria_mwh)
+        se = np.sqrt(eff_batt)
+        soc = batteria_mwh * soc_iniziale
+        for t in range(n):
+            if surplus[t] > 0:
+                c = min(surplus[t], (batteria_mwh - soc) / se, p_max)
+                if c > 0:
+                    soc += c * se
+                    carica[t] = c
+                    surplus[t] -= c
+            elif deficit[t] > 0:
+                d = min(deficit[t], soc * se, p_max)
+                if d > 0:
+                    soc -= d / se
+                    scarica[t] = d
+                    deficit[t] -= d
+            soc_serie[t] = soc
+
+    immesso = surplus
+    prelevato = deficit
+    autoconsumo = autoc_diretto + scarica
+
+    tot_cons = float(cons.sum())
+    tot_prod = float(prod.sum())
+    return {
+        "autoconsumo_diretto": autoc_diretto, "carica": carica, "scarica": scarica,
+        "immesso": immesso, "prelevato": prelevato, "soc": soc_serie,
+        "autoconsumo": autoconsumo,
+        "E_consumo": tot_cons, "E_produzione": tot_prod,
+        "E_autoconsumo": float(autoconsumo.sum()),
+        "E_immesso": float(immesso.sum()), "E_prelevato": float(prelevato.sum()),
+        "E_carica": float(carica.sum()), "E_scarica": float(scarica.sum()),
+        # quota del consumo coperta da produzione propria
+        "copertura_pct": float(autoconsumo.sum()) / tot_cons * 100 if tot_cons > 0 else 0.0,
+        # quota della produzione consumata sul posto invece che immessa
+        "autoconsumo_pct": float(autoconsumo.sum()) / tot_prod * 100 if tot_prod > 0 else 0.0,
+        "ore_autosufficienti": int((prelevato < 1e-9).sum()),
+    }
+
+
+@st.cache_data
+def carica_prezzi_elettrici(percorso="prezzi_elettrici.csv"):
+    """Serie oraria dei prezzi zonali.
+
+    Usa il file esterno se presente, altrimenti un profilo di riserva ricavato
+    dai prezzi zona Nord 2025 (media 116 €/MWh). Il profilo di riserva conserva
+    l'andamento giornaliero, che e' cio' che conta per l'autoconsumo: l'energia
+    solare vale meno perche' arriva quando il prezzo e' depresso.
+    """
+    if os.path.exists(percorso):
+        try:
+            df = pd.read_csv(percorso, parse_dates=["datetime"])
+            s = df.set_index("datetime")["prezzo"].reindex(HOURS_2024)
+            if s.notna().sum() > 8000:
+                return s.interpolate().bfill().ffill().values, "file esterno"
+        except Exception:
+            pass
+    # profilo di riserva: fattori orari applicati alla media mensile
+    fattori_ora = np.array([0.97, 0.93, 0.89, 0.89, 0.92, 1.00,
+                            1.08, 1.10, 1.06, 0.97, 0.88, 0.81,
+                            0.81, 0.83, 0.86, 0.90, 1.02, 1.18,
+                            1.18, 1.14, 1.09, 1.05, 1.02, 0.99])
+    medie_mese = np.array([137, 128, 108, 96, 84, 92,
+                           108, 112, 108, 118, 128, 124], dtype=float)
+    m = HOURS_2024.month.values - 1
+    h = HOURS_2024.hour.values
+    return medie_mese[m] * fattori_ora[h], "profilo interno (zona Nord 2025)"
+
+
 def van(flussi_cassa, tasso):
     """Valore Attuale Netto. flussi_cassa[0] e l'investimento (negativo)."""
     return float(sum(f / (1.0 + tasso) ** t for t, f in enumerate(flussi_cassa)))
@@ -2552,9 +2757,11 @@ st.caption(
     "contemporaneità Fig. 12.2) e **IEA DHC TS5** (COP e CAPEX pompe di calore, accumuli)."
 )
 
-tab_domanda, tab_offerta, tab_dimensionamento, tab_confronto, tab_economia = st.tabs(
+(tab_domanda, tab_offerta, tab_dimensionamento, tab_elettrico,
+ tab_confronto, tab_economia) = st.tabs(
     ["\U0001F3E0 Domanda", "\u267B\ufe0f Offerta", "\U0001F9EE Dimensionamento",
-     "\U0001F4CA Confronto scenari", "\U0001F4B6 Analisi economica"]
+     "\u26A1 Carico elettrico", "\U0001F4CA Confronto scenari",
+     "\U0001F4B6 Analisi economica"]
 )
 
 
@@ -3067,13 +3274,22 @@ with tab_domanda:
                                        "già posata. Non è una distanza in linea d'aria, quindi "
                                        "un edificio dall'altra parte di un fiume o di una ferrovia "
                                        "non viene agganciato solo perché è vicino sulla mappa.")
-            soglia_dens = tc4.slider("Soglia densità ramo (MWh/(m·a))", 0.3, 3.0, 1.0, step=0.1,
+            soglia_dens = tc4.slider("Soglia densità ramo (MWh/(m·a))", 0.0, 3.0, 1.0, step=0.1,
                                      key="dom_soglia_dens",
                                      help="QM: se un ramo del tratto pubblico porta meno di questa "
                                           "densità (MWh/anno diviso metri del ramo, cumulativo dal "
                                           "punto di diramazione in avanti), viene POTATO e gli edifici "
                                           "sotto vengono esclusi dal TLR (andrebbero serviti "
-                                          "localmente). 1.0 = soglia critica QM standard.")
+                                          "localmente). 1.0 = soglia critica QM standard; "
+                                          "**0 = nessuna esclusione**, tutti gli edifici "
+                                          "selezionati vengono collegati anche se il ramo "
+                                          "non è conveniente, utile per vedere il "
+                                          "potenziale massimo della rete.")
+            if soglia_dens <= 0.001:
+                st.info("🔓 Soglia disattivata: vengono collegati **tutti** gli edifici "
+                        "selezionati, anche quelli che non rispettano i criteri QM di "
+                        "densità lineare. Il tracciato mostra il potenziale massimo, "
+                        "non la configurazione conveniente.")
 
             # Scelta metodo: OSM (Dijkstra su strade) con fallback MST + tortuosita
             _cb1, _cb2 = st.columns(2)
@@ -3804,27 +4020,91 @@ taglia verrebbe sottostimata.
     if _sol_on:
         _sc1, _sc2 = st.columns([1, 2])
         with _sc1:
-            _sup_disp = st.number_input("Superficie disponibile (m²)", min_value=0,
-                                        max_value=50000, value=2000, step=100,
-                                        key="off_sup_disp",
-                                        help="Coperture utilizzabili: tetti degli edifici "
-                                             "pubblici, capannoni, aree a terra.")
+            # I tre vincoli (superficie, potenza, temperatura) non sono
+            # indipendenti: superficie e temperatura insieme determinano la
+            # potenza ottenibile. Si sceglie quale governa, gli altri due
+            # diventano una conseguenza da verificare.
+            _vincolo = st.radio(
+                "Cosa fissa la dimensione del campo",
+                ["Superficie disponibile", "Potenza termica richiesta"],
+                key="off_vincolo_sol",
+                help="Superficie e temperatura di esercizio determinano insieme la "
+                     "potenza ottenibile. Si può partire dal tetto che si ha e vedere "
+                     "che potenza se ne ricava, oppure dalla potenza che serve e "
+                     "vedere quanto tetto occupa.")
             _tipo_sol = st.radio("Tecnologia",
                                  ["Termico", "Ibrido PVT (Abora aH72)", "Fotovoltaico"],
                                  key="off_tipo_sol")
             _T_fluido = 35
             if _tipo_sol != "Fotovoltaico":
-                _T_fluido = st.slider("Anello alimentato (°C)", 25, 80, 45, step=5,
+                _T_fluido = st.slider("Temperatura di esercizio (°C)", 25, 80, 45, step=5,
                                       key="off_t_fluido",
                                       help="Livello termico a cui il campo cede calore. "
                                            "Più è basso, più rende il collettore, ma più "
                                            "lavoro resta alle pompe di calore. L'ottimo "
-                                           "non è il più freddo: vedi il confronto a lato.")
+                                           "non è il più freddo: vedi il confronto sotto.")
+
+            # potenza specifica del campo alle condizioni scelte, in condizioni
+            # di riferimento (irraggiamento 800 W/m², aria 20 °C)
+            if _tipo_sol == "Termico":
+                _eta_rif = max(0.78 - 3.5 * (_T_fluido - 20.0) / 800.0, 0.0)
+                _p_spec = _eta_rif * 800.0
+            elif _tipo_sol.startswith("Ibrido"):
+                _th_r, _el_r = resa_pvt_oraria(np.array([800.0]), np.array([20.0]),
+                                               np.array([float(_T_fluido)]))
+                _p_spec = float(_th_r[0]) * 1000.0
+            else:
+                _p_spec = 0.0
+
+            if _vincolo == "Superficie disponibile":
+                _sup_disp = st.number_input("Superficie disponibile (m²)", min_value=0,
+                                            max_value=50000, value=2000, step=100,
+                                            key="off_sup_disp",
+                                            help="Coperture utilizzabili: tetti degli "
+                                                 "edifici pubblici, capannoni, aree a terra.")
+                if _p_spec > 0:
+                    st.caption(f"Potenza termica di picco ottenibile: "
+                               f"**{_sup_disp * _p_spec / 1000:,.0f} kW** "
+                               f"a {_T_fluido} °C".replace(",", "."))
+            else:
+                _p_rich = st.number_input("Potenza termica richiesta (kW)", min_value=0,
+                                          max_value=20000, value=500, step=50,
+                                          key="off_p_rich",
+                                          help="Potenza di picco che il campo deve fornire "
+                                               "in condizioni di riferimento: irraggiamento "
+                                               "800 W/m² e aria a 20 °C.")
+                if _p_spec > 0:
+                    _sup_disp = int(round(_p_rich * 1000.0 / _p_spec))
+                    st.caption(f"Superficie necessaria: **{_sup_disp:,} m²** "
+                               f"a {_T_fluido} °C".replace(",", "."))
+                    _sup_max = st.number_input("Superficie realmente disponibile (m²)",
+                                               min_value=0, max_value=50000, value=2000,
+                                               step=100, key="off_sup_max",
+                                               help="Serve solo a verificare la fattibilità: "
+                                                    "se è inferiore a quella necessaria, "
+                                                    "la potenza richiesta non è raggiungibile.")
+                    if _sup_disp > _sup_max > 0:
+                        st.error(f"⚠️ Servirebbero {_sup_disp:,} m² ma ne hai "
+                                 f"{_sup_max:,}: la potenza richiesta non è "
+                                 f"raggiungibile a {_T_fluido} °C. Abbassa la "
+                                 f"temperatura di esercizio, riduci la potenza "
+                                 f"o accetta il campo più piccolo."
+                                 .replace(",", "."))
+                        _sup_disp = int(_sup_max)
+                else:
+                    _sup_disp = 2000
+                    st.caption("Il fotovoltaico non produce calore: la potenza termica "
+                               "richiesta non si applica. Imposta la superficie.")
+                    _sup_disp = st.number_input("Superficie disponibile (m²)", min_value=0,
+                                                max_value=50000, value=2000, step=100,
+                                                key="off_sup_disp_pv")
+
             _prezzo_el_sol = st.slider("Valore dell'elettricità (€/MWh)", 0, 300, 150, step=10,
                                        key="off_prezzo_el_sol",
                                        help="Prima approssimazione. Il valore effettivo "
                                             "dipende dall'autoconsumo, calcolato nella "
-                                            "scheda Bilancio elettrico.")
+                                            "scheda Copertura del carico elettrico.")
+
 
         # --- confronto delle tre tecnologie sulla stessa superficie ---
         _p = PVT_ABORA
@@ -3873,6 +4153,7 @@ taglia verrebbe sottostimata.
                        "calore serve davvero d'estate.")
 
         # --- serie effettivamente adottata ---
+        _serie_el_ad = np.zeros(len(HOURS_2024))
         if _tipo_sol == "Termico":
             _serie_ad = _serie_th["MWh"].reindex(HOURS_2024, fill_value=0).values
             _capex_ad = _sup_disp * 450
@@ -3880,11 +4161,13 @@ taglia verrebbe sottostimata.
             _n_ad = 0
         elif _tipo_sol.startswith("Ibrido"):
             _serie_ad = _serie_pvt["MWh_term"].reindex(HOURS_2024, fill_value=0).values
+            _serie_el_ad = _serie_pvt["MWh_el"].reindex(HOURS_2024, fill_value=0).values
             _capex_ad = _n_pan * 900
             _el_ad = _e_pvt_el
             _n_ad = _n_pan
         else:
             _serie_ad = np.zeros(len(HOURS_2024))
+            _serie_el_ad = _serie_pv["MWh_el"].reindex(HOURS_2024, fill_value=0).values * 0.97
             _capex_ad = _sup_disp * 180
             _el_ad = _e_pv_el
             _n_ad = _n_pan
@@ -3894,7 +4177,8 @@ taglia verrebbe sottostimata.
                       "elettrico_mwh": float(_el_ad),
                       "ricavo_elettrico": float(_el_ad * _prezzo_el_sol),
                       "T_fluido": float(_T_fluido),
-                      "serie_termica": _serie_ad}
+                      "serie_termica": _serie_ad,
+                      "serie_elettrica": _serie_el_ad}
 
         _m1, _m2, _m3, _m4 = st.columns(4)
         _m1.metric("Calore prodotto", f"{_serie_ad.sum():,.0f} MWh/a".replace(",", "."))
@@ -4088,12 +4372,31 @@ taglia verrebbe sottostimata.
                               margin=dict(t=30, b=10))
             st.plotly_chart(_fu, width="stretch")
 
+            # costo di modifica in situ dichiarato nel CSV, per azienda
+            _cost_az = (flussi.assign(
+                _c=pd.to_numeric(flussi["costo_allacciamento_eur"], errors="coerce"))
+                .groupby("azienda")["_c"].sum())
+            _u["costo_modifica_eur"] = _u["azienda"].map(_cost_az).fillna(0.0)
+            _u["eur_per_mwh_utile"] = np.where(
+                _u["utilizzata_mwh"] > 1e-9,
+                _u["costo_modifica_eur"] * crf(0.04, 20) / _u["utilizzata_mwh"], np.nan)
+
             _tab_u = _u.rename(columns={
                 "azienda": "Azienda", "offerta_mwh": "Offerto (MWh/a)",
                 "utilizzata_mwh": "Utilizzato (MWh/a)", "scartata_mwh": "Scartato (MWh/a)",
                 "quota_utilizzo_pct": "Utilizzo (%)", "ore_disponibile": "Ore disponibile",
-                "ore_utile": "Ore con domanda", "livello": "Livello termico"})
+                "ore_utile": "Ore con domanda", "livello": "Livello termico",
+                "costo_modifica_eur": "Costo modifica (€)",
+                "eur_per_mwh_utile": "Incidenza (€/MWh)"})
+            _tab_u["Incidenza (€/MWh)"] = _tab_u["Incidenza (€/MWh)"].round(1)
             st.dataframe(_tab_u, width="stretch", hide_index=True)
+            if _u["costo_modifica_eur"].sum() > 0:
+                st.caption("Il *costo di modifica* è quello dichiarato nel CSV dei flussi "
+                           "(scambiatore e opere in situ). L'*incidenza* lo annualizza a "
+                           "20 anni e lo divide per il calore effettivamente valorizzato: "
+                           "si somma al prezzo pagato all'azienda e va confrontata con il "
+                           "costo delle alternative. Le condotte di adduzione sono "
+                           "conteggiate a parte nella scheda *Analisi economica*.")
 
             _scarse = _u[_u["quota_utilizzo_pct"] < 40]
             if not _scarse.empty:
@@ -4354,14 +4657,47 @@ with tab_dimensionamento:
                 st.caption("Una seconda pompa di calore recupera il calore sotto "
                            f"{T_int} °C e il calore del terreno, ricaricando l'anello "
                            "intermedio.")
-                antigelo = st.slider("Floor antigelo ground loop (°C)", -5, 10, 0,
+                antigelo = st.slider("Floor antigelo sorgente fredda (°C)", -5, 10, 0,
                                      key="dim_antigelo",
-                                     help="Temperatura minima ammessa al circuito "
-                                          "geotermico, per non congelare il terreno.")
+                                     help="Temperatura minima ammessa al circuito, "
+                                          "per non congelare il terreno.")
+                tipo_sorgente = st.selectbox(
+                    "Sorgente fredda", list(SORGENTI_BASSA_T.keys()),
+                    index=2, key="dim_tipo_sorg",
+                    help="Da dove la pompa a bassa temperatura preleva il calore "
+                         "quando il calore di scarto non basta. La scelta pesa "
+                         "molto su costi e ingombri: le opere sono confrontate "
+                         "nel passo 4, a valle del calcolo.")
+                _sp = SORGENTI_BASSA_T[tipo_sorgente]
+                if tipo_sorgente == "acqua di falda":
+                    resa_sorgente = st.slider("Resa per pozzo (l/s)",
+                                              float(_sp["resa_min"]), float(_sp["resa_max"]),
+                                              float(_sp["resa_tip"]), step=5.0,
+                                              key="dim_resa_sorg")
+                    costo_sorgente = st.slider("Costo per pozzo (€)",
+                                               float(_sp["costo_min"]), float(_sp["costo_max"]),
+                                               float(_sp["costo_tip"]), step=5000.0,
+                                               key="dim_costo_sorg")
+                else:
+                    resa_sorgente = st.slider(
+                        f"Resa specifica (W per {_sp['unita'].split()[1] if tipo_sorgente=='sonde verticali' else 'm²'})",
+                        float(_sp["resa_min"]), float(_sp["resa_max"]),
+                        float(_sp["resa_tip"]), step=1.0, key="dim_resa_sorg",
+                        help="Dipende dalla conducibilità del terreno e dalla presenza "
+                             "di falda. Nelle ghiaie sature dell'alta pianura friulana "
+                             "ci si colloca nella parte alta della forchetta.")
+                    costo_sorgente = st.slider(
+                        f"Costo unitario (€ per {_sp['unita'].split()[0]})",
+                        float(_sp["costo_min"]), float(_sp["costo_max"]),
+                        float(_sp["costo_tip"]), step=1.0, key="dim_costo_sorg")
+                st.caption(_sp["note"])
                 capex_kw_bk = 700.0
                 opex_bk_mwh = 0.0
             else:
                 antigelo = 0
+                tipo_sorgente = None
+                resa_sorgente = None
+                costo_sorgente = None
                 st.caption(f"**Merit order**: la HP alta T lavora sempre per prima; "
                            f"il {backup_tipo} interviene solo sul residuo che la pompa "
                            f"non riesce a coprire.")
@@ -4394,6 +4730,14 @@ with tab_dimensionamento:
                              help="IEA DHC F1 Tab.3: 110-200 €/m³ sopra i 2.000 m³; "
                                       "1.000 €/m³ è conservativo per serbatoi in acciaio piccoli.")
         with _a2:
+            considera_el = st.checkbox(
+                "Tieni conto dell'autoproduzione elettrica", value=False,
+                key="dim_considera_el",
+                help="Se attivo, il costo dell'elettricità nel calcolo del LCOH "
+                     "viene ridotto in base all'autoconsumo calcolato nella scheda "
+                     "**Carico elettrico**. Lasciandolo spento il dimensionamento "
+                     "termico resta indipendente dalle scelte elettriche, che è "
+                     "l'impostazione consigliata per confrontare gli scenari.")
             strat_on = st.checkbox("Accumulo intermedio stratificato", value=True,
                                    key="dim_strat",
                                    help="Un serbatoio ben progettato non mescola: l'acqua "
@@ -4554,6 +4898,14 @@ with tab_dimensionamento:
                            antigelo=float(antigelo), perdita_sett_pct=perd,
                            q_int_bins=q_int_bins, bin_T_int=bin_T_int,
                            stratificato=strat_on)
+    # serie orarie che alimentano la scheda del carico elettrico: si tengono
+    # separate dal dimensionamento termico, che non deve dipenderne
+    st.session_state["_dim_serie_elettriche"] = {
+        "consumo_hp": (sim["el_alta"] + sim["el_bassa"]),
+        "el_alta": sim["el_alta"],
+        "el_bassa": sim["el_bassa"],
+    }
+
     # attribuzione alle aziende del calore realmente valorizzato: il risultato
     # viene mostrato nella scheda Offerta, dove si decide quali flussi allacciare
     try:
@@ -4572,10 +4924,27 @@ with tab_dimensionamento:
     capex_bassa = P_bassa * capex_hp_kw(P_bassa) if is_hp_par else 0.0
     capex_bk = P_bk * capex_kw_bk if not is_hp_par else 0.0
     capex_acc = (V_hot + V_int + V_low) * costo_m3
-    capex_sistema = capex_alta + capex_bassa + capex_bk + capex_acc + capex_solare
+    # Opere per la sorgente fredda: dimensionate sul picco di prelievo dal
+    # terreno, che si conosce solo dopo aver simulato l'anno. E' una voce che
+    # negli scenari a sole pompe di calore puo' pesare quanto le macchine.
+    capex_sorgente = 0.0
+    _pk_ground_kw = float(sim["q_ground"].max()) * 1000.0 if is_hp_par else 0.0
+    if is_hp_par and _pk_ground_kw > 0:
+        capex_sorgente = float(dimensiona_sorgente_bassa_t(
+            _pk_ground_kw, tipo_sorgente, resa_sorgente, costo_sorgente)["costo"])
+    capex_sistema = (capex_alta + capex_bassa + capex_bk + capex_acc
+                     + capex_solare + capex_sorgente)
     # L'elettricita' prodotta dai pannelli ibridi alimenta le pompe di calore
     # (o viene venduta) e si porta in detrazione dei costi operativi.
-    opex_lordo = sim["E_el_tot"] * prezzo_el + E_bk * opex_bk_mwh
+    # Prezzo effettivo dell'elettricita': se si tiene conto dell'autoproduzione,
+    # la quota autoconsumata non viene acquistata e il costo medio scende.
+    prezzo_el_eff = prezzo_el
+    quota_autocons = 0.0
+    if considera_el:
+        _rel = st.session_state.get("_el_risultato") or {}
+        quota_autocons = float(_rel.get("copertura_pct", 0.0)) / 100.0
+        prezzo_el_eff = prezzo_el * (1.0 - quota_autocons)
+    opex_lordo = sim["E_el_tot"] * prezzo_el_eff + E_bk * opex_bk_mwh
     opex = opex_lordo - ricavo_pvt_el
     costo_annuo = capex_sistema * fattore_crf + opex
     lcoh = costo_annuo / dom_tot if dom_tot > 0 else np.nan
@@ -4735,6 +5104,81 @@ with tab_dimensionamento:
             st.success("\u2705 Copertura 100 % in tutte le ore.")
 
         # ---- schema di massima dell'impianto dimensionato ----
+        if considera_el and quota_autocons > 0:
+            st.info(f"⚡ Il costo dell'elettricità tiene conto dell'autoproduzione: "
+                    f"copertura **{quota_autocons * 100:.0f}%** dalla scheda *Carico "
+                    f"elettrico*, prezzo effettivo **{prezzo_el_eff:.0f} €/MWh** invece "
+                    f"di {prezzo_el:.0f}. Per confrontare gli scenari su basi omogenee "
+                    f"conviene disattivare l'opzione nel passo 2.")
+        elif considera_el:
+            st.warning("⚡ Autoproduzione attiva ma nessun risultato disponibile: "
+                       "apri la scheda **Carico elettrico** e configura la generazione.")
+
+        # ---- dimensionamento della sorgente fredda ----
+        if is_hp_par and E_ground > 1:
+            st.markdown("##### \U0001F573\ufe0f Sorgente fredda della pompa a bassa temperatura")
+            _pk_ground = float(sim["q_ground"].max()) * 1000.0
+            _ore_gr = int(sim["ore_ground"])
+            _gs1, _gs2, _gs3 = st.columns(3)
+            _gs1.metric("Potenza di picco richiesta", f"{_pk_ground:,.0f} kW".replace(",", "."),
+                        help="Massimo prelievo orario dalla sorgente nel corso dell'anno: "
+                             "è questo a dimensionare le opere, non l'energia.")
+            _gs2.metric("Energia annua estratta", f"{E_ground:,.0f} MWh".replace(",", "."),
+                        help=f"in {_ore_gr} ore di funzionamento")
+            _gs3.metric("Ore equivalenti", f"{E_ground * 1000 / max(_pk_ground, 1):,.0f} h".replace(",", "."),
+                        help="Poche ore equivalenti significano opere costose usate "
+                             "per poco tempo: conviene ridurre la potenza della "
+                             "pompa a bassa temperatura e lasciare il resto al supporto.")
+
+            _dg = dimensiona_sorgente_bassa_t(_pk_ground, tipo_sorgente,
+                                              resa_sorgente, costo_sorgente)
+            _o1, _o2, _o3, _o4 = st.columns(4)
+            _o1.metric("Opere", f"{_dg['quantita']:,.0f}".replace(",", ".") + f" {_dg['unita'].split()[0]}")
+            if _dg["n_pozzi"]:
+                _o2.metric("Pozzi", f"{_dg['n_pozzi']}")
+            else:
+                _o2.metric("Pozzi", "—")
+            _sup = _dg["superficie_m2"]
+            _o3.metric("Superficie impegnata",
+                       f"{_sup / 10000:.2f} ha" if _sup >= 5000 else f"{_sup:,.0f} m²".replace(",", "."))
+            _o4.metric("Costo", f"{_dg['costo'] / 1000:,.0f} k€".replace(",", "."),
+                       help=f"{_dg['costo'] / max(_pk_ground, 1):,.0f} €/kW estratto".replace(",", "."))
+
+            # confronto fra le tre tecnologie a parità di potenza
+            with st.expander("Confronto fra le sorgenti possibili"):
+                _rg = []
+                for _t in SORGENTI_BASSA_T:
+                    _d = dimensiona_sorgente_bassa_t(_pk_ground, _t)
+                    _s = _d["superficie_m2"]
+                    _rg.append({
+                        "Sorgente": _t,
+                        "Dimensione": f"{_d['quantita']:,.0f} {_d['unita']}".replace(",", "."),
+                        "Pozzi": _d["n_pozzi"] or "—",
+                        "Superficie": (f"{_s / 10000:.2f} ha" if _s >= 5000
+                                       else f"{_s:,.0f} m²".replace(",", ".")),
+                        "Costo (k€)": round(_d["costo"] / 1000),
+                        "€/kW": round(_d["costo"] / max(_pk_ground, 1)),
+                    })
+                st.dataframe(pd.DataFrame(_rg), width="stretch", hide_index=True)
+                st.caption(SORGENTI_BASSA_T[tipo_sorgente]["note"])
+
+            if _sup > 20000:
+                st.warning(
+                    f"⚠️ La sorgente scelta richiede **{_sup / 10000:.1f} ettari**. "
+                    f"È una superficie che va reperita e vincolata: sopra le serpentine "
+                    f"non si può costruire né piantare alberi. Valuta l'acqua di falda, "
+                    f"oppure riduci la potenza della pompa a bassa temperatura lasciando "
+                    f"il picco a un supporto a combustibile.")
+            elif _dg["costo"] > capex_sistema * 0.4:
+                st.warning(
+                    f"⚠️ Le opere per la sorgente fredda costano "
+                    f"**{_dg['costo'] / 1000:,.0f} k€**, oltre il 40 % del CAPEX di "
+                    f"centrale. Con {E_ground * 1000 / max(_pk_ground, 1):,.0f} ore "
+                    f"equivalenti l'investimento si ripartisce su poca energia."
+                    .replace(",", "."))
+            st.session_state["_dim_sorgente"] = _dg
+            st.divider()
+
         st.markdown("##### \U0001F5A5\ufe0f Schema di massima dell'impianto")
         _fl_caldo, _fl_int, _fl_basso = [], [], []
         if not off_all.empty:
@@ -4878,6 +5322,13 @@ with tab_dimensionamento:
             {"Voce": f"Accumuli ({V_hot}+{V_int}+{V_low} m³)", "CAPEX (\u20ac)": round(capex_acc),
              "OPEX (\u20ac/a)": 0},
         ]
+        if capex_sorgente > 0:
+            _dgs = dimensiona_sorgente_bassa_t(_pk_ground_kw, tipo_sorgente,
+                                               resa_sorgente, costo_sorgente)
+            righe.append({"Voce": f"Sorgente fredda: {tipo_sorgente} "
+                                  f"({_dgs['quantita']:,.0f} {_dgs['unita'].split()[0]})".replace(",", "."),
+                          "CAPEX (\u20ac)": round(capex_sorgente),
+                          "OPEX (\u20ac/a)": 0})
         if solare_on:
             if tipo_solare.startswith("Ibrido"):
                 righe.append({"Voce": f"Solare ibrido PVT ({n_pvt} pann., {area_sol} m²)",
@@ -4984,6 +5435,8 @@ with tab_dimensionamento:
         "T_int": int(T_int),
         "supporto": backup_tipo,
         "accumulo_stratificato": "sì" if strat_on else "no",
+        "autoproduzione_el": ("sì" if considera_el else "no"),
+        "prezzo_el_effettivo": round(prezzo_el_eff),
         "carico_utenze_mwh": round(dom_tot_utenze),
         "carico_centrale_mwh": round(dom_tot),
         "perdite_rete_pct": round(_perd_pct, 1),
@@ -5046,7 +5499,211 @@ with tab_dimensionamento:
 
 
 # =============================================================================
-# TAB 4 - CONFRONTO SCENARI (P9: rimozione selettiva)
+# TAB 4 - COPERTURA DEL CARICO ELETTRICO
+# Volutamente separata dal dimensionamento termico: le scelte elettriche non
+# devono condizionare il dispatch del calore, che risponde a vincoli propri.
+# =============================================================================
+with tab_elettrico:
+    st.markdown("### \u26A1 Copertura del carico elettrico")
+    _snap_el = st.session_state.get("_dim_snapshot")
+    if not _snap_el:
+        st.info("Configura prima un assetto nella scheda **Dimensionamento**: "
+                "da lì arrivano i consumi elettrici delle pompe di calore.")
+    else:
+        _sol_el = st.session_state.get("_off_solare", {}) or {}
+        _serie_el = st.session_state.get("_dim_serie_elettriche", {}) or {}
+
+        _cons_h = np.asarray(_serie_el.get("consumo_hp", []), dtype=float)
+        if _cons_h.size == 0:
+            _cons_h = np.full(len(HOURS_2024),
+                              float(_snap_el.get("E_elettrica", 0)) / len(HOURS_2024))
+        st.caption(f"Consumo elettrico delle pompe di calore: "
+                   f"**{_cons_h.sum():,.0f} MWh/a**, dal dispatch termico. "
+                   f"Assetto: {_snap_el.get('tecnologie', '—')}".replace(",", "."))
+
+        # ---------------- generazione ----------------
+        st.markdown("#### Generazione")
+        _g1, _g2 = st.columns([1, 1])
+        with _g1:
+            _tipo_g = _sol_el.get("tipo", "assente")
+            _el_da_solare = float(_sol_el.get("elettrico_mwh", 0.0))
+            if _el_da_solare > 0:
+                st.success(f"Dalla scheda **Offerta**: {_tipo_g}, "
+                           f"{_sol_el.get('area_m2', 0):,} m², "
+                           f"**{_el_da_solare:,.0f} MWh/a** elettrici".replace(",", "."))
+            else:
+                st.info("Nessuna generazione elettrica configurata in **Offerta**. "
+                        "Puoi aggiungerne una qui sotto per il solo bilancio elettrico.")
+            _agg_pv = st.checkbox("Aggiungi fotovoltaico dedicato", value=(_el_da_solare <= 0),
+                                  key="el_agg_pv",
+                                  help="Impianto destinato a coprire i consumi della "
+                                       "centrale, distinto dal campo solare termico "
+                                       "o ibrido dimensionato in Offerta.")
+            _kwp = 0.0
+            if _agg_pv:
+                _kwp = st.number_input("Potenza fotovoltaica (kWp)", min_value=0,
+                                       max_value=20000, value=500, step=50, key="el_kwp")
+        with _g2:
+            st.markdown("**Accumulo elettrochimico**")
+            _batt = st.slider("Capacità utile (MWh)", 0.0, 20.0, 0.0, step=0.5,
+                              key="el_batt",
+                              help="Sposta l'energia dalle ore di produzione a quelle "
+                                   "di consumo. Con i prezzi 2025 il beneficio sta nel "
+                                   "differenziale fra mezzogiorno e sera, che d'estate "
+                                   "supera i 70 €/MWh.")
+            _c_rate = st.slider("Potenza in rapporto alla capacità (C-rate)", 0.25, 2.0,
+                                0.5, step=0.25, key="el_crate",
+                                help="0,5 significa che una batteria da 4 MWh eroga "
+                                     "2 MW: è il rapporto tipico degli accumuli "
+                                     "stazionari.")
+            _eff_b = st.slider("Rendimento di ciclo (%)", 70, 98, 90, step=1,
+                               key="el_eff_batt") / 100.0
+
+        # serie di produzione
+        _prod_h = np.zeros(len(HOURS_2024))
+        _serie_sol = np.asarray(_sol_el.get("serie_elettrica", []), dtype=float)
+        if _serie_sol.size == len(HOURS_2024):
+            _prod_h = _prod_h + _serie_sol
+        elif _el_da_solare > 0:
+            _mt = serie_meteo_annua(pvgis)
+            _sh = _mt["G_totale"].values
+            _prod_h = _prod_h + _sh / max(_sh.sum(), 1e-9) * _el_da_solare
+        if _agg_pv and _kwp > 0:
+            _mt = serie_meteo_annua(pvgis)
+            # 0,18 di rendimento, 0,88 di BOS: resa attesa ~1.150 kWh/kWp a Maniago
+            _prod_h = _prod_h + _mt["G_totale"].values * _kwp * 0.18 * 0.88 / 1e6
+
+        if _prod_h.sum() <= 0:
+            st.warning("Nessuna generazione elettrica: senza produzione propria "
+                       "tutto il consumo viene prelevato dalla rete.")
+
+        # ---------------- bilancio ----------------
+        _res_el = dispatch_elettrico(_prod_h, _cons_h, batteria_mwh=_batt,
+                                     p_batt_mw=_batt * _c_rate, eff_batt=_eff_b)
+
+        st.divider()
+        st.markdown("#### Bilancio annuo")
+        _b1, _b2, _b3, _b4 = st.columns(4)
+        _b1.metric("Consumo pompe di calore", f"{_res_el['E_consumo']:,.0f} MWh".replace(",", "."))
+        _b2.metric("Produzione propria", f"{_res_el['E_produzione']:,.0f} MWh".replace(",", "."))
+        _b3.metric("Copertura del consumo", f"{_res_el['copertura_pct']:.0f}%",
+                   help="Quota del fabbisogno coperta da generazione propria, "
+                        "direttamente o tramite la batteria.")
+        _b4.metric("Autoconsumo della produzione", f"{_res_el['autoconsumo_pct']:.0f}%",
+                   help="Quota della produzione usata sul posto invece che immessa "
+                        "in rete. È questa a determinarne il valore economico.")
+
+        _fb = go.Figure()
+        _fb.add_trace(go.Bar(y=["consumo"], x=[_res_el["E_autoconsumo"]], orientation="h",
+                             name="coperto da produzione propria", marker_color=COLOR_OFFERTA))
+        _fb.add_trace(go.Bar(y=["consumo"], x=[_res_el["E_prelevato"]], orientation="h",
+                             name="prelevato dalla rete", marker_color=COLOR_NONCOP))
+        _fb.add_trace(go.Bar(y=["produzione"], x=[_res_el["E_autoconsumo"]], orientation="h",
+                             name="autoconsumata", marker_color=COLOR_HP, showlegend=False))
+        _fb.add_trace(go.Bar(y=["produzione"], x=[_res_el["E_immesso"]], orientation="h",
+                             name="immessa in rete", marker_color=COLOR_SOLARE))
+        _fb.update_layout(barmode="stack", height=200, xaxis_title="MWh/anno",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                          margin=dict(t=30, b=10))
+        st.plotly_chart(_fb, width="stretch")
+
+        # ---------------- valore economico ----------------
+        st.divider()
+        st.markdown("#### Valore economico")
+        _prezzi_h, _fonte_pr = carica_prezzi_elettrici()
+        _pz1, _pz2 = st.columns(2)
+        _oneri = _pz1.slider("Oneri, trasporto e imposte sul prelievo (€/MWh)",
+                             0, 200, 110, step=5, key="el_oneri",
+                             help="Si sommano al prezzo zonale sull'energia acquistata. "
+                                  "L'energia immessa viene invece remunerata al solo "
+                                  "prezzo zonale: è questo divario a rendere "
+                                  "conveniente l'autoconsumo.")
+        _pz2.caption(f"Prezzi zonali orari da **{_fonte_pr}** · media "
+                     f"{_prezzi_h.mean():.1f} €/MWh · nelle ore 10-16 "
+                     f"{_prezzi_h[HOURS_2024.hour.isin(range(10, 17))].mean():.1f} €/MWh")
+
+        _costo_senza = float((_cons_h * (_prezzi_h + _oneri)).sum())
+        _costo_con = float((_res_el["prelevato"] * (_prezzi_h + _oneri)).sum())
+        _ricavo_imm = float((_res_el["immesso"] * _prezzi_h).sum())
+        _beneficio = _costo_senza - _costo_con + _ricavo_imm
+
+        _v1, _v2, _v3 = st.columns(3)
+        _v1.metric("Bolletta senza produzione", f"{_costo_senza / 1000:,.0f} k€/a".replace(",", "."))
+        _v2.metric("Bolletta con produzione", f"{_costo_con / 1000:,.0f} k€/a".replace(",", "."),
+                   delta=f"−{(_costo_senza - _costo_con) / 1000:,.0f} k€".replace(",", "."),
+                   delta_color="inverse")
+        _v3.metric("Beneficio complessivo", f"{_beneficio / 1000:,.0f} k€/a".replace(",", "."),
+                   help=f"risparmio in bolletta più {_ricavo_imm / 1000:,.0f} k€ "
+                        f"di vendita dell'energia immessa".replace(",", "."))
+        if _res_el["E_autoconsumo"] > 0 and _res_el["E_immesso"] > 0:
+            _val_auto = (_costo_senza - _costo_con) / _res_el["E_autoconsumo"]
+            _val_imm = _ricavo_imm / _res_el["E_immesso"]
+            st.caption(f"Un MWh autoconsumato vale **{_val_auto:.0f} €**, uno immesso "
+                       f"in rete **{_val_imm:.0f} €**: il rapporto è di "
+                       f"**{_val_auto / max(_val_imm, 1e-9):.1f} a 1**. È la ragione per "
+                       f"cui conviene dimensionare sull'autoconsumo e non sulla "
+                       f"producibilità massima.")
+
+        # ---------------- andamento nel tempo ----------------
+        st.divider()
+        st.markdown("#### Come si distribuisce nell'anno")
+        _mese = HOURS_2024.month.values
+        _dfm = pd.DataFrame({
+            "mese": [MONTH_NAMES[m - 1] for m in range(1, 13)],
+            "consumo": [float(_cons_h[_mese == m].sum()) for m in range(1, 13)],
+            "autoconsumo": [float(_res_el["autoconsumo"][_mese == m].sum()) for m in range(1, 13)],
+            "immesso": [float(_res_el["immesso"][_mese == m].sum()) for m in range(1, 13)],
+        })
+        _fm = go.Figure()
+        _fm.add_trace(go.Bar(x=_dfm["mese"], y=_dfm["autoconsumo"], name="autoconsumo",
+                             marker_color=COLOR_OFFERTA))
+        _fm.add_trace(go.Bar(x=_dfm["mese"], y=_dfm["consumo"] - _dfm["autoconsumo"],
+                             name="prelievo dalla rete", marker_color=COLOR_NONCOP))
+        _fm.add_trace(go.Scatter(x=_dfm["mese"], y=_dfm["immesso"], name="immesso in rete",
+                                 mode="lines+markers", line=dict(color=COLOR_SOLARE, width=2.5)))
+        _fm.update_layout(barmode="stack", height=340, yaxis_title="MWh",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                          margin=dict(t=30, b=10))
+        st.plotly_chart(_fm, width="stretch")
+        st.caption("Le pompe di calore consumano d'inverno, il solare produce d'estate: "
+                   "è questo sfasamento a limitare l'autoconsumo, molto più della "
+                   "taglia dell'accumulo.")
+
+        if _batt > 0:
+            with st.expander("Effetto dell'accumulo al variare della taglia"):
+                _rb = []
+                for _bb in [0.0, _batt * 0.5, _batt, _batt * 2]:
+                    _r = dispatch_elettrico(_prod_h, _cons_h, batteria_mwh=_bb,
+                                            p_batt_mw=_bb * _c_rate, eff_batt=_eff_b)
+                    _cc = float((_r["prelevato"] * (_prezzi_h + _oneri)).sum())
+                    _ri = float((_r["immesso"] * _prezzi_h).sum())
+                    _rb.append({"Capacità (MWh)": round(_bb, 1),
+                                "Copertura (%)": round(_r["copertura_pct"], 1),
+                                "Autoconsumo (%)": round(_r["autoconsumo_pct"], 1),
+                                "Beneficio (k€/a)": round((_costo_senza - _cc + _ri) / 1000)})
+                _dfb = pd.DataFrame(_rb)
+                st.dataframe(_dfb, width="stretch", hide_index=True)
+                _delta = _dfb["Beneficio (k€/a)"].diff().iloc[1:]
+                if len(_delta) and _delta.iloc[-1] < _delta.iloc[0] * 0.5:
+                    st.caption("Il beneficio cresce sempre meno all'aumentare della "
+                               "capacità: oltre una certa taglia la batteria resta "
+                               "scarica nei mesi in cui servirebbe.")
+
+        st.session_state["_el_risultato"] = {
+            "consumo_mwh": round(_res_el["E_consumo"], 1),
+            "produzione_mwh": round(_res_el["E_produzione"], 1),
+            "autoconsumo_mwh": round(_res_el["E_autoconsumo"], 1),
+            "immesso_mwh": round(_res_el["E_immesso"], 1),
+            "prelevato_mwh": round(_res_el["E_prelevato"], 1),
+            "copertura_pct": round(_res_el["copertura_pct"], 1),
+            "batteria_mwh": _batt,
+            "beneficio_eur": round(_beneficio),
+            "costo_rete_eur": round(_costo_con),
+        }
+
+
+# =============================================================================
+# TAB 5 - CONFRONTO SCENARI (P9: rimozione selettiva)
 # =============================================================================
 with tab_confronto:
     st.markdown("### \U0001F4CA Confronto tra scenari salvati")
@@ -5083,6 +5740,14 @@ with tab_confronto:
         if not _scen:
             st.stop()
 
+        _misti = {s.get("autoproduzione_el", "no") for s in _scen.values()}
+        if len(_misti) > 1:
+            st.warning(
+                "⚠️ Fra gli scenari salvati alcuni calcolano il LCOH al netto "
+                "dell'autoproduzione elettrica e altri no: i costi non sono "
+                "confrontabili fra loro. Per un confronto omogeneo disattiva "
+                "l'opzione nel passo 2 del dimensionamento e risalva gli scenari.")
+
         # --- tabella di confronto ---
         _campi = [
             ("carico_utenze_mwh", "Calore venduto (MWh/a)"),
@@ -5107,6 +5772,7 @@ with tab_confronto:
             ("V_int", "Accumulo intermedio (m³)"),
             ("V_low", "Accumulo basso (m³)"),
             ("accumulo_stratificato", "Accumulo stratificato"),
+            ("autoproduzione_el", "LCOH al netto dell'autoproduzione"),
             ("E_hot_diretto", "Scarto diretto (MWh/a)"),
             ("E_hp_alta", "Consegnato da HP alta T (MWh/a)"),
             ("E_backup", "Da combustibile (MWh/a)"),
@@ -5241,7 +5907,7 @@ with tab_confronto:
 
 
 # =============================================================================
-# TAB 5 - ANALISI ECONOMICA
+# TAB 6 - ANALISI ECONOMICA
 # =============================================================================
 with tab_economia:
     st.markdown("### \U0001F4B6 Analisi economica del progetto")
