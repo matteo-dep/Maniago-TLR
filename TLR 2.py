@@ -28,6 +28,12 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P17 Solare dimensionabile anche per quota della domanda coperta; PV
+     dimensionabile per copertura del consumo elettrico; volumi di prelievo
+     idrico nel caso di acqua di falda; struttura finanziaria completa in
+     analisi economica (debito con piano di ammortamento, ammortamenti
+     fiscali, imposte sul reddito imponibile, DSCR, TIR di progetto e per
+     l'azionista, prezzo di equilibrio).
  P16 Sorgente fredda della HP bassa T dimensionata davvero (sonde verticali,
      serpentine orizzontali o acqua di falda) con superficie, numero di pozzi
      e costo; nuova scheda "Carico elettrico" con autoconsumo, accumulo e
@@ -2731,6 +2737,135 @@ def tir(flussi_cassa, lo=-0.95, hi=1.5, tol=1e-7, itmax=300):
     return (lo + hi) / 2.0
 
 
+# =============================================================================
+# STRUTTURA FINANZIARIA
+# =============================================================================
+def piano_ammortamento_debito(capitale, tasso_annuo, anni, rate_per_anno=2):
+    """Piano di ammortamento francese, aggregato per anno.
+
+    Il calcolo procede per rata (semestrale per impostazione predefinita, come
+    nella prassi del project financing) e viene poi sommato per anno, perche'
+    aggregare direttamente su base annua sottostima gli interessi.
+
+    Ritorna un DataFrame con quota interessi, quota capitale, rata e debito
+    residuo per ciascun anno.
+    """
+    if capitale <= 0 or anni <= 0:
+        return pd.DataFrame(columns=["anno", "rata", "interessi", "capitale", "residuo"])
+    i_per = (1.0 + tasso_annuo) ** (1.0 / rate_per_anno) - 1.0
+    n_rate = int(anni * rate_per_anno)
+    if i_per <= 0:
+        rata = capitale / n_rate
+    else:
+        rata = capitale * (i_per * (1 + i_per) ** n_rate) / ((1 + i_per) ** n_rate - 1)
+    saldo = float(capitale)
+    righe = []
+    for k in range(n_rate):
+        interesse = saldo * i_per
+        quota_cap = rata - interesse
+        saldo -= quota_cap
+        righe.append({"periodo": k + 1, "rata": rata, "interessi": interesse,
+                      "capitale": quota_cap, "residuo": max(saldo, 0.0)})
+    df = pd.DataFrame(righe)
+    df["anno"] = ((df["periodo"] - 1) // rate_per_anno) + 1
+    out = df.groupby("anno").agg(rata=("rata", "sum"),
+                                 interessi=("interessi", "sum"),
+                                 capitale=("capitale", "sum"),
+                                 residuo=("residuo", "last")).reset_index()
+    return out
+
+
+def conto_economico(anni, ricavi_0, costi_op_0, capex_lordo, contributo,
+                    quota_debito, tasso_debito, anni_debito,
+                    aliquota_imposte=0.24, anni_ammortamento=20,
+                    esc_ricavi=0.02, esc_costi=0.03, rate_per_anno=2):
+    """Conto economico e flussi di cassa del progetto, anno per anno.
+
+    Distingue il flusso disponibile per il servizio del debito da quello per
+    l'azionista, e calcola le imposte sul reddito imponibile (quindi al netto
+    di ammortamenti e interessi passivi, che sono deducibili): trascurarli
+    sovrastima il carico fiscale e con esso il costo del calore.
+
+    Ritorna un DataFrame con una riga per anno e un dizionario di sintesi.
+    """
+    capex_netto = capex_lordo - contributo
+    debito = capex_netto * quota_debito
+    equity = capex_netto - debito
+    piano = piano_ammortamento_debito(debito, tasso_debito, anni_debito, rate_per_anno)
+    amm_annuo = (capex_lordo - contributo) / max(anni_ammortamento, 1)
+
+    righe = []
+    for t in range(1, anni + 1):
+        ric = ricavi_0 * (1 + esc_ricavi) ** (t - 1)
+        cos = costi_op_0 * (1 + esc_costi) ** (t - 1)
+        ebitda = ric - cos
+        amm = amm_annuo if t <= anni_ammortamento else 0.0
+        ebit = ebitda - amm
+        _r = piano[piano["anno"] == t]
+        interessi = float(_r["interessi"].iloc[0]) if len(_r) else 0.0
+        quota_cap = float(_r["capitale"].iloc[0]) if len(_r) else 0.0
+        residuo = float(_r["residuo"].iloc[0]) if len(_r) else 0.0
+        ebt = ebit - interessi
+        imposte = max(ebt, 0.0) * aliquota_imposte
+        utile = ebt - imposte
+        # il flusso operativo riprende l'ammortamento, che non e' un'uscita
+        fcf_progetto = ebitda - imposte
+        fcf_equity = fcf_progetto - interessi - quota_cap
+        dscr = (fcf_progetto / (interessi + quota_cap)
+                if (interessi + quota_cap) > 1e-9 else np.nan)
+        righe.append({
+            "anno": t, "ricavi": ric, "costi_operativi": cos, "ebitda": ebitda,
+            "ammortamenti": amm, "ebit": ebit, "interessi": interessi,
+            "ebt": ebt, "imposte": imposte, "utile_netto": utile,
+            "quota_capitale": quota_cap, "debito_residuo": residuo,
+            "fcf_progetto": fcf_progetto, "fcf_equity": fcf_equity, "dscr": dscr,
+        })
+    df = pd.DataFrame(righe)
+
+    flussi_progetto = [-capex_netto] + df["fcf_progetto"].tolist()
+    flussi_equity = [-equity] + df["fcf_equity"].tolist()
+    dscr_validi = df["dscr"].replace([np.inf, -np.inf], np.nan).dropna()
+    return df, {
+        "capex_lordo": capex_lordo, "contributo": contributo,
+        "capex_netto": capex_netto, "debito": debito, "equity": equity,
+        "flussi_progetto": flussi_progetto, "flussi_equity": flussi_equity,
+        "interessi_totali": float(df["interessi"].sum()),
+        "imposte_totali": float(df["imposte"].sum()),
+        "dscr_min": float(dscr_validi.min()) if len(dscr_validi) else np.nan,
+        "dscr_medio": float(dscr_validi.mean()) if len(dscr_validi) else np.nan,
+    }
+
+
+def prezzo_di_equilibrio(energia_venduta, quota_fissa_tot, anni, costi_op_0,
+                         capex_lordo, contributo, quota_debito, tasso_debito,
+                         anni_debito, tasso_van, **kw):
+    """Prezzo di vendita del calore che annulla il valore attuale netto.
+
+    E' il costo minimo a cui il progetto sta in piedi: sotto questa soglia
+    l'investimento distrugge valore. Si cerca per bisezione, sfruttando il
+    fatto che il VAN cresce in modo monotono col prezzo.
+    """
+    if energia_venduta <= 0:
+        return None
+
+    def _van_a(prezzo):
+        ric = energia_venduta * prezzo + quota_fissa_tot
+        _, s = conto_economico(anni, ric, costi_op_0, capex_lordo, contributo,
+                               quota_debito, tasso_debito, anni_debito, **kw)
+        return van(s["flussi_progetto"], tasso_van)
+
+    lo, hi = 0.0, 1000.0
+    if _van_a(hi) < 0:
+        return None
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if _van_a(mid) < 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
 def payback_semplice(flussi_cassa):
     """Tempo di ritorno semplice (non attualizzato), in anni. None se mai."""
     cum = 0.0
@@ -4026,7 +4161,8 @@ taglia verrebbe sottostimata.
             # diventano una conseguenza da verificare.
             _vincolo = st.radio(
                 "Cosa fissa la dimensione del campo",
-                ["Superficie disponibile", "Potenza termica richiesta"],
+                ["Superficie disponibile", "Potenza termica richiesta",
+                 "Quota della domanda da coprire"],
                 key="off_vincolo_sol",
                 help="Superficie e temperatura di esercizio determinano insieme la "
                      "potenza ottenibile. Si può partire dal tetto che si ha e vedere "
@@ -4066,7 +4202,7 @@ taglia verrebbe sottostimata.
                     st.caption(f"Potenza termica di picco ottenibile: "
                                f"**{_sup_disp * _p_spec / 1000:,.0f} kW** "
                                f"a {_T_fluido} °C".replace(",", "."))
-            else:
+            elif _vincolo == "Potenza termica richiesta":
                 _p_rich = st.number_input("Potenza termica richiesta (kW)", min_value=0,
                                           max_value=20000, value=500, step=50,
                                           key="off_p_rich",
@@ -4098,6 +4234,86 @@ taglia verrebbe sottostimata.
                     _sup_disp = st.number_input("Superficie disponibile (m²)", min_value=0,
                                                 max_value=50000, value=2000, step=100,
                                                 key="off_sup_disp_pv")
+
+            else:
+                # --- dimensionamento per quota della domanda termica ---
+                # Il minimo utile e' l'acqua calda sanitaria estiva: e' l'unico
+                # fabbisogno presente quando il sole c'e' davvero, ed e' il
+                # classico punto di partenza del solare termico. Il massimo e'
+                # l'intera domanda annua, che pero' richiede un accumulo
+                # stagionale: senza, gran parte del calore estivo si perde.
+                _dom_tot_sol = 0.0
+                _acs_est_sol = 0.0
+                _ed_sol = st.session_state.get("_dom_edifici") or []
+                if _ed_sol:
+                    _d_sol = domanda[domanda["edificio"].isin(_ed_sol)]
+                    _dom_tot_sol = float(_d_sol["MWh_riscaldamento"].sum()
+                                         + _d_sol["MWh_ACS"].sum())
+                    _est_m = _d_sol["datetime"].dt.month.isin([6, 7, 8])
+                    _acs_est_sol = float(_d_sol.loc[_est_m, "MWh_ACS"].sum())
+                if _dom_tot_sol <= 0:
+                    st.warning("Seleziona prima le utenze nella scheda **Domanda**: "
+                               "senza domanda non si può dimensionare per copertura.")
+                    _sup_disp = 2000
+                else:
+                    _q_min = _acs_est_sol / _dom_tot_sol * 100 if _dom_tot_sol > 0 else 1.0
+                    st.caption(f"Domanda annua **{_dom_tot_sol:,.0f} MWh** · "
+                               f"ACS estiva **{_acs_est_sol:,.0f} MWh** "
+                               f"({_q_min:.1f} % del totale)".replace(",", "."))
+                    _quota_dom = st.slider(
+                        "Quota della domanda coperta dal solare (%)",
+                        float(max(round(_q_min, 1), 0.5)), 100.0,
+                        float(min(max(round(_q_min, 1), 0.5) * 2, 100.0)), step=0.5,
+                        key="off_quota_dom",
+                        help="Il minimo proposto corrisponde alla sola acqua calda "
+                             "sanitaria estiva, che è il fabbisogno presente quando "
+                             "il sole c'è. Quote elevate richiedono un accumulo "
+                             "stagionale, altrimenti il calore estivo eccedente "
+                             "viene disperso.")
+                    _e_target = _dom_tot_sol * _quota_dom / 100.0
+                    # resa annua per m² alla temperatura scelta, dalla simulazione
+                    if _tipo_sol == "Termico":
+                        _res_1000 = genera_offerta_solare(pvgis, 1000.0, 0.45)["MWh"].sum()
+                        _resa_m2 = _res_1000 / 1000.0
+                    elif _tipo_sol.startswith("Ibrido"):
+                        _np_rif = int(1000.0 / PVT_ABORA["area_lorda_m2"])
+                        _res_rif = genera_offerta_pvt(pvgis, _np_rif,
+                                                      float(_T_fluido))["MWh_term"].sum()
+                        _resa_m2 = _res_rif / 1000.0
+                    else:
+                        _resa_m2 = 0.0
+                    if _resa_m2 > 0:
+                        _sup_disp = int(round(_e_target / _resa_m2))
+                        st.caption(f"Servono **{_sup_disp:,} m²** per coprire "
+                                   f"{_quota_dom:.1f} % della domanda "
+                                   f"({_e_target:,.0f} MWh/a) a {_T_fluido} °C. "
+                                   f"Resa unitaria {_resa_m2 * 1000:.0f} kWh/(m²·a)."
+                                   .replace(",", "."))
+                        _sup_max2 = st.number_input(
+                            "Superficie realmente disponibile (m²)", min_value=0,
+                            max_value=100000, value=2000, step=100, key="off_sup_max2")
+                        if _sup_disp > _sup_max2 > 0:
+                            _cop_max = _sup_max2 * _resa_m2 / _dom_tot_sol * 100
+                            st.error(f"⚠️ Con {_sup_max2:,} m² si copre al massimo "
+                                     f"**{_cop_max:.1f} %** della domanda. Per arrivare "
+                                     f"al {_quota_dom:.1f} % servirebbero {_sup_disp:,} m². "
+                                     f"Abbassa la temperatura di esercizio per guadagnare "
+                                     f"resa, oppure riduci l'obiettivo."
+                                     .replace(",", "."))
+                            _sup_disp = int(_sup_max2)
+                        if _quota_dom > 25:
+                            st.warning(
+                                "☀️ Sopra il 25 % circa la copertura solare richiede un "
+                                "accumulo stagionale: d'estate il campo produce molto più "
+                                "del necessario e senza un serbatoio di grande volume "
+                                "quell'energia viene dispersa. La quota effettivamente "
+                                "utilizzata, calcolata dal dispatch, sarà inferiore a "
+                                "quella impostata qui.")
+                    else:
+                        _sup_disp = 2000
+                        st.caption("Il fotovoltaico non produce calore: usa la scheda "
+                                   "**Carico elettrico** per dimensionarlo sui consumi.")
+
 
             _prezzo_el_sol = st.slider("Valore dell'elettricità (€/MWh)", 0, 300, 150, step=10,
                                        key="off_prezzo_el_sol",
@@ -5134,6 +5350,21 @@ with tab_dimensionamento:
                                               resa_sorgente, costo_sorgente)
             _o1, _o2, _o3, _o4 = st.columns(4)
             _o1.metric("Opere", f"{_dg['quantita']:,.0f}".replace(",", ".") + f" {_dg['unita'].split()[0]}")
+            _volumi_acqua = None
+            if tipo_sorgente == "acqua di falda":
+                # portata di prelievo e volumi movimentati: sono i numeri che
+                # servono per la domanda di concessione di derivazione
+                _q_ls = _dg["quantita"]
+                _q_m3h = _dg.get("portata_m3h", _q_ls * 3.6)
+                _ore_pren = int((sim["q_ground"] > 1e-9).sum())
+                _vol_anno = _q_m3h * _ore_pren
+                # volume effettivo, pesato sul prelievo orario reale
+                _vol_eff = float((sim["q_ground"] * 1000.0
+                                  / (CP_ACQUA_KJ_KG_K * _dg["dt_k"])   # kg/s per MWh/h
+                                  ).sum()) * 3600.0 / 1000.0
+                _volumi_acqua = {"l_s": _q_ls, "m3_h": _q_m3h,
+                                 "m3_anno": _vol_eff, "ore": _ore_pren,
+                                 "dt_k": _dg["dt_k"]}
             if _dg["n_pozzi"]:
                 _o2.metric("Pozzi", f"{_dg['n_pozzi']}")
             else:
@@ -5143,6 +5374,27 @@ with tab_dimensionamento:
                        f"{_sup / 10000:.2f} ha" if _sup >= 5000 else f"{_sup:,.0f} m²".replace(",", "."))
             _o4.metric("Costo", f"{_dg['costo'] / 1000:,.0f} k€".replace(",", "."),
                        help=f"{_dg['costo'] / max(_pk_ground, 1):,.0f} €/kW estratto".replace(",", "."))
+
+            if _volumi_acqua:
+                st.markdown("**Prelievo idrico**")
+                _w1, _w2, _w3, _w4 = st.columns(4)
+                _w1.metric("Portata di punta", f"{_volumi_acqua['l_s']:,.0f} l/s".replace(",", "."),
+                           help=f"pari a {_volumi_acqua['m3_h']:,.0f} m³/h, con un salto "
+                                f"termico di {_volumi_acqua['dt_k']:.0f} K sul prelievo".replace(",", "."))
+                _w2.metric("Volume annuo", f"{_volumi_acqua['m3_anno'] / 1000:,.0f} migliaia di m³".replace(",", "."),
+                           help="Calcolato ora per ora sul prelievo effettivo, non sulla "
+                                "portata di punta: è il dato da riportare nella domanda "
+                                "di concessione di derivazione.")
+                _w3.metric("Ore di prelievo", f"{_volumi_acqua['ore']:,} h/a".replace(",", "."))
+                _w4.metric("Portata media", 
+                           f"{_volumi_acqua['m3_anno'] / max(_volumi_acqua['ore'], 1):,.0f} m³/h".replace(",", "."),
+                           help="Il rapporto fra portata di punta e portata media indica "
+                                "quanto il pozzo lavori a carico parziale.")
+                st.caption("L'acqua prelevata viene restituita in falda a temperatura "
+                           "inferiore: il bilancio idrico è nullo, quello termico no. "
+                           "La concessione di derivazione e l'autorizzazione allo scarico "
+                           "termico vanno verificate con la Regione, insieme "
+                           "all'interferenza con altri pozzi nell'intorno.")
 
             # confronto fra le tre tecnologie a parità di potenza
             with st.expander("Confronto fra le sorgenti possibili"):
@@ -5541,8 +5793,23 @@ with tab_elettrico:
                                        "o ibrido dimensionato in Offerta.")
             _kwp = 0.0
             if _agg_pv:
-                _kwp = st.number_input("Potenza fotovoltaica (kWp)", min_value=0,
-                                       max_value=20000, value=500, step=50, key="el_kwp")
+                _mod_pv = st.radio("Come dimensionarlo",
+                                   ["Potenza scelta", "Copertura obiettivo"],
+                                   horizontal=True, key="el_mod_pv",
+                                   help="Si può fissare la potenza e vedere che copertura "
+                                        "se ne ricava, oppure indicare la quota di consumo "
+                                        "da coprire e lasciare che sia il programma a "
+                                        "cercare la taglia. La seconda tiene conto dello "
+                                        "sfasamento fra produzione e consumo, quindi la "
+                                        "potenza necessaria è maggiore di quella che si "
+                                        "otterrebbe dal semplice rapporto fra le energie.")
+                if _mod_pv == "Potenza scelta":
+                    _kwp = st.number_input("Potenza fotovoltaica (kWp)", min_value=0,
+                                           max_value=20000, value=500, step=50, key="el_kwp")
+                else:
+                    _cop_obj = st.slider("Copertura del consumo da raggiungere (%)",
+                                         5, 100, 40, step=5, key="el_cop_obj")
+                    _kwp = None   # calcolata sotto, serve la serie di produzione
         with _g2:
             st.markdown("**Accumulo elettrochimico**")
             _batt = st.slider("Capacità utile (MWh)", 0.0, 20.0, 0.0, step=0.5,
@@ -5568,10 +5835,45 @@ with tab_elettrico:
             _mt = serie_meteo_annua(pvgis)
             _sh = _mt["G_totale"].values
             _prod_h = _prod_h + _sh / max(_sh.sum(), 1e-9) * _el_da_solare
-        if _agg_pv and _kwp > 0:
+        if _agg_pv:
             _mt = serie_meteo_annua(pvgis)
             # 0,18 di rendimento, 0,88 di BOS: resa attesa ~1.150 kWh/kWp a Maniago
-            _prod_h = _prod_h + _mt["G_totale"].values * _kwp * 0.18 * 0.88 / 1e6
+            _pv_unit = _mt["G_totale"].values * 0.18 * 0.88 / 1e6      # MWh per kWp
+            if _kwp is None:
+                # Ricerca della taglia che raggiunge la copertura voluta. Non
+                # basta il rapporto fra le energie: produzione e consumo sono
+                # sfasati, quindi oltre una certa taglia la potenza aggiunta
+                # finisce quasi tutta in rete e la copertura cresce poco.
+                _lo, _hi = 0.0, 50000.0
+                _obiettivo = float(_cop_obj)
+                for _ in range(40):
+                    _mid = (_lo + _hi) / 2.0
+                    _r = dispatch_elettrico(_prod_h + _pv_unit * _mid, _cons_h,
+                                            batteria_mwh=_batt,
+                                            p_batt_mw=_batt * _c_rate, eff_batt=_eff_b)
+                    if _r["copertura_pct"] < _obiettivo:
+                        _lo = _mid
+                    else:
+                        _hi = _mid
+                _kwp = round(_hi / 10.0) * 10.0
+                _r_fin = dispatch_elettrico(_prod_h + _pv_unit * _kwp, _cons_h,
+                                            batteria_mwh=_batt,
+                                            p_batt_mw=_batt * _c_rate, eff_batt=_eff_b)
+                if _kwp >= 49000 or _r_fin["copertura_pct"] < _obiettivo - 1:
+                    st.error(f"⚠️ La copertura del {_obiettivo:.0f} % non è raggiungibile "
+                             f"con il solo fotovoltaico: produzione e consumo sono "
+                             f"troppo sfasati. Il massimo praticabile è circa "
+                             f"**{_r_fin['copertura_pct']:.0f} %**. Aumenta l'accumulo "
+                             f"oppure accetta una copertura minore.")
+                else:
+                    st.success(f"Per coprire il **{_obiettivo:.0f} %** dei consumi "
+                               f"servono **{_kwp:,.0f} kWp** "
+                               f"({_kwp * 6.5 / 1000:,.1f} m² circa di superficie). "
+                               f"Produzione annua {(_pv_unit * _kwp).sum():,.0f} MWh, "
+                               f"di cui autoconsumata il "
+                               f"{_r_fin['autoconsumo_pct']:.0f} %.".replace(",", "."))
+            if _kwp and _kwp > 0:
+                _prod_h = _prod_h + _pv_unit * _kwp
 
         if _prod_h.sum() <= 0:
             st.warning("Nessuna generazione elettrica: senza produzione propria "
@@ -6247,6 +6549,159 @@ with tab_economia:
         amb3.metric("Valore CO\u2082 evitata / anno",
                     f"{_snap.get('co2_evitata_t', 0) * _val_co2 / 1000:,.0f} k\u20ac/a".replace(",", "."),
                     help="Beneficio economico potenziale (non incluso nel VAN sopra).")
+
+        # ------------------------------------------------------------------
+        # STRUTTURA FINANZIARIA
+        # Il calcolo sopra tratta l'investimento come se fosse pagato per
+        # intero e subito. Nella realta' un'opera di questa dimensione viene
+        # finanziata: qui si aggiungono debito, ammortamenti e imposte, che
+        # cambiano sensibilmente il quadro perche' gli interessi e gli
+        # ammortamenti sono deducibili.
+        # ------------------------------------------------------------------
+        st.divider()
+        st.markdown("#### \U0001F3E6 Struttura finanziaria")
+        _usa_pf = st.checkbox("Considera debito, ammortamenti e imposte",
+                              value=False, key="eco_usa_pf",
+                              help="Senza questa opzione il progetto è valutato come "
+                                   "se fosse interamente autofinanziato e non soggetto "
+                                   "a imposte: è il conto più semplice, ma trascura la "
+                                   "leva finanziaria e la deducibilità di interessi e "
+                                   "ammortamenti.")
+        if _usa_pf:
+            _f1, _f2, _f3 = st.columns(3)
+            with _f1:
+                _q_deb = st.slider("Quota coperta da debito (%)", 0, 90, 70, step=5,
+                                   key="eco_q_deb",
+                                   help="Percentuale dell'investimento netto, cioè al "
+                                        "netto del contributo pubblico.") / 100.0
+                _t_deb = st.slider("Tasso sul debito (%)", 0.5, 10.0, 4.5, step=0.25,
+                                   key="eco_t_deb") / 100.0
+            with _f2:
+                _anni_deb = st.slider("Durata del debito (anni)", 5, 30, 15,
+                                      key="eco_anni_deb")
+                _rate_anno = st.selectbox("Rate all'anno", [1, 2, 4, 12], index=1,
+                                          key="eco_rate_anno",
+                                          help="Il piano si calcola per rata e si "
+                                               "aggrega per anno: sommare direttamente "
+                                               "su base annua sottostimerebbe gli interessi.")
+            with _f3:
+                _aliq = st.slider("Aliquota sul reddito (%)", 0, 45, 24, step=1,
+                                  key="eco_aliq",
+                                  help="IRES 24 %. Aggiungere l'IRAP se rilevante "
+                                       "per la forma societaria scelta.")
+                _anni_amm = st.slider("Anni di ammortamento fiscale", 5, 40, 20,
+                                      key="eco_anni_amm")
+
+            _costi_op_pf = (opex_energia_0 + costo_pompaggio_0 + costo_scarto_0
+                            + om_0 + costi_fissi_0)
+            _df_ce, _sint = conto_economico(
+                anni=orizzonte, ricavi_0=ricavi_0, costi_op_0=_costi_op_pf,
+                capex_lordo=capex_tot, contributo=contributo,
+                quota_debito=_q_deb, tasso_debito=_t_deb, anni_debito=_anni_deb,
+                aliquota_imposte=_aliq / 100.0, anni_ammortamento=_anni_amm,
+                esc_ricavi=esc_ricavi, esc_costi=esc_costi,
+                rate_per_anno=int(_rate_anno))
+
+            _van_p = van(_sint["flussi_progetto"], wacc)
+            _van_e = van(_sint["flussi_equity"], wacc)
+            _tir_p = tir(_sint["flussi_progetto"])
+            _tir_e = tir(_sint["flussi_equity"])
+
+            _s1, _s2, _s3, _s4 = st.columns(4)
+            _s1.metric("Debito", f"{_sint['debito'] / 1e6:.2f} M€",
+                       help=f"su {_sint['capex_netto'] / 1e6:.2f} M€ di investimento netto")
+            _s2.metric("Capitale proprio", f"{_sint['equity'] / 1e6:.2f} M€")
+            _s3.metric("Interessi totali", f"{_sint['interessi_totali'] / 1e6:.2f} M€")
+            _s4.metric("Imposte totali", f"{_sint['imposte_totali'] / 1e6:.2f} M€")
+
+            _r1, _r2, _r3, _r4 = st.columns(4)
+            _r1.metric("VAN di progetto", f"{_van_p / 1e6:.2f} M€",
+                       help="Flussi disponibili prima del servizio del debito, "
+                            "attualizzati al WACC.")
+            _r2.metric("VAN per l'azionista", f"{_van_e / 1e6:.2f} M€",
+                       help="Flussi che restano dopo aver pagato rate e interessi.")
+            _r3.metric("TIR di progetto",
+                       f"{_tir_p * 100:.1f}%" if _tir_p is not None else "n/d")
+            _r4.metric("TIR per l'azionista",
+                       f"{_tir_e * 100:.1f}%" if _tir_e is not None else "n/d",
+                       help="Se supera il TIR di progetto, la leva finanziaria sta "
+                            "creando valore: il debito costa meno del rendimento "
+                            "dell'investimento.")
+
+            _d1, _d2 = st.columns(2)
+            _dscr_min = _sint["dscr_min"]
+            _d1.metric("DSCR minimo", f"{_dscr_min:.2f}" if np.isfinite(_dscr_min) else "n/d",
+                       help="Rapporto fra flusso di cassa e servizio del debito nell'anno "
+                            "peggiore. Le banche chiedono di norma almeno 1,20-1,30.")
+            _d2.metric("DSCR medio", f"{_sint['dscr_medio']:.2f}"
+                       if np.isfinite(_sint["dscr_medio"]) else "n/d")
+            if np.isfinite(_dscr_min):
+                if _dscr_min < 1.0:
+                    st.error(f"⚠️ Con un DSCR minimo di {_dscr_min:.2f} il progetto non "
+                             f"genera cassa sufficiente a pagare le rate: va ridotta la "
+                             f"quota di debito, allungata la durata o aumentato il "
+                             f"contributo pubblico.")
+                elif _dscr_min < 1.2:
+                    st.warning(f"⚠️ DSCR minimo {_dscr_min:.2f}: sotto la soglia di 1,20 "
+                               f"normalmente richiesta dagli istituti di credito. "
+                               f"Il margine di sicurezza è esiguo.")
+                else:
+                    st.success(f"✅ DSCR minimo {_dscr_min:.2f}: il flusso di cassa copre "
+                               f"il servizio del debito con margine adeguato.")
+
+            _pe = prezzo_di_equilibrio(
+                E_venduto, ricavo_fisso_0, orizzonte, _costi_op_pf, capex_tot,
+                contributo, _q_deb, _t_deb, _anni_deb, wacc,
+                aliquota_imposte=_aliq / 100.0, anni_ammortamento=_anni_amm,
+                esc_ricavi=esc_ricavi, esc_costi=esc_costi,
+                rate_per_anno=int(_rate_anno))
+            if _pe is not None:
+                _scarto = prezzo_calore - _pe
+                st.metric("Prezzo di equilibrio del calore", f"{_pe:.1f} €/MWh",
+                          delta=f"{_scarto:+.1f} rispetto al prezzo impostato",
+                          delta_color="normal" if _scarto >= 0 else "inverse",
+                          help="Prezzo che annulla il valore attuale netto: è il minimo "
+                               "a cui il progetto sta in piedi.")
+                if _scarto < 0:
+                    st.warning(f"Al prezzo di {prezzo_calore:.0f} €/MWh il progetto "
+                               f"distrugge valore: servirebbero almeno {_pe:.0f} €/MWh, "
+                               f"oppure un contributo più alto.")
+
+            _fg = go.Figure()
+            _fg.add_trace(go.Bar(x=_df_ce["anno"], y=_df_ce["ebitda"], name="EBITDA",
+                                 marker_color=COLOR_OFFERTA))
+            _fg.add_trace(go.Bar(x=_df_ce["anno"], y=-_df_ce["interessi"],
+                                 name="interessi", marker_color=COLOR_CALDAIA))
+            _fg.add_trace(go.Bar(x=_df_ce["anno"], y=-_df_ce["quota_capitale"],
+                                 name="quota capitale", marker_color="#8E5FC2"))
+            _fg.add_trace(go.Bar(x=_df_ce["anno"], y=-_df_ce["imposte"],
+                                 name="imposte", marker_color="#9AA0A6"))
+            _fg.add_trace(go.Scatter(x=_df_ce["anno"], y=_df_ce["fcf_equity"],
+                                     name="flusso per l'azionista", mode="lines+markers",
+                                     line=dict(color=COLOR_DOMANDA, width=2.5)))
+            _fg.update_layout(barmode="relative", height=400, yaxis_title="€/anno",
+                              xaxis_title="anno",
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                              margin=dict(t=30, b=10))
+            st.plotly_chart(_fg, width="stretch")
+
+            with st.expander("📄 Conto economico e flussi, anno per anno"):
+                _vis = _df_ce.copy()
+                _vis.columns = ["Anno", "Ricavi", "Costi operativi", "EBITDA",
+                                "Ammortamenti", "EBIT", "Interessi", "EBT", "Imposte",
+                                "Utile netto", "Quota capitale", "Debito residuo",
+                                "Flusso di progetto", "Flusso per l'azionista", "DSCR"]
+                st.dataframe(_vis.round(0), width="stretch", hide_index=True)
+                st.download_button("⬇️ Scarica il conto economico (CSV)",
+                                   data=_vis.to_csv(index=False).encode("utf-8"),
+                                   file_name="maniago_tlr_conto_economico.csv",
+                                   mime="text/csv", key="eco_dl_ce")
+            st.caption("Le imposte gravano sul reddito imponibile, quindi al netto di "
+                       "ammortamenti e interessi passivi che sono deducibili. Il flusso "
+                       "di progetto è quello disponibile prima del servizio del debito, "
+                       "quello per l'azionista è ciò che resta dopo. Non sono considerati "
+                       "l'IVA, il credito d'imposta e gli eventuali incentivi in conto "
+                       "esercizio, che vanno valutati caso per caso.")
 
         with st.expander("\U0001F4C4 Dettaglio dei flussi di cassa anno per anno"):
             df_det = pd.DataFrame(dettaglio)
