@@ -28,6 +28,10 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P18 Catalogo di moduli ibridi PVT selezionabile (Abora aH72 vetrato e isolato,
+     Fototherm FT320AS e FT265CS non isolati), con i parametri certificati
+     EN ISO 9806 delle rispettive schede tecniche e i limiti di temperatura
+     di circuito dichiarati dai costruttori.
  P17 Solare dimensionabile anche per quota della domanda coperta; PV
      dimensionabile per copertura del consumo elettrico; volumi di prelievo
      idrico nel caso di acqua di falda; struttura finanziaria completa in
@@ -2279,6 +2283,57 @@ def genera_offerta_flussi(flussi_df, pinch):
 # Il modello usa invece i parametri fisici certificati (eta0, a1, a2 per il
 # termico; Pmpp e coefficiente di temperatura per l'elettrico), che consentono
 # di calcolare la resa ora per ora nelle condizioni reali di Maniago.
+# Catalogo dei moduli ibridi considerati. I parametri termici sono quelli
+# certificati EN ISO 9806 riportati nelle schede tecniche dei costruttori.
+#
+# Differenza sostanziale fra le due famiglie: l'Abora e' un modulo isolato e
+# vetrato, con temperatura di stagnazione dichiarata a 126 C; i Fototherm sono
+# moduli non isolati, con perdite maggiori e stagnazione intorno ai 68 C. Sopra
+# i 60 C di esercizio i Fototherm rendono quindi pochissimo calore, mentre
+# restano competitivi sul lato elettrico. Il manuale della serie AS fissa
+# inoltre a 80 C la temperatura massima ammessa nel circuito solare.
+CATALOGO_PVT = {
+    "Abora aH72 M2 (vetrato e isolato)": {
+        "nome": "Abora aH72 M2",
+        "area_lorda_m2": 1.96, "area_apertura_m2": 1.88,
+        "eta0": 0.70, "a1": 5.98, "a2": 0.00,
+        "p_picco_w": 350.0, "eta_pv_stc": 0.178, "coeff_pmpp_pct_k": -0.36,
+        "noct_c": 45.0, "t_ristagno_c": 126.0, "t_max_circuito_c": 100.0,
+        "portata_l_h": 60.0, "peso_kg": 50.0,
+        "note": ("Modulo vetrato e coibentato: perdite contenute (a1 = 5,98) e "
+                 "quindi buona resa anche a temperature elevate. E' il piu' "
+                 "adatto quando si vuole alimentare direttamente un anello caldo."),
+    },
+    "Fototherm FT320AS (non isolato)": {
+        "nome": "Fototherm FT320AS",
+        "area_lorda_m2": 1.63, "area_apertura_m2": 1.63,
+        "eta0": 0.472, "a1": 7.96, "a2": 0.00,
+        "p_picco_w": 320.0, "eta_pv_stc": 0.1967, "coeff_pmpp_pct_k": -0.38,
+        "noct_c": 45.0, "t_ristagno_c": 67.0, "t_max_circuito_c": 80.0,
+        "portata_l_h": 120.0, "peso_kg": 30.0,
+        "note": ("Rendimento elettrico elevato (19,7 %) ma modulo non isolato: "
+                 "stagnazione a circa 67 C e resa termica che crolla oltre i "
+                 "50 C. Il manuale fissa a 80 C la massima temperatura di "
+                 "circuito. Adatto a precaricare l'anello basso. Nota: la "
+                 "potenza termica nominale dichiarata (827 W) implicherebbe "
+                 "un'area di riferimento di 1,75 m2 contro i 1,63 m2 di area "
+                 "lorda; qui si adotta l'ipotesi conservativa dell'area lorda."),
+    },
+    "Fototherm FT265CS (non isolato)": {
+        "nome": "Fototherm FT265CS",
+        "area_lorda_m2": 1.61, "area_apertura_m2": 1.59,
+        "eta0": 0.56, "a1": 9.12, "a2": 0.00,
+        "p_picco_w": 265.0, "eta_pv_stc": 0.165, "coeff_pmpp_pct_k": -0.41,
+        "noct_c": 45.0, "t_ristagno_c": 69.0, "t_max_circuito_c": 80.0,
+        "portata_l_h": 120.0, "peso_kg": 27.0,
+        "note": ("Celle policristalline, rendimento elettrico inferiore (16,5 %) "
+                 "ma rendimento ottico termico piu' alto della serie AS. Anche "
+                 "questo non isolato: perdite elevate (a1 = 9,12) e stagnazione "
+                 "intorno ai 69 C."),
+    },
+}
+
+
 PVT_ABORA = {
     "nome": "Abora aH72 M2",
     "area_lorda_m2": 1.96,       # 1970 x 995 mm
@@ -2340,18 +2395,19 @@ def resa_pvt_oraria(G_wm2, T_amb_c, T_fluido_c, pvt=None,
 
 
 @st.cache_data
-def genera_offerta_pvt(pvgis_df, n_pannelli, T_fluido_c, pvt_nome="Abora aH72 M2"):
+def genera_offerta_pvt(pvgis_df, n_pannelli, T_fluido_c, pvt_nome=None):
     """Serie oraria annua di un campo PVT: calore utile ed elettricita'.
 
     T_fluido_c: temperatura media del fluido nei collettori. Coincide col
     livello termico che il campo deve alimentare (anello basso, intermedio
     o caldo): piu' e' alta, minore e' la resa termica.
     """
-    p = PVT_ABORA
+    p = CATALOGO_PVT.get(pvt_nome, PVT_ABORA) if pvt_nome else PVT_ABORA
     area = n_pannelli * p["area_lorda_m2"]
     # anno meteorologico con la variabilita' giorno per giorno conservata
     out = serie_meteo_annua(pvgis_df).copy()
-    q_th, q_el = resa_pvt_oraria(out["G_totale"].values, out["T2m"].values, T_fluido_c)
+    q_th, q_el = resa_pvt_oraria(out["G_totale"].values, out["T2m"].values,
+                                 T_fluido_c, pvt=p)
     out["MWh_term"] = q_th * area / 1000.0
     out["MWh_el"] = q_el * area / 1000.0
     out["MWh"] = out["MWh_term"]          # per compatibilita' col dispatch
@@ -4322,29 +4378,36 @@ taglia verrebbe sottostimata.
                                             "scheda Copertura del carico elettrico.")
 
 
-        # --- confronto delle tre tecnologie sulla stessa superficie ---
-        _p = PVT_ABORA
+        # --- confronto delle tecnologie sulla stessa superficie ---
+        # Il modulo ibrido si sceglie qui: i tre in catalogo hanno profili molto
+        # diversi, e il migliore dipende dalla temperatura a cui deve lavorare.
+        _mod_off = st.selectbox("Modello di modulo ibrido da confrontare",
+                                list(CATALOGO_PVT.keys()), index=0, key="off_modello_pvt")
+        _p = CATALOGO_PVT[_mod_off]
         _n_pan = int(_sup_disp / _p["area_lorda_m2"])
         _righe_cfr = []
 
-        # termico tradizionale (collettore piano, eta0 0.78 a1 3.5: migliore del PVT
-        # sul termico perche' non deve ospitare le celle)
+        # termico tradizionale (collettore piano vetrato: rende piu' calore
+        # perche' non deve ospitare le celle)
         _serie_th = genera_offerta_solare(pvgis, _sup_disp, 0.45).set_index("datetime")
         _e_th = float(_serie_th["MWh"].reindex(HOURS_2024, fill_value=0).sum())
         _righe_cfr.append({"Tecnologia": "Termico", "Calore (MWh/a)": round(_e_th),
                            "Elettricità (MWh/a)": 0.0,
                            "CAPEX (€)": round(_sup_disp * 450)})
 
-        # ibrido PVT
-        _serie_pvt = genera_offerta_pvt(pvgis, _n_pan, float(_T_fluido)).set_index("datetime")
+        # ibrido PVT, con il modulo scelto
+        _serie_pvt = genera_offerta_pvt(pvgis, _n_pan, float(_T_fluido),
+                                        _mod_off).set_index("datetime")
         _e_pvt_th = float(_serie_pvt["MWh_term"].reindex(HOURS_2024, fill_value=0).sum())
         _e_pvt_el = float(_serie_pvt["MWh_el"].reindex(HOURS_2024, fill_value=0).sum())
-        _righe_cfr.append({"Tecnologia": "Ibrido PVT", "Calore (MWh/a)": round(_e_pvt_th),
+        _cap_pvt_u = 900 if "Abora" in _p["nome"] else 500
+        _righe_cfr.append({"Tecnologia": f"Ibrido · {_p['nome']}",
+                           "Calore (MWh/a)": round(_e_pvt_th),
                            "Elettricità (MWh/a)": round(_e_pvt_el),
-                           "CAPEX (€)": round(_n_pan * 900)})
+                           "CAPEX (€)": round(_n_pan * _cap_pvt_u)})
 
         # fotovoltaico puro: stessa cella, nessun recupero termico
-        _serie_pv = genera_offerta_pvt(pvgis, _n_pan, 60.0).set_index("datetime")
+        _serie_pv = genera_offerta_pvt(pvgis, _n_pan, 60.0, _mod_off).set_index("datetime")
         _e_pv_el = float(_serie_pv["MWh_el"].reindex(HOURS_2024, fill_value=0).sum()) * 0.97
         _righe_cfr.append({"Tecnologia": "Fotovoltaico", "Calore (MWh/a)": 0.0,
                            "Elettricità (MWh/a)": round(_e_pv_el),
@@ -4367,6 +4430,29 @@ taglia verrebbe sottostimata.
                        "le celle; l'ibrido ne rende meno ma aggiunge elettricità. Quale "
                        "convenga dipende da quanto vale l'energia elettrica e da quanto "
                        "calore serve davvero d'estate.")
+
+        with st.expander("⚖️ Confronto fra i moduli ibridi in catalogo"):
+            st.caption("A parità di superficie, al variare della temperatura a cui il "
+                       "campo deve cedere calore. La resa elettrica quasi non ne risente, "
+                       "quella termica moltissimo: è il criterio che discrimina fra un "
+                       "modulo isolato e uno che non lo è.")
+            _righe_mod = []
+            for _nm, _pp in CATALOGO_PVT.items():
+                _npn = int(_sup_disp / _pp["area_lorda_m2"])
+                _r = {"Modulo": _pp["nome"],
+                      "Pannelli": _npn,
+                      "Stagnazione (°C)": round(_pp["t_ristagno_c"]),
+                      "η elettrico": f"{_pp['eta_pv_stc'] * 100:.1f} %"}
+                for _T in (35, 45, 60):
+                    _sr = genera_offerta_pvt(pvgis, _npn, float(_T), _nm)
+                    _r[f"Calore a {_T} °C"] = round(float(_sr["MWh_term"].sum()))
+                _sr45 = genera_offerta_pvt(pvgis, _npn, 45.0, _nm)
+                _r["Elettricità"] = round(float(_sr45["MWh_el"].sum()))
+                _r["Peso (t)"] = round(_npn * _pp["peso_kg"] / 1000, 1)
+                _righe_mod.append(_r)
+            st.dataframe(pd.DataFrame(_righe_mod), width="stretch", hide_index=True)
+            for _nm, _pp in CATALOGO_PVT.items():
+                st.caption(f"**{_pp['nome']}** · {_pp['note']}")
 
         # --- serie effettivamente adottata ---
         _serie_el_ad = np.zeros(len(HOURS_2024))
@@ -5028,6 +5114,32 @@ with tab_dimensionamento:
                            f"**{solar_low.sum():,.0f} MWh/a** termici".replace(",", ".")
                            + (f" e **{pvt_el_mwh:,.0f} MWh/a** elettrici".replace(",", ".")
                               if pvt_el_mwh > 0 else ""))
+                # Il costo resta modificabile anche quando la taglia arriva da
+                # Offerta: e' il parametro su cui si fa piu' spesso sensitivita',
+                # e i prezzi di mercato cambiano piu' in fretta della tecnologia.
+                _cst1, _cst2 = st.columns([1, 1])
+                if _scelta_sol == _opzioni_sol[2] and n_pvt > 0:
+                    _cap_pan_o = _cst1.slider(
+                        "Costo per pannello (€)", 300, 2000,
+                        int(round(capex_solare / max(n_pvt, 1) / 50) * 50), step=25,
+                        key="dim_capex_pvt_da_off",
+                        help="Fornitura e posa, comprensivi di circuito idraulico, "
+                             "inverter e opere accessorie.")
+                    capex_solare = n_pvt * _cap_pan_o
+                    _cst2.metric("Equivale a",
+                                 f"{capex_solare / max(area_sol, 1):,.0f} €/m²".replace(",", "."),
+                                 help=f"{n_pvt} pannelli, "
+                                      f"{area_sol / max(n_pvt, 1):.2f} m² ciascuno")
+                else:
+                    _cap_mq_o = _cst1.slider(
+                        "Costo del campo (€/m²)", 100, 1200,
+                        int(round(capex_solare / max(area_sol, 1) / 10) * 10), step=10,
+                        key="dim_capex_term_da_off",
+                        help="Collettori, strutture di supporto, circuito idraulico "
+                             "e regolazione.")
+                    capex_solare = area_sol * _cap_mq_o
+                    _cst2.metric("Costo complessivo",
+                                 f"{capex_solare / 1000:,.0f} k€".replace(",", "."))
             else:
                 if _fonte_sol == "Dalla scheda Offerta" and not _coerente:
                     st.warning("La scheda Offerta non ha una configurazione di questo "
@@ -5044,30 +5156,83 @@ with tab_dimensionamento:
                 area_sol = int(_area_in)
                 if _scelta_sol == _opzioni_sol[1]:
                     tipo_solare = "Termico"
-                    _cap_mq = st.slider("CAPEX (€/m²)", 200, 900, 450, step=20,
-                                        key="dim_capex_sol_mq")
+                    _cap_mq = st.slider("Costo del campo (€/m²)", 100, 1200, 450, step=10,
+                                        key="dim_capex_sol_mq",
+                                        help="Collettori, strutture di supporto, circuito "
+                                             "idraulico e regolazione. Un campo di grande "
+                                             "taglia sta sui 300-500 €/m², uno piccolo su "
+                                             "coperture esistenti può superare gli 800.")
                     _st_ = genera_offerta_solare(pvgis, area_sol, 0.45).set_index("datetime")
                     solar_low = _st_["MWh"].reindex(idx_h, fill_value=0).values
                     capex_solare = area_sol * _cap_mq
                 else:
-                    tipo_solare = "Ibrido PVT (Abora aH72)"
-                    n_pvt = int(area_sol / PVT_ABORA["area_lorda_m2"])
-                    _cap_pan = st.slider("CAPEX per pannello (€)", 400, 1600, 900, step=50,
-                                         key="dim_capex_pvt_pan")
-                    _pv_ = genera_offerta_pvt(pvgis, n_pvt, float(_tf_in)).set_index("datetime")
+                    _mod_sel = st.selectbox("Modello di pannello ibrido",
+                                            list(CATALOGO_PVT.keys()), index=0,
+                                            key="dim_modello_pvt",
+                                            help="I moduli vetrati e isolati rendono "
+                                                 "calore anche a temperature elevate; "
+                                                 "quelli non isolati hanno perdite "
+                                                 "maggiori e stagnano intorno ai 68 °C, "
+                                                 "ma costano meno e hanno spesso un "
+                                                 "rendimento elettrico superiore.")
+                    _mp = CATALOGO_PVT[_mod_sel]
+                    tipo_solare = f"Ibrido PVT ({_mp['nome']})"
+                    n_pvt = int(area_sol / _mp["area_lorda_m2"])
+                    _t_lim = _mp.get("t_max_circuito_c", 100.0)
+                    if _tf_in > _t_lim:
+                        st.error(f"⚠️ La temperatura impostata ({_tf_in} °C) supera il "
+                                 f"limite di circuito del modulo ({_t_lim:.0f} °C).")
+                    elif _tf_in > _mp["t_ristagno_c"] - 15:
+                        st.warning(f"⚠️ A {_tf_in} °C il modulo è vicino alla stagnazione "
+                                   f"({_mp['t_ristagno_c']:.0f} °C): la resa termica è "
+                                   f"quasi nulla. Con un modulo non isolato conviene "
+                                   f"restare sotto i 45-50 °C.")
+                    _cap_pan = st.slider("Costo per pannello (€)", 200, 2000,
+                                         900 if "Abora" in _mp["nome"] else 500, step=25,
+                                         key="dim_capex_pvt_pan",
+                                         help="Il pannello ibrido si acquista a pezzo. "
+                                              "Fornitura e posa comprensive di circuito "
+                                              "idraulico, inverter e opere accessorie.")
+                    st.caption(_mp["note"])
+                    _pv_ = genera_offerta_pvt(pvgis, n_pvt, float(_tf_in),
+                                              _mod_sel).set_index("datetime")
                     solar_low = _pv_["MWh_term"].reindex(idx_h, fill_value=0).values
                     _serie_el_dim = _pv_["MWh_el"].reindex(HOURS_2024, fill_value=0).values
                     pvt_el_mwh = float(_serie_el_dim.sum())
                     capex_solare = n_pvt * _cap_pan
-                _mm1, _mm2, _mm3 = st.columns(3)
+                _mm1, _mm2, _mm3, _mm4 = st.columns(4)
                 _mm1.metric("Calore", f"{solar_low.sum():,.0f} MWh/a".replace(",", "."))
                 _mm2.metric("Elettricità", f"{pvt_el_mwh:,.0f} MWh/a".replace(",", ".")
                             if pvt_el_mwh > 0 else "—")
                 _mm3.metric("CAPEX", f"{capex_solare / 1000:,.0f} k€".replace(",", "."))
+                # potenza di picco alle condizioni di riferimento, per leggere il
+                # costo anche in €/kW e confrontarlo con le altre tecnologie
+                _th_r, _ = resa_pvt_oraria(np.array([800.0]), np.array([20.0]),
+                                           np.array([float(_tf_in)]))
+                if _scelta_sol == _opzioni_sol[1]:
+                    _p_pk = area_sol * max(0.78 - 3.5 * (_tf_in - 20.0) / 800.0, 0.0) * 0.8
+                else:
+                    _p_pk = area_sol * float(_th_r[0])
+                _mm4.metric("Costo specifico",
+                            f"{capex_solare / max(_p_pk, 1):,.0f} €/kW".replace(",", "."),
+                            help=f"riferito ai {_p_pk:,.0f} kW di picco alle condizioni "
+                                 f"di riferimento (800 W/m², aria 20 °C, fluido "
+                                 f"{_tf_in} °C)".replace(",", "."))
+                _det = [f"{capex_solare / max(area_sol, 1):,.0f} €/m²".replace(",", ".")]
                 if n_pvt:
-                    st.caption(f"{n_pvt} pannelli da {PVT_ABORA['area_lorda_m2']:.2f} m², "
-                               f"peso complessivo {n_pvt * PVT_ABORA['peso_kg'] / 1000:.1f} t: "
-                               f"verificare la portata delle coperture.")
+                    _mp_d = CATALOGO_PVT.get(st.session_state.get("dim_modello_pvt", ""),
+                                             PVT_ABORA)
+                    _det.append(f"{n_pvt} pannelli da {_mp_d['area_lorda_m2']:.2f} m²")
+                    _det.append(f"peso {n_pvt * _mp_d['peso_kg'] / 1000:.1f} t "
+                                f"(verificare la portata delle coperture)")
+                st.caption(" · ".join(_det))
+                if _scelta_sol == _opzioni_sol[2]:
+                    st.caption("A parità di superficie l'ibrido costa quanto un buon "
+                               "campo termico, ma rende meno calore: il costo per kW "
+                               "termico è quindi più alto, tanto più quanto sale la "
+                               "temperatura di esercizio. La differenza va giustificata "
+                               "dall'elettricità prodotta, che si valuta nella scheda "
+                               "**Carico elettrico**.")
 
             if not is_hp_par:
                 st.warning("⚠️ Il calore solare alimenta l'anello basso, che senza "
