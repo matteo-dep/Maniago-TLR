@@ -4946,14 +4946,6 @@ with tab_dimensionamento:
                              help="IEA DHC F1 Tab.3: 110-200 €/m³ sopra i 2.000 m³; "
                                       "1.000 €/m³ è conservativo per serbatoi in acciaio piccoli.")
         with _a2:
-            considera_el = st.checkbox(
-                "Tieni conto dell'autoproduzione elettrica", value=False,
-                key="dim_considera_el",
-                help="Se attivo, il costo dell'elettricità nel calcolo del LCOH "
-                     "viene ridotto in base all'autoconsumo calcolato nella scheda "
-                     "**Carico elettrico**. Lasciandolo spento il dimensionamento "
-                     "termico resta indipendente dalle scelte elettriche, che è "
-                     "l'impostazione consigliata per confrontare gli scenari.")
             strat_on = st.checkbox("Accumulo intermedio stratificato", value=True,
                                    key="dim_strat",
                                    help="Un serbatoio ben progettato non mescola: l'acqua "
@@ -4972,28 +4964,143 @@ with tab_dimensionamento:
                            "viene calcolato sulla temperatura nominale dell'anello. "
                            "È l'ipotesi conservativa.")
 
-        # Il solare e' stato spostato nella scheda Offerta, dove si confrontano
-        # termico, fotovoltaico e ibrido a parita' di superficie disponibile.
+        # ------------------------------------------------------------------
+        # SOLARE
+        # La configurazione puo' arrivare dalla scheda Offerta, dove si
+        # confrontano le tecnologie a parita' di superficie, oppure essere
+        # impostata direttamente qui quando si vuole solo provare l'effetto
+        # sul dimensionamento senza rifare il confronto.
+        # ------------------------------------------------------------------
+        st.divider()
+        st.markdown("**\u2600\ufe0f Solare**")
         _sol = st.session_state.get("_off_solare", {}) or {}
-        solare_on = bool(_sol.get("attivo", False))
-        solar_low = np.asarray(_sol.get("serie_termica", np.zeros(len(dom_arr))), dtype=float)
-        if len(solar_low) != len(dom_arr):
-            solar_low = np.zeros(len(dom_arr))
-        capex_solare = float(_sol.get("capex", 0.0))
-        area_sol = int(_sol.get("area_m2", 0))
-        n_pvt = int(_sol.get("n_pannelli", 0))
-        pvt_el_mwh = float(_sol.get("elettrico_mwh", 0.0))
-        ricavo_pvt_el = float(_sol.get("ricavo_elettrico", 0.0))
-        tipo_solare = _sol.get("tipo", "assente")
+        _sol_da_offerta = bool(_sol.get("attivo", False))
+
+        _opzioni_sol = ["Nessun impianto solare", "Solare termico", "Ibrido PVT (termico + elettrico)"]
+        _idx_def = 0
+        if _sol_da_offerta:
+            _idx_def = 2 if str(_sol.get("tipo", "")).startswith("Ibrido") else 1
+        _scelta_sol = st.radio(
+            "Tecnologia solare", _opzioni_sol, index=_idx_def, key="dim_scelta_sol",
+            help="Il solare termico rende piu' calore per metro quadro; l'ibrido ne "
+                 "rende meno ma produce anche elettricita' con la stessa superficie. "
+                 "Il confronto quantitativo a parita' di tetto disponibile e' nella "
+                 "scheda Offerta.")
+
+        solare_on = (_scelta_sol != _opzioni_sol[0])
+        solar_low = np.zeros(len(dom_arr))
+        capex_solare = 0.0
+        area_sol = 0
+        n_pvt = 0
+        pvt_el_mwh = 0.0
+        ricavo_pvt_el = 0.0
+        tipo_solare = "assente"
+        _serie_el_dim = np.zeros(len(HOURS_2024))
+
         if solare_on:
-            st.info(f"☀️ Solare attivo dalla scheda **Offerta**: {tipo_solare}, "
-                    f"{area_sol:,} m², {solar_low.sum():,.0f} MWh/a termici".replace(",", ".")
-                    + (f" e {pvt_el_mwh:,.0f} MWh/a elettrici".replace(",", ".")
-                       if pvt_el_mwh > 0 else "") + ".")
+            _coerente = (_sol_da_offerta and
+                         ((_scelta_sol == _opzioni_sol[1] and _sol.get("tipo") == "Termico") or
+                          (_scelta_sol == _opzioni_sol[2] and
+                           str(_sol.get("tipo", "")).startswith("Ibrido"))))
+            _fonte_sol = st.radio(
+                "Da dove prendere il dimensionamento",
+                ["Dalla scheda Offerta", "Imposta qui"],
+                index=0 if _coerente else 1, horizontal=True, key="dim_fonte_sol",
+                help="La scheda Offerta permette di confrontare le tecnologie e di "
+                     "dimensionare per superficie, potenza o quota di domanda coperta. "
+                     "Qui si imposta solo la taglia, per valutarne l'effetto sul "
+                     "dispatch termico.")
+
+            if _fonte_sol == "Dalla scheda Offerta" and _coerente:
+                solar_low = np.asarray(_sol.get("serie_termica", np.zeros(len(dom_arr))),
+                                       dtype=float)
+                if len(solar_low) != len(dom_arr):
+                    solar_low = np.zeros(len(dom_arr))
+                capex_solare = float(_sol.get("capex", 0.0))
+                area_sol = int(_sol.get("area_m2", 0))
+                n_pvt = int(_sol.get("n_pannelli", 0))
+                pvt_el_mwh = float(_sol.get("elettrico_mwh", 0.0))
+                ricavo_pvt_el = float(_sol.get("ricavo_elettrico", 0.0))
+                tipo_solare = _sol.get("tipo", "assente")
+                _serie_el_dim = np.asarray(_sol.get("serie_elettrica",
+                                                    np.zeros(len(HOURS_2024))), dtype=float)
+                st.success(f"{tipo_solare} · **{area_sol:,} m²** · "
+                           f"**{solar_low.sum():,.0f} MWh/a** termici".replace(",", ".")
+                           + (f" e **{pvt_el_mwh:,.0f} MWh/a** elettrici".replace(",", ".")
+                              if pvt_el_mwh > 0 else ""))
+            else:
+                if _fonte_sol == "Dalla scheda Offerta" and not _coerente:
+                    st.warning("La scheda Offerta non ha una configurazione di questo "
+                               "tipo: imposta la taglia qui, oppure configurala in Offerta.")
+                _ds1, _ds2 = st.columns(2)
+                _area_in = _ds1.number_input("Superficie del campo (m²)", min_value=0,
+                                             max_value=50000, value=2000, step=100,
+                                             key="dim_area_sol")
+                _tf_in = _ds2.slider("Temperatura di esercizio (°C)", 25, 80, 45, step=5,
+                                     key="dim_tf_sol",
+                                     help="Piu' e' bassa, piu' rende il campo: a 70 °C "
+                                          "si ottiene circa la meta' del calore che si "
+                                          "avrebbe a 45 °C, a parita' di superficie.")
+                area_sol = int(_area_in)
+                if _scelta_sol == _opzioni_sol[1]:
+                    tipo_solare = "Termico"
+                    _cap_mq = st.slider("CAPEX (€/m²)", 200, 900, 450, step=20,
+                                        key="dim_capex_sol_mq")
+                    _st_ = genera_offerta_solare(pvgis, area_sol, 0.45).set_index("datetime")
+                    solar_low = _st_["MWh"].reindex(idx_h, fill_value=0).values
+                    capex_solare = area_sol * _cap_mq
+                else:
+                    tipo_solare = "Ibrido PVT (Abora aH72)"
+                    n_pvt = int(area_sol / PVT_ABORA["area_lorda_m2"])
+                    _cap_pan = st.slider("CAPEX per pannello (€)", 400, 1600, 900, step=50,
+                                         key="dim_capex_pvt_pan")
+                    _pv_ = genera_offerta_pvt(pvgis, n_pvt, float(_tf_in)).set_index("datetime")
+                    solar_low = _pv_["MWh_term"].reindex(idx_h, fill_value=0).values
+                    _serie_el_dim = _pv_["MWh_el"].reindex(HOURS_2024, fill_value=0).values
+                    pvt_el_mwh = float(_serie_el_dim.sum())
+                    capex_solare = n_pvt * _cap_pan
+                _mm1, _mm2, _mm3 = st.columns(3)
+                _mm1.metric("Calore", f"{solar_low.sum():,.0f} MWh/a".replace(",", "."))
+                _mm2.metric("Elettricità", f"{pvt_el_mwh:,.0f} MWh/a".replace(",", ".")
+                            if pvt_el_mwh > 0 else "—")
+                _mm3.metric("CAPEX", f"{capex_solare / 1000:,.0f} k€".replace(",", "."))
+                if n_pvt:
+                    st.caption(f"{n_pvt} pannelli da {PVT_ABORA['area_lorda_m2']:.2f} m², "
+                               f"peso complessivo {n_pvt * PVT_ABORA['peso_kg'] / 1000:.1f} t: "
+                               f"verificare la portata delle coperture.")
+
             if not is_hp_par:
                 st.warning("⚠️ Il calore solare alimenta l'anello basso, che senza "
                            "HP bassa T non ha utilizzatori: verrebbe scartato mentre "
                            "il CAPEX resta a bilancio.")
+
+        # ------------------------------------------------------------------
+        # AUTOPRODUZIONE ELETTRICA
+        # ------------------------------------------------------------------
+        st.divider()
+        st.markdown("**\u26A1 Autoproduzione elettrica**")
+        if pvt_el_mwh > 0:
+            st.caption(f"L'impianto ibrido produce **{pvt_el_mwh:,.0f} MWh/a** elettrici. "
+                       f"Puoi tenerne conto nel costo dell'elettricità delle pompe di "
+                       f"calore, oppure ignorarli per mantenere il dimensionamento "
+                       f"termico indipendente.".replace(",", "."))
+        else:
+            st.caption("Nessuna produzione elettrica dal solare. Attivando l'opzione si "
+                       "può comunque dimensionare un fotovoltaico dedicato nella scheda "
+                       "**Carico elettrico**.")
+        considera_el = st.checkbox(
+            "Tieni conto dell'autoproduzione nel costo dell'elettricità",
+            value=False, key="dim_considera_el",
+            help="Se attivo si apre la scheda **Carico elettrico**, dove si calcolano "
+                 "autoconsumo e scambio con la rete; il costo dell'energia usato qui "
+                 "viene ridotto di conseguenza. Lasciandolo spento il dimensionamento "
+                 "termico resta indipendente dalle scelte elettriche, che è "
+                 "l'impostazione consigliata per confrontare scenari fra loro.")
+        if considera_el:
+            st.info("⚡ Scheda **Carico elettrico** attiva: configurala per calcolare "
+                    "l'autoconsumo, poi torna qui per vedere l'effetto sul costo.")
+        st.session_state["_dim_considera_el"] = considera_el
+        st.session_state["_dim_serie_el_solare"] = _serie_el_dim
 
         (q_hot_arr, q_int_arr, q_low_arr, q_low_bins, bin_T,
          q_int_bins, bin_T_int) = routing_flussi(off_all, idx_h, T_mandata_ideale, T_int)
@@ -5001,8 +5108,6 @@ with tab_dimensionamento:
         if solare_on:
             q_low_bins_eff[:, -1] = q_low_bins_eff[:, -1] + solar_low
 
-    # ---------------------------------------------------------------- PASSO 3
-    # ---------------------------------------------------------------- PASSO 3
     # ---------------------------------------------------------------- PASSO 3
     with step3:
         st.markdown("#### Taglie delle macchine e volumi di accumulo")
@@ -5758,12 +5863,48 @@ with tab_dimensionamento:
 with tab_elettrico:
     st.markdown("### \u26A1 Copertura del carico elettrico")
     _snap_el = st.session_state.get("_dim_snapshot")
+    _attiva_el = bool(st.session_state.get("_dim_considera_el", False))
     if not _snap_el:
         st.info("Configura prima un assetto nella scheda **Dimensionamento**: "
                 "da lì arrivano i consumi elettrici delle pompe di calore.")
+    elif not _attiva_el:
+        st.warning(
+            "Questa scheda è disattivata. Per usarla vai nel **Dimensionamento**, "
+            "passo *2 · Tecnologie*, e spunta **«Tieni conto dell'autoproduzione "
+            "nel costo dell'elettricità»**.")
+        st.caption(
+            "La separazione è voluta: finché la spunta è spenta il dimensionamento "
+            "termico non dipende dalle scelte elettriche, e gli scenari restano "
+            "confrontabili fra loro sulla sola parte di calore. Attivandola, il "
+            "costo dell'energia usato nel calcolo del LCOH viene ridotto in base "
+            "all'autoconsumo calcolato qui.")
+        with st.expander("Cosa si può fare in questa scheda"):
+            st.markdown("""
+- **Bilancio orario** fra i consumi delle pompe di calore e la produzione propria,
+  con l'ordine di merito: prima l'autoconsumo istantaneo, poi la batteria, infine
+  lo scambio con la rete.
+- **Dimensionamento del fotovoltaico** per raggiungere una copertura obiettivo dei
+  consumi, tenendo conto dello sfasamento fra produzione e fabbisogno.
+- **Accumulo elettrochimico** con rendimento di ciclo e limite di potenza.
+- **Valorizzazione ai prezzi zonali orari**, che distingue l'energia autoconsumata
+  (evita l'acquisto a prezzo pieno, oneri inclusi) da quella immessa in rete
+  (remunerata al solo prezzo zonale).
+
+Se nel dimensionamento hai scelto un impianto **ibrido**, l'elettricità che produce
+viene ripresa qui in automatico.
+""")
     else:
         _sol_el = st.session_state.get("_off_solare", {}) or {}
         _serie_el = st.session_state.get("_dim_serie_elettriche", {}) or {}
+        # se il solare e' stato impostato direttamente nel dimensionamento,
+        # la sua produzione elettrica ha la precedenza su quella di Offerta
+        _el_dim = np.asarray(st.session_state.get("_dim_serie_el_solare",
+                                                  np.zeros(len(HOURS_2024))), dtype=float)
+        if _el_dim.size == len(HOURS_2024) and _el_dim.sum() > 0:
+            _sol_el = dict(_sol_el)
+            _sol_el["serie_elettrica"] = _el_dim
+            _sol_el["elettrico_mwh"] = float(_el_dim.sum())
+            _sol_el.setdefault("tipo", "Ibrido PVT")
 
         _cons_h = np.asarray(_serie_el.get("consumo_hp", []), dtype=float)
         if _cons_h.size == 0:
