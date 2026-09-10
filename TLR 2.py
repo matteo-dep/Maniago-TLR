@@ -28,6 +28,12 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P19 Scomposizione energetica per origine (calore di scarto, solare, loop
+     geotermico, HP alta temperatura, fonte di backup) con quote che sommano
+     esattamente alla domanda; costo della rete differenziato per diametro,
+     con lo scavo separato dalla fornitura; sottostazioni d'utenza in analisi
+     economica; diagnostica del contributo, del prezzo o del calore aggiuntivo
+     necessari quando il progetto non rientra.
  P18 Catalogo di moduli ibridi PVT selezionabile (Abora aH72 vetrato e isolato,
      Fototherm FT320AS e FT265CS non isolati), con i parametri certificati
      EN ISO 9806 delle rispettive schede tecniche e i limiti di temperatura
@@ -173,7 +179,7 @@ COLOR_OFFERTA = "#3FA34D"
 COLOR_ACCUMULO = "#8E5FC2"
 COLOR_HP = "#22C3DD"
 COLOR_CALDAIA = "#B0413E"
-COLOR_EX_BIOMAN = "#E63946"
+COLOR_MANIAGO_SUD = "#E63946"
 COLOR_ALTA_T = "#FF4B4B"
 COLOR_HP_ALTA = COLOR_HP
 COLOR_HP_BASSA = "#B57EDC"
@@ -185,15 +191,15 @@ COLOR_GROUND = "#8C6D46"
 
 ZONE_NOMI = {
     1: "Zona 1 - Comune NE",
-    2: "Zona 2 - Ex Bioman",
+    2: "Zona 2 - Maniago Sud",
     3: "Zona 3 - Sud",
     4: "Zona 4 - Centro",
     5: "Zona 5 - Ovest",
 }
-ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Ex Bioman"]
+ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Maniago Sud"]
 ZONA_COLORI = {
     "Zona 1 - Comune NE": "#2D7DC0",
-    "Zona 2 - Ex Bioman": "#E63946",
+    "Zona 2 - Maniago Sud": "#E63946",
     "Zona 3 - Sud": "#E9C46A",
     "Zona 4 - Centro": "#9B5DE5",
     "Zona 5 - Ovest": "#3FA34D",
@@ -1336,6 +1342,33 @@ def dimensiona_sorgente_bassa_t(potenza_kw, tipo="sonde verticali", resa=None,
             "superficie_m2": sup, "costo": q * cu, "costo_unitario": cu, "resa": r}
 
 
+def costo_condotta_eur_m(dn, costo_scavo=150.0, fattore=1.0):
+    """Costo al metro di condotta preisolata posata, per diametro nominale.
+
+    La relazione col diametro non e' proporzionale: una quota rilevante del
+    costo e' scavo, letto di posa, rinterro e ripristino, che dipendono poco
+    dal tubo. Sui piccoli diametri lo scavo arriva a pesare oltre l'80 %,
+    quindi un ramo DN40 non costa un quarto di una dorsale DN150 ma circa la
+    meta'. Usare un costo unico per tutta la rete sovrastima quindi i rami
+    secondari e sottostima le dorsali.
+
+    Args:
+        dn: diametro nominale
+        costo_scavo: quota indipendente dal diametro (EUR/m)
+        fattore: moltiplicatore sulla sola quota di fornitura, per adeguare
+            i prezzi al contesto o al momento di mercato
+
+    Riferimento: prezzari regionali per reti di teleriscaldamento preisolate
+    in area urbana, da verificare con offerte reali in fase di progetto.
+    """
+    # quota di sola fornitura e montaggio della tubazione preisolata
+    _dn_rif = [20, 25, 32, 40, 50, 65, 80, 100, 125, 150, 200, 250, 300, 400, 500]
+    _forn = [25, 30, 50, 75, 105, 150, 195, 260, 340, 430, 610, 800, 1000, 1450, 1950]
+    d = float(dn) if dn else 20.0
+    forn = float(np.interp(d, _dn_rif, _forn))
+    return float(costo_scavo) + forn * float(fattore)
+
+
 def potenza_da_energia(mwh_anno, ore_equivalenti=1900.0, f_contemporaneita=1.0):
     """Potenza di picco stimata (kW) da energia annua (MWh).
 
@@ -1515,7 +1548,8 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                      P_hp_alta_kw, P_hp_bassa_kw,
                      parallelo="HP bassa T", P_backup_kw=0.0, backup_cop=None,
                      antigelo=0.0, perdita_sett_pct=1.0,
-                     q_int_bins=None, bin_T_int=None, stratificato=True):
+                     q_int_bins=None, bin_T_int=None, stratificato=True,
+                     solare_low=None):
     """Dispatch orario dello schema a cascata con 3 accumuli stratificati.
 
     MERIT ORDER (P7) - ordine di merito rigido, indipendente dai prezzi:
@@ -1598,6 +1632,16 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
         cop_strato = None
 
     soc_int_bins = np.zeros(n_bin_int) if strat else None
+
+    # Quota solare dell'anello basso. Il calore solare entra nello stesso
+    # accumulo dello scarto a bassa temperatura e diventa indistinguibile:
+    # per attribuirne la parte utilizzata si tiene la proporzione fra le due
+    # sorgenti ora per ora, che e' l'unica attribuzione corretta.
+    sol_low = (np.asarray(solare_low, dtype=float)
+               if solare_low is not None else np.zeros(n))
+    if len(sol_low) != n:
+        sol_low = np.zeros(n)
+    q_da_solare = np.zeros(n)
 
     cop_a = float(cop_singola(T_int - dT_evap, mandata, eta_hp))
     hp_alta_attiva = (P_alta > 0) and (cop_a > 1.0)
@@ -1742,6 +1786,14 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
                         if need <= 1e-12:
                             break
                     q_ground[i] = need if need > 0.0 else 0.0
+                    # attribuzione della quota solare: il prelievo effettivo
+                    # dall'anello basso e' E_b meno cio' che e' arrivato dal
+                    # terreno, e si ripartisce in proporzione agli ingressi
+                    _pres_low = max(E_b - q_ground[i], 0.0)
+                    if _pres_low > 1e-12:
+                        _in_low = float(q_low_bins[i].sum()) + sol_low[i]
+                        if _in_low > 1e-12:
+                            q_da_solare[i] = _pres_low * sol_low[i] / _in_low
                     if src_is_ground or q_ground[i] > 1e-9:
                         ore_ground += 1
                     q_bassa[i] = q_b
@@ -1822,6 +1874,7 @@ def dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
     return {
         "q_hot_direct": q_hot_direct, "q_alta": q_alta, "q_bassa": q_bassa, "q_backup": q_backup,
         "q_ground": q_ground, "E_ground": float(q_ground.sum()),
+        "q_da_solare": q_da_solare, "E_da_solare": float(q_da_solare.sum()),
         "el_alta": el_alta, "el_bassa": el_bassa, "non_cop": non_cop,
         "cop_alta_s": cop_alta_s, "cop_bassa_s": cop_bassa_s,
         "E_hot_diretto": E_hot, "E_hp_alta": E_alta, "E_hp_bassa": E_bassa, "E_backup": E_bk,
@@ -2184,8 +2237,12 @@ def load_data():
         if _esclusi.any():
             buildings = buildings[~_esclusi].copy()
     else:
+        # compatibilita' con i vecchi nomi usati nei CSV, compreso "Ex Bioman"
+        # che nel frattempo e' diventato "Maniago Sud"
         buildings["cluster"] = buildings["cluster"].replace({
-            "NE-Centro": "Zona 1 - Comune NE", "Ex Bioman": "Zona 2 - Ex Bioman",
+            "NE-Centro": "Zona 1 - Comune NE",
+            "Ex Bioman": "Zona 2 - Maniago Sud",
+            "Maniago Sud": "Zona 2 - Maniago Sud",
             "Campagna": "Zona 3 - Sud", "Ovest": "Zona 5 - Ovest"})
     domanda = domanda[domanda["edificio"].isin(buildings["edificio"])].copy()
     domanda = domanda.drop(columns=["cluster"], errors="ignore").merge(
@@ -3456,7 +3513,12 @@ with tab_domanda:
         else:
             tc1, tc2, tc3, tc4 = st.columns(4)
             tort = tc1.slider("Fattore di tortuosità", 1.0, 2.0, 1.35, step=0.05, key="dom_tort")
-            costo_m_tr = tc2.slider("Costo rete (\u20ac/m)", 200, 1500, 600, step=50, key="dom_costo_tr")
+            costo_m_tr = tc2.slider("Costo dello scavo (€/m)", 60, 500, 150, step=10,
+                                    key="dom_costo_tr",
+                                    help="Scavo, letto di posa, rinterro e ripristino: "
+                                         "dipendono poco dal diametro. Alla dorsale e "
+                                         "ai rami viene poi sommato il costo della "
+                                         "tubazione, che invece cresce col diametro.")
             buffer_m = tc3.slider("Lunghezza max allaccio privati (m)", 20, 200, 50, step=5,
                                   key="dom_buffer",
                                   help="Metri di tubo che si e disposti a posare per allacciare "
@@ -3931,19 +3993,58 @@ with tab_domanda:
             _n_utenze_tot = (len(_bmap_srv_e) + _n_cond_serviti
                              + (len(_priv_in) if not _priv_in.empty else 0))
 
+            # ---- CAPEX della rete, differenziato per diametro ----
+            # La dorsale porta l'intera potenza, i rami di allaccio solo quella
+            # delle utenze che servono: applicare a tutta la rete il costo della
+            # dorsale sovrastimerebbe sensibilmente gli allacci.
+            _dT_r = max(T_mandata_ideale - T_ritorno_ideale, 1)
+            _f_sim_r = coeff_simultaneita_QM(max(_n_utenze_tot, 1))
+            _P_dors = potenza_da_energia(_E_tot, 1900.0, _f_sim_r)
+            _dn_d0, _, _, _ = dimensiona_dn(_P_dors, _dT_r, 1.5)
+            _c_dors = costo_condotta_eur_m(_dn_d0, costo_m_tr)
+            # ramo tipo: potenza di una singola utenza, con la sua contemporaneita'
+            _P_ramo = potenza_da_energia(_E_tot / max(_n_utenze_tot, 1), 1900.0, 1.0)
+            _dn_r0, _, _, _ = dimensiona_dn(_P_ramo, _dT_r, 1.0)
+            _c_ramo = costo_condotta_eur_m(_dn_r0, costo_m_tr)
+            _capex_rete_tot = _len_pub_t * _c_dors + _len_stub_t * _c_ramo
+
             t1, t2, t3, t4 = st.columns(4)
             t1.metric("Lunghezza totale rete", f"{_len_totale / 1000:.2f} km",
-                      help=f"Obbligato {_len_pub_t / 1000:.2f} km + stub {_len_stub_t / 1000:.2f} km "
-                           f"(tortuosità {tort})")
+                      help=f"Dorsale {_len_pub_t / 1000:.2f} km + allacci "
+                           f"{_len_stub_t / 1000:.2f} km (tortuosità {tort})")
             t2.metric("Utenze totali servite",
                       f"{_n_utenze_tot}",
                       help=f"pubblici + condomini + {len(_priv_in) if not _priv_in.empty else 0} privati nel buffer"
                            f" (edifici sopra soglia densità)")
-            t3.metric("CAPEX rete", f"{_len_totale * costo_m_tr / 1e6:.2f} M\u20ac")
+            t3.metric("CAPEX rete", f"{_capex_rete_tot / 1e6:.2f} M€",
+                      help=f"dorsale DN{_dn_d0} a {_c_dors:.0f} €/m · "
+                           f"allacci DN{_dn_r0} a {_c_ramo:.0f} €/m")
             _dens = _E_tot / _len_totale if _len_totale > 0 else 0.0
             t4.metric("Densità lineare", f"{_dens:.2f} MWh/(m·a)",
                       help=f"soglia potatura: {soglia_dens:.1f} · sotto ~1,2 la rete fatica a ripagarsi; "
                            f"sopra ~2,0 e buona (QM)")
+
+            with st.expander("💰 Come si compone il costo della rete"):
+                _rc = pd.DataFrame([
+                    {"Tratto": "Dorsale", "Lunghezza (m)": round(_len_pub_t),
+                     "DN": _dn_d0, "€/m": round(_c_dors),
+                     "di cui scavo": round(costo_m_tr),
+                     "Costo (k€)": round(_len_pub_t * _c_dors / 1000)},
+                    {"Tratto": "Allacci d'utenza", "Lunghezza (m)": round(_len_stub_t),
+                     "DN": _dn_r0, "€/m": round(_c_ramo),
+                     "di cui scavo": round(costo_m_tr),
+                     "Costo (k€)": round(_len_stub_t * _c_ramo / 1000)},
+                ])
+                st.dataframe(_rc, width="stretch", hide_index=True)
+                _c_medio = _capex_rete_tot / max(_len_totale, 1)
+                st.caption(
+                    f"Costo medio della rete **{_c_medio:.0f} €/m**. Il diametro degli "
+                    f"allacci è calcolato sulla potenza di una singola utenza, quello "
+                    f"della dorsale sulla potenza complessiva con la contemporaneità QM "
+                    f"({_f_sim_r:.2f}). Sui piccoli diametri lo scavo pesa per la maggior "
+                    f"parte del costo, quindi un allaccio DN{_dn_r0} non costa una "
+                    f"frazione della dorsale ma circa "
+                    f"{_c_ramo / max(_c_dors, 1) * 100:.0f} %.")
 
             # --- breakdown ---
             b1, b2, b3 = st.columns(3)
@@ -4046,7 +4147,10 @@ with tab_domanda:
                 "lunghezza_m": float(_len_totale),
                 "lunghezza_pubblico_m": float(_len_pub_t),
                 "lunghezza_stub_m": float(_len_stub_t),
-                "capex_rete": float(_len_totale * costo_m_tr),
+                "capex_rete": float(_capex_rete_tot),
+                "dn_allaccio": int(_dn_r0),
+                "costo_m_dorsale": float(_c_dors),
+                "costo_m_allaccio": float(_c_ramo),
                 "densita": float(_dens),
                 "n_utenze": int(_n_utenze_tot),
                 "n_privati_agganciati": int(_n_priv_dentro),
@@ -4224,13 +4328,14 @@ taglia verrebbe sottostimata.
                      "potenza ottenibile. Si può partire dal tetto che si ha e vedere "
                      "che potenza se ne ricava, oppure dalla potenza che serve e "
                      "vedere quanto tetto occupa.")
-            _tipo_sol = st.radio("Tecnologia",
-                                 ["Termico", "Ibrido PVT (Abora aH72)", "Fotovoltaico"],
-                                 key="off_tipo_sol")
-            _T_fluido = 35
-            if _tipo_sol != "Fotovoltaico":
-                _T_fluido = st.slider("Temperatura di esercizio (°C)", 25, 80, 45, step=5,
-                                      key="off_t_fluido",
+            _tipo_sol = st.radio("Tecnologia", ["Termico", "Ibrido PVT"],
+                                 key="off_tipo_sol",
+                                 help="Il fotovoltaico puro non compare qui: non produce "
+                                      "calore e quindi non entra nel bilancio termico. "
+                                      "Si dimensiona nella scheda **Carico elettrico**, "
+                                      "sui consumi delle pompe di calore.")
+            _T_fluido = st.slider("Temperatura di esercizio (°C)", 25, 100, 45, step=5,
+                                  key="off_t_fluido",
                                       help="Livello termico a cui il campo cede calore. "
                                            "Più è basso, più rende il collettore, ma più "
                                            "lavoro resta alle pompe di calore. L'ottimo "
@@ -4241,12 +4346,12 @@ taglia verrebbe sottostimata.
             if _tipo_sol == "Termico":
                 _eta_rif = max(0.78 - 3.5 * (_T_fluido - 20.0) / 800.0, 0.0)
                 _p_spec = _eta_rif * 800.0
-            elif _tipo_sol.startswith("Ibrido"):
-                _th_r, _el_r = resa_pvt_oraria(np.array([800.0]), np.array([20.0]),
-                                               np.array([float(_T_fluido)]))
-                _p_spec = float(_th_r[0]) * 1000.0
             else:
-                _p_spec = 0.0
+                _mod_p = CATALOGO_PVT.get(st.session_state.get("off_modello_pvt",
+                                                               list(CATALOGO_PVT)[0]))
+                _th_r, _el_r = resa_pvt_oraria(np.array([800.0]), np.array([20.0]),
+                                               np.array([float(_T_fluido)]), pvt=_mod_p)
+                _p_spec = float(_th_r[0]) * 1000.0
 
             if _vincolo == "Superficie disponibile":
                 _sup_disp = st.number_input("Superficie disponibile (m²)", min_value=0,
@@ -4461,17 +4566,11 @@ taglia verrebbe sottostimata.
             _capex_ad = _sup_disp * 450
             _el_ad = 0.0
             _n_ad = 0
-        elif _tipo_sol.startswith("Ibrido"):
+        else:
             _serie_ad = _serie_pvt["MWh_term"].reindex(HOURS_2024, fill_value=0).values
             _serie_el_ad = _serie_pvt["MWh_el"].reindex(HOURS_2024, fill_value=0).values
-            _capex_ad = _n_pan * 900
+            _capex_ad = _n_pan * _cap_pvt_u
             _el_ad = _e_pvt_el
-            _n_ad = _n_pan
-        else:
-            _serie_ad = np.zeros(len(HOURS_2024))
-            _serie_el_ad = _serie_pv["MWh_el"].reindex(HOURS_2024, fill_value=0).values * 0.97
-            _capex_ad = _sup_disp * 180
-            _el_ad = _e_pv_el
             _n_ad = _n_pan
 
         _sol_state = {"attivo": True, "tipo": _tipo_sol, "area_m2": int(_sup_disp),
@@ -4489,8 +4588,7 @@ taglia verrebbe sottostimata.
         _m4.metric("Superficie", f"{_sup_disp:,} m²".replace(",", "."))
 
         # --- a quale anello conviene collegare il solare termico ---
-        if _tipo_sol != "Fotovoltaico":
-            with st.expander("🔍 A quale anello conviene collegare il campo solare?"):
+        with st.expander("🔍 A quale anello conviene collegare il campo solare?"):
                 st.caption("Alimentare un anello più freddo aumenta il rendimento del "
                            "collettore, ma richiede alle pompe di calore un salto maggiore, "
                            "quindi più elettricità. L'ottimo è un compromesso e dipende dai "
@@ -5304,9 +5402,12 @@ with tab_dimensionamento:
                     stratificato=strat_on, picco_kw_override=picco_kw,
                     v_max_m3=float(v_max_acc))
             if best:
-                st.session_state["dim_p_alta"] = int(round(best["P_alta"] / 100) * 100)
-                st.session_state["dim_p_bassa"] = int(round(best["P_bassa"] / 100) * 100)
-                st.session_state["dim_p_bk"] = int(round(best["P_bk"] / 100) * 100)
+                # arrotondamento per ECCESSO: al centinaio piu' vicino la taglia
+                # poteva restare qualche kW sotto il picco, lasciando scoperta
+                # l'ora di punta e facendo comparire un allarme fuorviante
+                st.session_state["dim_p_alta"] = int(np.ceil(best["P_alta"] / 100) * 100)
+                st.session_state["dim_p_bassa"] = int(np.ceil(best["P_bassa"] / 100) * 100)
+                st.session_state["dim_p_bk"] = int(np.ceil(best["P_bk"] / 100) * 100)
                 st.session_state["dim_v_hot"] = int(round(best["v_hot"] / 50) * 50)
                 st.session_state["dim_v_int"] = int(round(best["v_int"] / 50) * 50)
                 st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
@@ -5383,7 +5484,8 @@ with tab_dimensionamento:
                            parallelo=backup_tipo, P_backup_kw=P_bk, backup_cop=backup_cop,
                            antigelo=float(antigelo), perdita_sett_pct=perd,
                            q_int_bins=q_int_bins, bin_T_int=bin_T_int,
-                           stratificato=strat_on)
+                           stratificato=strat_on,
+                           solare_low=(solar_low if solare_on else None))
     # serie orarie che alimentano la scheda del carico elettrico: si tengono
     # separate dal dimensionamento termico, che non deve dipenderne
     st.session_state["_dim_serie_elettriche"] = {
@@ -5521,28 +5623,59 @@ with tab_dimensionamento:
         cA4.metric("\U0001F535 → basso", f"{q_low_arr.sum():,.0f} MWh".replace(",", "."),
                    help=f"< {T_int}°C, utilizzabile solo con HP bassa T")
 
+        # ------------------------------------------------------------------
+        # SCOMPOSIZIONE DELL'ENERGIA PER ORIGINE
+        # Le voci sono le sorgenti primarie da cui il calore entra nel sistema,
+        # non i componenti che lo erogano: cosi' le quote sommano esattamente
+        # alla domanda e nessun contributo viene contato due volte.
+        # La pompa a bassa temperatura non compare come voce a se': cio' che
+        # preleva dal terreno sta in "loop geotermico", l'elettricita' che
+        # assorbe sta nella voce del supporto.
+        # ------------------------------------------------------------------
+        _q_sol = sim.get("q_da_solare", np.zeros(len(dom_arr)))
+        # calore di scarto valorizzato: quello usato direttamente piu' quello
+        # risollevato, al netto di elettricita', terreno e solare
+        _scarto_h = np.maximum(
+            sim["q_hot_direct"] + sim["q_alta"]
+            - sim["el_alta"] - sim["el_bassa"] - ground - _q_sol, 0.0)
+        _el_hp_alta = sim["el_alta"]
+        _el_backup = sim["el_bassa"]
+
+        _bande = [
+            ("Calore di scarto", _scarto_h, COLOR_ALTA_T),
+            ("Calore solare", _q_sol, COLOR_SOLARE),
+            ("Loop geotermico", ground, COLOR_GROUND),
+            ("HP alta temperatura", _el_hp_alta, COLOR_HP),
+            (f"Fonte di backup ({backup_tipo})",
+             _el_backup + sim["q_backup"], COLOR_BACKUP),
+        ]
+
         st.markdown("##### \U0001F4C9 Curva di durata: da dove arriva l'energia")
         order = np.argsort(dom_arr)[::-1]
         x = np.arange(1, len(dom_arr) + 1)
         fig_dur = go.Figure()
-        bande = [("Scarto diretto", sim["q_hot_direct"], COLOR_ALTA_T),
-                 ("Scarto risollevato dalle HP", scarto_via_hp, COLOR_OFFERTA),
-                 ("Suolo / ground loop", ground, COLOR_GROUND),
-                 ("Elettricità HP alta", sim["el_alta"], COLOR_HP),
-                 ("Elettricità HP bassa", sim["el_bassa"], COLOR_HP_BASSA),
-                 (f"Supporto ({backup_tipo})", sim["q_backup"], COLOR_BACKUP)]
-        for nome, arr, col in bande:
-            if float(arr.sum()) < 1:
+        for nome, arr, col in _bande:
+            if float(np.asarray(arr).sum()) < 1:
                 continue
-            fig_dur.add_trace(go.Scatter(x=x, y=arr[order], mode="lines", name=nome,
-                                         stackgroup="c", line=dict(width=0),
+            fig_dur.add_trace(go.Scatter(x=x, y=np.asarray(arr)[order], mode="lines",
+                                         name=nome, stackgroup="c", line=dict(width=0),
                                          fillcolor=hex_to_rgba(col, 0.9)))
+        if E_nc > 1:
+            fig_dur.add_trace(go.Scatter(x=x, y=sim["non_cop"][order], mode="lines",
+                                         name="Non coperto", stackgroup="c",
+                                         line=dict(width=0),
+                                         fillcolor=hex_to_rgba(COLOR_NONCOP, 0.9)))
         fig_dur.add_trace(go.Scatter(x=x, y=dom_arr[order], mode="lines", name="Domanda",
                                      line=dict(color=COLOR_DOMANDA, width=2.4)))
         fig_dur.update_layout(height=440, xaxis_title="Ore/anno", yaxis_title="MW",
                               legend=dict(orientation="h", yanchor="bottom", y=1.02),
                               margin=dict(t=30, b=10))
         st.plotly_chart(fig_dur, width="stretch")
+        st.caption("Le voci sono le sorgenti da cui il calore entra nel sistema: "
+                   "**HP alta temperatura** è l'energia elettrica che la pompa aggiunge "
+                   "al calore che risolleva, non il totale che consegna. Sommate danno "
+                   "esattamente la domanda alla centrale.")
+
 
         st.markdown("##### \U0001F5FA\ufe0f Heatmap: energia di scarto per mese e temperatura")
         _h = off_all[off_all["MWh"] > 0].copy()
@@ -5583,11 +5716,20 @@ with tab_dimensionamento:
         for i, (lab, val, hlp) in enumerate(mets):
             cols_r[i].metric(lab, f"{val:,.0f} MWh".replace(",", "."), help=hlp)
         cols_r[-1].metric("Quota FER", f"{quota_fer:.0f}%")
-        if sim["ore_non_coperte"] > 0:
-            st.error(f"\u26a0\ufe0f {sim['ore_non_coperte']} ore non coperte "
-                     f"({E_nc:,.0f} MWh): ottimizza o aumenta le taglie.".replace(",", "."))
+        _quota_nc = E_nc / dom_tot * 100 if dom_tot > 0 else 0.0
+        if sim["ore_non_coperte"] == 0:
+            st.success("✅ Copertura 100 % in tutte le ore.")
+        elif _quota_nc < 0.01:
+            st.info(f"✅ Copertura sostanzialmente completa: restano scoperte "
+                    f"{sim['ore_non_coperte']} ore per un totale di "
+                    f"**{E_nc * 1000:.0f} kWh**, meno di un centesimo di punto "
+                    f"della domanda annua. È un residuo di arrotondamento delle "
+                    f"taglie, non un deficit di dimensionamento.")
         else:
-            st.success("\u2705 Copertura 100 % in tutte le ore.")
+            st.error(f"⚠️ {sim['ore_non_coperte']} ore non coperte per "
+                     f"{E_nc:,.0f} MWh ({_quota_nc:.2f} % della domanda): "
+                     f"rilancia il dimensionamento o aumenta le taglie."
+                     .replace(",", "."))
 
         # ---- schema di massima dell'impianto dimensionato ----
         if considera_el and quota_autocons > 0:
@@ -5755,12 +5897,13 @@ with tab_dimensionamento:
 
         st.markdown("**Da dove arriva l'energia** (fonti, sull'anno)")
         fig_mix = go.Figure()
-        voci = [("Scarto diretto", E_hot, COLOR_ALTA_T),
-                ("Scarto risollevato dalle HP", E_scarto_via_hp, COLOR_OFFERTA),
-                ("Suolo / ground loop", E_ground, COLOR_GROUND),
-                ("Elettricità HP alta", float(sim["el_alta"].sum()), COLOR_HP),
-                ("Elettricità HP bassa", float(sim["el_bassa"].sum()), COLOR_HP_BASSA),
-                (f"Supporto ({backup_tipo})", E_bk, COLOR_BACKUP)]
+        # stessa scomposizione per origine usata nella curva di durata
+        voci = [("Calore di scarto", float(_scarto_h.sum()), COLOR_ALTA_T),
+                ("Calore solare", float(np.asarray(_q_sol).sum()), COLOR_SOLARE),
+                ("Loop geotermico", E_ground, COLOR_GROUND),
+                ("HP alta temperatura", float(sim["el_alta"].sum()), COLOR_HP),
+                (f"Fonte di backup ({backup_tipo})",
+                 float(sim["el_bassa"].sum()) + E_bk, COLOR_BACKUP)]
         if E_nc > 1:
             voci.append(("Non coperto", E_nc, COLOR_NONCOP))
         voci = [(n, v, c) for n, v, c in voci if v > 1]
@@ -5777,6 +5920,11 @@ with tab_dimensionamento:
                               margin=dict(t=30, b=10))
         fig_mix.update_yaxes(showticklabels=False)
         st.plotly_chart(fig_mix, width="stretch")
+        st.caption("**Calore di scarto** è quello industriale effettivamente valorizzato, "
+                   "al netto dell'energia spesa per risollevarlo. **HP alta temperatura** "
+                   "è l'elettricità che la pompa aggiunge. **Fonte di backup** comprende "
+                   "l'elettricità della pompa a bassa temperatura oppure il combustibile, "
+                   "secondo l'assetto scelto.")
 
         st.markdown("**Bilancio energetico dello scenario**")
         _spf = (E_hot + E_alta) / E_el if E_el > 1e-6 else 0.0
@@ -6659,7 +6807,63 @@ with tab_economia:
                            "€/MWh si somma al prezzo pagato all'azienda: se supera il costo "
                            "delle alternative, quell'allacciamento non conviene.")
 
-        capex_tot = capex_centrale + capex_rete + capex_allacci
+        # ------------------------------------------------------------------
+        # SOTTOSTAZIONI D'UTENZA
+        # Ogni edificio allacciato richiede uno scambiatore, il contatore di
+        # calore, la regolazione e le opere murarie nel locale tecnico. E' una
+        # voce che nelle reti reali pesa quanto un tratto di dorsale, e va
+        # tenuta distinta dal costo della condotta.
+        # ------------------------------------------------------------------
+        _ri = st.session_state.get("_rete_info", {}) or {}
+        _n_pub_ut = int(_ri.get("n_utenze", 0)) - int(_ri.get("n_privati_agganciati", 0))
+        _n_priv_ut = int(_ri.get("n_privati_agganciati", 0))
+        _e_pub_ut = float(_ri.get("E_pubblico", 0.0)) + float(_ri.get("E_condomini", 0.0))
+        _e_priv_ut = float(_ri.get("E_privati", 0.0))
+
+        with st.expander(f"🏠 Sottostazioni d'utenza "
+                         f"({_n_pub_ut} fra pubblici e condomini, {_n_priv_ut} privati)"):
+            st.caption("Scambiatore, contatore di calore, valvole, regolazione e opere "
+                       "nel locale tecnico dell'utente. Il costo dipende soprattutto "
+                       "dalla taglia: una scuola richiede una sottostazione molto più "
+                       "grande di una villetta.")
+            _u1, _u2, _u3 = st.columns(3)
+            _cost_ut_grande = _u1.slider("Sottostazione grande (€ cad.)", 3000, 40000,
+                                         12000, step=500, key="eco_sub_grande",
+                                         help="Edifici pubblici e condomini: taglie "
+                                              "da qualche decina a qualche centinaio di kW.")
+            _cost_ut_piccola = _u2.slider("Sottostazione piccola (€ cad.)", 1500, 15000,
+                                          4500, step=250, key="eco_sub_piccola",
+                                          help="Utenze private singole, tipicamente "
+                                               "sotto i 30 kW.")
+            _quota_utente = _u3.slider("Quota a carico dell'utente (%)", 0, 100, 0,
+                                       step=5, key="eco_quota_utente",
+                                       help="Parte del costo di sottostazione pagata "
+                                            "dall'utente all'atto dell'allacciamento. "
+                                            "Riduce l'investimento del gestore ma è "
+                                            "già compresa nel contributo di "
+                                            "allacciamento impostato sopra: attenzione "
+                                            "a non contarla due volte.")
+            capex_sottostazioni = (_n_pub_ut * _cost_ut_grande
+                                   + _n_priv_ut * _cost_ut_piccola)
+            capex_sottostazioni *= (1.0 - _quota_utente / 100.0)
+            _v1, _v2, _v3 = st.columns(3)
+            _v1.metric("Pubblici e condomini",
+                       f"{_n_pub_ut * _cost_ut_grande / 1000:,.0f} k€".replace(",", "."),
+                       help=f"{_n_pub_ut} sottostazioni")
+            _v2.metric("Privati",
+                       f"{_n_priv_ut * _cost_ut_piccola / 1000:,.0f} k€".replace(",", "."),
+                       help=f"{_n_priv_ut} sottostazioni")
+            _v3.metric("A carico del gestore",
+                       f"{capex_sottostazioni / 1e6:.2f} M€")
+            if _e_pub_ut + _e_priv_ut > 0:
+                _inc_sub = capex_sottostazioni * _crf_pre / (_e_pub_ut + _e_priv_ut)
+                st.caption(f"Incidenza sul calore venduto: **{_inc_sub:.1f} €/MWh**. "
+                           f"Se le sottostazioni pesano molto, conviene concentrare la "
+                           f"rete sulle utenze grandi: una sottostazione costa quasi "
+                           f"uguale a prescindere dai MWh che serve.")
+
+        capex_tot = (capex_centrale + capex_rete + capex_allacci
+                     + capex_sottostazioni)
         contributo = capex_tot * contributo_pct / 100.0
         capex_netto = capex_tot - contributo
 
@@ -6716,8 +6920,9 @@ with tab_economia:
 
         n1, n2, n3, n4 = st.columns(4)
         n1.metric("CAPEX totale", f"{capex_tot / 1e6:.2f} M\u20ac",
-                  help=f"centrale {capex_centrale / 1e6:.2f} M€ + rete {capex_rete / 1e6:.2f} M€ "
-                       f"+ allacciamenti aziende {capex_allacci / 1e6:.2f} M€")
+                  help=f"centrale {capex_centrale / 1e6:.2f} + rete {capex_rete / 1e6:.2f} "
+                       f"+ allacci aziende {capex_allacci / 1e6:.2f} "
+                       f"+ sottostazioni {capex_sottostazioni / 1e6:.2f} M€")
         n2.metric("Contributo pubblico", f"{contributo / 1e6:.2f} M\u20ac",
                   help=f"{contributo_pct}% del CAPEX")
         n3.metric("Investimento netto", f"{capex_netto / 1e6:.2f} M\u20ac")
@@ -6726,6 +6931,118 @@ with tab_economia:
                        "Il 'LCOH di sistema' della scheda Dimensionamento e piu ristretto "
                        "(sola centrale, riferito al calore prodotto): non sono confrontabili "
                        "direttamente.")
+
+        # ------------------------------------------------------------------
+        # QUANTO SERVIREBBE PERCHE' IL PROGETTO STIA IN PIEDI
+        # Quando il tempo di ritorno supera l'orizzonte, dire soltanto "non
+        # rientra" non aiuta: serve sapere di quanto manca e su quale leva
+        # agire. Qui si calcolano tre soglie alternative, ciascuna agendo su
+        # una sola variabile per volta.
+        # ------------------------------------------------------------------
+        if _pb is None or _van < 0:
+            st.divider()
+            st.markdown("#### \U0001F9ED Cosa servirebbe perché il progetto stia in piedi")
+            _margine_unit = margine_0 / E_venduto if E_venduto > 0 else 0.0
+            _costi_tot_0 = (opex_energia_0 + costo_pompaggio_0 + costo_scarto_0
+                            + om_0 + costi_fissi_0)
+            _crf_x = crf(wacc, orizzonte)
+
+            if margine_0 <= 0:
+                st.error(
+                    f"**Il margine di gestione è negativo** "
+                    f"({margine_0 / 1000:,.0f} k€/a): i ricavi non coprono nemmeno i "
+                    f"costi di esercizio. Nessun contributo in conto capitale può "
+                    f"risolverlo, perché il problema non è l'investimento iniziale ma "
+                    f"la gestione corrente. Occorre alzare il prezzo di vendita, "
+                    f"ridurre i costi operativi o aumentare il calore venduto."
+                    .replace(",", "."))
+            else:
+                _c1, _c2, _c3 = st.columns(3)
+
+                def _van_con_contributo(q_pct):
+                    _cn = capex_tot * (1.0 - q_pct / 100.0)
+                    _fc = [-_cn + incasso_allacci]
+                    for _t in range(1, orizzonte + 1):
+                        _fc.append(
+                            ricavi_0 * (1 + esc_ricavi) ** (_t - 1)
+                            - (opex_energia_0 + costo_pompaggio_0 + costo_scarto_0)
+                            * (1 + esc_costi) ** (_t - 1)
+                            - (om_0 + costi_fissi_0) * (1 + esc_om) ** (_t - 1))
+                    return van(_fc, wacc)
+
+                _q_nec = None
+                if _van_con_contributo(100.0) > 0:
+                    _lo, _hi = float(contributo_pct), 100.0
+                    for _ in range(50):
+                        _m = (_lo + _hi) / 2.0
+                        if _van_con_contributo(_m) < 0:
+                            _lo = _m
+                        else:
+                            _hi = _m
+                    _q_nec = _hi
+                if _q_nec is not None:
+                    _c1.metric("Contributo necessario", f"{_q_nec:.0f} %",
+                               delta=f"{_q_nec - contributo_pct:+.0f} punti",
+                               delta_color="inverse",
+                               help=f"{capex_tot * _q_nec / 100 / 1e6:.2f} M€ contro i "
+                                    f"{contributo / 1e6:.2f} M€ attualmente ipotizzati")
+                else:
+                    _c1.metric("Contributo necessario", "non sufficiente",
+                               help="Nemmeno un contributo del 100 % rende positivo il "
+                                    "valore attuale netto: il margine di gestione è "
+                                    "troppo esiguo per sostenere i costi ricorrenti.")
+
+                _prezzo_nec = (((capex_netto - incasso_allacci) * _crf_x + _costi_tot_0
+                                - ricavo_fisso_0) / E_venduto) if E_venduto > 0 else None
+                if _prezzo_nec:
+                    _c2.metric("Prezzo di vendita necessario", f"{_prezzo_nec:.0f} €/MWh",
+                               delta=f"{_prezzo_nec - prezzo_calore:+.0f}",
+                               delta_color="inverse",
+                               help=f"A parità di contributo e di costi. Oggi impostato "
+                                    f"a {prezzo_calore:.0f} €/MWh. Va confrontato con "
+                                    f"quanto l'utente spende oggi col proprio impianto.")
+
+                _mancante = max(-_van, 0.0)
+                _extra = (_mancante * _crf_x / _margine_unit) if _margine_unit > 0 else None
+                if _extra is not None and _extra < E_venduto * 3:
+                    _c3.metric("Calore da vendere in più",
+                               f"+{_extra / E_venduto * 100:.0f} %",
+                               help=f"{_extra:,.0f} MWh/a in più a parità di rete e di "
+                                    f"costi fissi, cioè allacciando altre utenze lungo "
+                                    f"il tracciato già posato.".replace(",", "."))
+                else:
+                    _c3.metric("Calore da vendere in più", "oltre il triplo",
+                               help="Il divario non si colma densificando la rete attuale.")
+
+                st.caption(
+                    "Le tre soglie sono alternative, non cumulative: ciascuna porta a "
+                    "zero il valore attuale netto agendo su una sola variabile e "
+                    "lasciando ferme le altre. Nella pratica si combinano, e conviene "
+                    "verificare quale sia davvero disponibile: il contributo dipende "
+                    "dai bandi aperti, il prezzo di vendita dal confronto con il costo "
+                    "del gas per l'utente finale, le utenze aggiuntive dalla densità "
+                    "edilizia lungo il tracciato.")
+
+                with st.expander("Strumenti di finanziamento da verificare"):
+                    st.markdown(
+                        "Canali che di norma finanziano reti di teleriscaldamento da "
+                        "recupero di calore. Le finestre e le percentuali cambiano nel "
+                        "tempo, quindi vanno verificate al momento della domanda.\n\n"
+                        "- **Conto Termico** (GSE), per la quota di impianto a fonte "
+                        "rinnovabile e per gli interventi sugli edifici pubblici allacciati\n"
+                        "- **Fondi europei a gestione regionale** (FESR) e programmi di "
+                        "cooperazione territoriale come **Interreg**, che è il canale "
+                        "del progetto HEAT 35 stesso\n"
+                        "- **Fondo nazionale per l'efficienza energetica** e strumenti "
+                        "della **BEI** per la quota a debito, spesso a condizioni "
+                        "migliori del mercato\n"
+                        "- **Certificati bianchi** per il risparmio di energia primaria: "
+                        "sono però un ricavo in conto esercizio e non riducono "
+                        "l'investimento iniziale\n\n"
+                        "Il modello tratta il contributo come una percentuale unica del "
+                        "CAPEX. Per una valutazione puntuale occorre verificare quali "
+                        "voci siano ammissibili in ciascuno strumento, perché spesso "
+                        "rete, sottostazioni e centrale hanno aliquote diverse.")
 
         if lcoh_completo > prezzo_calore:
             st.warning(f"\u26a0\ufe0f Il costo pieno del calore ({lcoh_completo:.1f} \u20ac/MWh) supera "
