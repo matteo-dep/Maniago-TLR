@@ -28,6 +28,30 @@
      agganciati opportunisticamente entro un buffer dal tubo (default 50 m).
      Zone senza pubblici possono essere agganciate opportunisticamente se il
      tubo di altre zone ci passa vicino.
+ P22 Riorganizzazione del solare fra le schede:
+     - Offerta decide soltanto se considerare un campo di COLLETTORI TERMICI;
+     - Dimensionamento ne stabilisce superficie, temperatura e costo;
+     - i MODULI IBRIDI passano alla scheda Carico elettrico, dove elettricita'
+       e calore si valutano insieme, e il loro contributo termico rientra nel
+       dispatch con un trasferimento esplicito;
+     - il FOTOVOLTAICO resta solo nella scheda elettrica.
+     La scheda elettrica sostituisce la "copertura obiettivo" con una
+     OTTIMIZZAZIONE DI SISTEMA che cerca la combinazione di ibridi,
+     fotovoltaico e accumulo a costo di approvvigionamento minimo.
+     Nota metodologica: con l'eccedenza valorizzata al prezzo di mercato
+     l'ottimo non esiste (il fotovoltaico produce a ~56 EUR/MWh e l'energia
+     immessa ne vale ~105, quindi conviene sempre ingrandire). Valutando
+     l'impianto come approvvigionamento, con l'eccedenza a valore nullo,
+     l'ottimo torna interno e ben definito. Il cursore permette comunque di
+     valorizzarla, avvisando che in quel caso il vincolo diventa la superficie
+     o la potenza di connessione.
+     Nel bilancio dell'ibrido si conta anche il calore prodotto, valorizzato
+     come costo evitato alle pompe: senza di esso l'ibrido non risulterebbe
+     mai conveniente rispetto al fotovoltaico.
+ P21 Parametro n_griglia nell'ottimizzatore: regola la finezza della ricerca
+     sui volumi di accumulo, che si riflette al cubo sul tempo di calcolo.
+     Serve allo script scenari_maniago.py, che percorre in batch l'intero
+     ventaglio di configurazioni e produce la tabella di confronto.
  P20 Solare riorganizzato: in Offerta solo la scelta se considerarlo, in
      Dimensionamento la tecnologia (collettori termici o moduli ibridi) e la
      taglia, nella scheda elettrica il fotovoltaico a valle. Quest'ultima
@@ -1903,7 +1927,7 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
                       capex_hp_func, capex_backup_kw, opex_backup_mwh, backup_cop,
                       prezzo_el, costo_m3, capex_solare_fisso, fattore_crf,
                       perdita_func, antigelo, q_int_bins=None, bin_T_int=None,
-                      stratificato=True, **kwargs):
+                      stratificato=True, n_griglia=6, **kwargs):
     """Dimensiona P_hp_alta, P_hp_bassa, V_hot, V_int, V_low a LCOH minimo.
 
     Vincolo: copertura 100 % delle ore (backup firm sul picco).
@@ -1934,8 +1958,15 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
     # di altra natura. Il limite e' impostabile dall'utente.
     v_max = float(kwargs.get("v_max_m3", 2000.0))
 
-    def _griglia(vmax, n=6):
-        """Volumi candidati fino a vmax, piu' fitti sui valori piccoli."""
+    def _griglia(vmax, n=None):
+        """Volumi candidati fino a vmax, piu' fitti sui valori piccoli.
+
+        Il numero di valori si riflette al cubo sul tempo di calcolo, perche'
+        i tre accumuli vengono combinati fra loro: con la pompa a bassa
+        temperatura, dove tutti e tre sono in gioco, scendere da 6 a 4 valori
+        riduce le combinazioni da oltre trecento a una sessantina.
+        """
+        n = int(n_griglia if n is None else n)
         if vmax <= 0:
             return [0.0]
         passi = np.unique(np.round(np.geomspace(50.0, max(vmax, 100.0), n) / 50.0) * 50.0)
@@ -4311,27 +4342,30 @@ taglia verrebbe sottostimata.
     st.divider()
     st.markdown("#### \u2600\ufe0f Solare termico")
     _sol_on = st.checkbox(
-        "Considera un campo solare fra le fonti di calore", value=False,
+        "Considera un campo di collettori solari termici", value=False,
         key="off_sol_on",
-        help="Attivandolo, nella scheda **Dimensionamento** compare la scelta fra "
-             "collettori termici e moduli ibridi, con superficie e temperatura di "
-             "esercizio. Il fotovoltaico puro non compare qui né lì: non produce "
-             "calore e si dimensiona nella scheda **Carico elettrico**.")
+        help="Attivandolo, nella scheda **Dimensionamento** compaiono superficie, "
+             "temperatura di esercizio e costo del campo. Qui si decide soltanto se "
+             "il solare termico rientra fra le fonti di calore.")
     if _sol_on:
-        st.info("☀️ Solare attivo. Vai in **Dimensionamento**, passo *2 · Tecnologie*, "
-                "per scegliere fra collettori termici e moduli ibridi e per "
-                "dimensionare il campo.")
-        _sol_prec = st.session_state.get("_off_solare", {}) or {}
+        st.info("☀️ Solare termico attivo. Vai in **Dimensionamento**, passo "
+                "*2 · Tecnologie*, per dimensionare il campo.")
         _dim_sol = st.session_state.get("_dim_solare_conf", {}) or {}
         if _dim_sol.get("area_m2"):
             _s1, _s2, _s3 = st.columns(3)
-            _s1.metric("Tecnologia scelta", _dim_sol.get("tipo", "—"))
+            _s1.metric("Configurazione", _dim_sol.get("tipo", "—"))
             _s2.metric("Superficie", f"{_dim_sol['area_m2']:,} m²".replace(",", "."))
             _s3.metric("Calore prodotto",
                        f"{_dim_sol.get('termico_mwh', 0):,.0f} MWh/a".replace(",", "."))
     else:
-        st.caption("Nessun campo solare: le fonti di calore sono i soli flussi di scarto "
-                   "selezionati sopra.")
+        st.caption("Nessun campo solare termico: le fonti di calore sono i soli flussi "
+                   "di scarto selezionati sopra.")
+
+    st.caption("I **moduli ibridi** non si impostano qui: producendo elettricità oltre "
+               "al calore, si dimensionano nella scheda **Carico elettrico**, dove i due "
+               "prodotti si valutano insieme. Il calore che producono rientra poi nel "
+               "bilancio termico con un trasferimento esplicito. Il **fotovoltaico** "
+               "puro, che non produce calore, sta solo in quella scheda.")
 
     st.session_state["_off_solare_attivo"] = bool(_sol_on)
 
@@ -4858,14 +4892,16 @@ with tab_dimensionamento:
 
         # ------------------------------------------------------------------
         # SOLARE TERMICO
-        # Si attiva nella scheda Offerta, dove si decide se considerarlo fra
-        # le fonti; qui se ne sceglie la tecnologia e la taglia, perche' e'
-        # in questa scheda che se ne vede l'effetto sul dispatch.
-        # Il fotovoltaico puro non compare: non produce calore e si dimensiona
-        # nella scheda Carico elettrico, a valle di questa.
+        # Si attiva nella scheda Offerta, dove si decide se considerarlo fra le
+        # fonti di calore; qui se ne sceglie la taglia, perche' e' in questa
+        # scheda che se ne vede l'effetto sul dispatch.
+        # Qui compaiono i soli collettori termici. I moduli ibridi producono
+        # anche elettricita' e vanno quindi dimensionati nella scheda Carico
+        # elettrico, dove i due prodotti si valutano insieme; il calore che
+        # producono rientra qui attraverso il trasferimento esplicito.
         # ------------------------------------------------------------------
         st.divider()
-        st.markdown("**\u2600\ufe0f Solare termico**")
+        st.markdown("**☀️ Solare termico**")
         solare_on = bool(st.session_state.get("_off_solare_attivo", False))
         solar_low = np.zeros(len(dom_arr))
         capex_solare = 0.0
@@ -4881,13 +4917,7 @@ with tab_dimensionamento:
             st.caption("Disattivato. Per considerarlo, spunta *Considera un campo solare "
                        "fra le fonti di calore* nella scheda **Offerta**.")
         else:
-            _scelta_sol = st.radio(
-                "Tecnologia", ["Collettori termici", "Moduli ibridi PVT"],
-                key="dim_scelta_sol", horizontal=True,
-                help="I collettori termici rendono più calore per metro quadro; i moduli "
-                     "ibridi ne rendono meno ma producono anche elettricità, che si "
-                     "valorizza nella scheda Carico elettrico.")
-            _ds1, _ds2 = st.columns(2)
+            _ds1, _ds2, _ds3 = st.columns(3)
             _area_in = _ds1.number_input("Superficie del campo (m²)", min_value=0,
                                          max_value=50000, value=2000, step=100,
                                          key="dim_area_sol")
@@ -4897,78 +4927,67 @@ with tab_dimensionamento:
                                       "ottiene circa la metà del calore che si avrebbe "
                                       "a 45 °C, a parità di superficie. Deve però essere "
                                       "compatibile con l'anello che alimenta.")
+            _cap_mq = _ds3.slider("Costo del campo (€/m²)", 100, 1200, 450, step=10,
+                                  key="dim_capex_sol_mq",
+                                  help="Collettori, strutture di supporto, circuito "
+                                       "idraulico e regolazione. Un campo di grande "
+                                       "taglia sta sui 300-500 €/m²; su coperture "
+                                       "esistenti si può superare gli 800.")
             area_sol = int(_area_in)
+            tipo_solare = "Collettori termici"
+            _st_ = genera_offerta_solare(pvgis, area_sol, 0.45).set_index("datetime")
+            solar_low = _st_["MWh"].reindex(idx_h, fill_value=0).values
+            capex_solare = area_sol * _cap_mq
 
-            if _scelta_sol == "Collettori termici":
-                tipo_solare = "Collettori termici"
-                _cap_mq = st.slider("Costo del campo (€/m²)", 100, 1200, 450, step=10,
-                                    key="dim_capex_sol_mq",
-                                    help="Collettori, strutture di supporto, circuito "
-                                         "idraulico e regolazione. Un campo di grande "
-                                         "taglia sta sui 300-500 €/m²; su coperture "
-                                         "esistenti si può superare gli 800.")
-                _st_ = genera_offerta_solare(pvgis, area_sol, 0.45).set_index("datetime")
-                solar_low = _st_["MWh"].reindex(idx_h, fill_value=0).values
-                capex_solare = area_sol * _cap_mq
-            else:
-                _mod_sel = st.selectbox("Modello di modulo ibrido",
-                                        list(CATALOGO_PVT.keys()), index=0,
-                                        key="dim_modello_pvt",
-                                        help="I moduli vetrati e isolati rendono calore "
-                                             "anche a temperature elevate; quelli non "
-                                             "isolati hanno perdite maggiori e stagnano "
-                                             "intorno ai 68 °C, ma costano meno e hanno "
-                                             "spesso un rendimento elettrico superiore.")
-                _mp = CATALOGO_PVT[_mod_sel]
-                tipo_solare = f"Ibrido {_mp['nome']}"
-                n_pvt = int(area_sol / _mp["area_lorda_m2"])
-                _t_lim = _mp.get("t_max_circuito_c", 100.0)
-                if _tf_in > _t_lim:
-                    st.error(f"⚠️ La temperatura impostata ({_tf_in} °C) supera il limite "
-                             f"di circuito dichiarato per questo modulo ({_t_lim:.0f} °C).")
-                elif _tf_in > _mp["t_ristagno_c"] - 15:
-                    st.warning(f"⚠️ A {_tf_in} °C il modulo è vicino alla stagnazione "
-                               f"({_mp['t_ristagno_c']:.0f} °C) e la resa termica è quasi "
-                               f"nulla. Con un modulo non isolato conviene restare sotto "
-                               f"i 45-50 °C.")
-                _cap_pan = st.slider("Costo per pannello (€)", 200, 2000,
-                                     900 if "Abora" in _mp["nome"] else 500, step=25,
-                                     key="dim_capex_pvt_pan",
-                                     help="Il modulo ibrido si acquista a pezzo. "
-                                          "Fornitura e posa comprensive di circuito "
-                                          "idraulico, inverter e opere accessorie. "
-                                          "Valore da verificare con offerte reali.")
-                st.caption(_mp["note"])
-                _pv_ = genera_offerta_pvt(pvgis, n_pvt, float(_tf_in),
-                                          _mod_sel).set_index("datetime")
-                solar_low = _pv_["MWh_term"].reindex(idx_h, fill_value=0).values
-                _serie_el_dim = _pv_["MWh_el"].reindex(HOURS_2024, fill_value=0).values
-                pvt_el_mwh = float(_serie_el_dim.sum())
-                capex_solare = n_pvt * _cap_pan
-
-            _mm1, _mm2, _mm3, _mm4 = st.columns(4)
+            _mm1, _mm2, _mm3 = st.columns(3)
             _mm1.metric("Calore", f"{solar_low.sum():,.0f} MWh/a".replace(",", "."))
-            _mm2.metric("Elettricità", f"{pvt_el_mwh:,.0f} MWh/a".replace(",", ".")
-                        if pvt_el_mwh > 0 else "—")
-            _mm3.metric("CAPEX", f"{capex_solare / 1000:,.0f} k€".replace(",", "."))
+            _mm2.metric("CAPEX", f"{capex_solare / 1000:,.0f} k€".replace(",", "."))
             _p_pk_s = (solar_low.max() * 1000.0) if len(solar_low) else 0.0
-            _mm4.metric("Costo specifico",
+            _mm3.metric("Costo specifico",
                         f"{capex_solare / max(_p_pk_s, 1):,.0f} €/kW".replace(",", "."),
                         help=f"riferito ai {_p_pk_s:,.0f} kW di picco raggiunti "
                              f"nell'anno simulato".replace(",", "."))
-            _det = [f"{capex_solare / max(area_sol, 1):,.0f} €/m²".replace(",", ".")]
-            if n_pvt:
-                _mp_d = CATALOGO_PVT[st.session_state.get("dim_modello_pvt",
-                                                          list(CATALOGO_PVT)[0])]
-                _det.append(f"{n_pvt} moduli da {_mp_d['area_lorda_m2']:.2f} m²")
-                _det.append(f"peso {n_pvt * _mp_d['peso_kg'] / 1000:.1f} t "
-                            f"(verificare la portata delle coperture)")
-            st.caption(" · ".join(_det))
-
             if not is_hp_par:
                 st.warning("⚠️ Il calore solare alimenta l'anello basso, che senza pompa "
                            "a bassa temperatura non ha utilizzatori: verrebbe scartato "
                            "mentre il CAPEX resta a bilancio.")
+
+        # --- calore dei moduli ibridi trasferito dalla scheda elettrica ---
+        # I moduli ibridi si dimensionano di la', dove elettricita' e calore si
+        # valutano insieme; qui ne arriva il contributo termico, che alleggerisce
+        # il carico delle pompe di calore.
+        _ibr = st.session_state.get("_el_ibrido_da_elettrico") or {}
+        if _ibr.get("attivo") and _ibr.get("area_m2", 0) > 0:
+            _s_ibr = np.asarray(_ibr.get("serie_termica", np.zeros(len(dom_arr))),
+                                dtype=float)
+            if _s_ibr.size == len(dom_arr):
+                solar_low = solar_low + _s_ibr
+                capex_solare += _ibr["area_m2"] * (_ibr["costo_pannello"]
+                                                   / CATALOGO_PVT[_ibr["modello"]]["area_lorda_m2"])
+                area_sol += int(_ibr["area_m2"])
+                n_pvt = int(_ibr["area_m2"] / CATALOGO_PVT[_ibr["modello"]]["area_lorda_m2"])
+                _serie_el_dim = np.asarray(_ibr.get("serie_elettrica",
+                                                    np.zeros(len(HOURS_2024))), dtype=float)
+                pvt_el_mwh = float(_serie_el_dim.sum())
+                tipo_solare = (f"{tipo_solare} + ibridi" if solare_on
+                               else f"Ibridi {CATALOGO_PVT[_ibr['modello']]['nome']}")
+                solare_on = True
+                _c1i, _c2i, _c3i = st.columns(3)
+                _c1i.metric("Moduli ibridi (dalla scheda elettrica)",
+                            f"{_ibr['area_m2']:,.0f} m²".replace(",", "."))
+                _c2i.metric("Calore che portano",
+                            f"{_s_ibr.sum():,.0f} MWh/a".replace(",", "."))
+                _c3i.metric("Elettricità",
+                            f"{pvt_el_mwh:,.0f} MWh/a".replace(",", "."))
+                st.caption(f"Dimensionati nella scheda **Carico elettrico** "
+                           f"({CATALOGO_PVT[_ibr['modello']]['nome']}, "
+                           f"{_ibr['T_esercizio']:.0f} °C) e trasferiti qui. "
+                           f"Se li modifichi là, ritrasferiscili e rilancia il "
+                           f"dimensionamento.")
+                if st.button("Rimuovi i moduli ibridi dal bilancio termico",
+                             key="dim_rimuovi_ibr"):
+                    st.session_state.pop("_el_ibrido_da_elettrico", None)
+                    st.rerun()
 
         st.session_state["_dim_solare_conf"] = {
             "attivo": solare_on, "tipo": tipo_solare, "area_m2": area_sol,
@@ -4977,12 +4996,15 @@ with tab_dimensionamento:
             "T_esercizio": _tf_in,
         }
         st.session_state["_dim_serie_el_solare"] = _serie_el_dim
+        st.session_state["_dim_serie_el_solare_term"] = (
+            np.asarray(_ibr.get("serie_termica", np.zeros(len(dom_arr))), dtype=float)
+            if _ibr.get("attivo") else np.zeros(len(dom_arr)))
 
         # ------------------------------------------------------------------
         # AUTOPRODUZIONE ELETTRICA
         # ------------------------------------------------------------------
         st.divider()
-        st.markdown("**\u26A1 Autoproduzione elettrica**")
+        st.markdown("**⚡ Autoproduzione elettrica**")
 
         if pvt_el_mwh > 0:
             st.caption(f"L'impianto ibrido produce **{pvt_el_mwh:,.0f} MWh/a** elettrici. "
@@ -5816,7 +5838,7 @@ with tab_dimensionamento:
 # devono condizionare il dispatch del calore, che risponde a vincoli propri.
 # =============================================================================
 with tab_elettrico:
-    st.markdown("### \u26A1 Copertura del carico elettrico")
+    st.markdown("### ⚡ Copertura del carico elettrico")
     _snap_el = st.session_state.get("_dim_snapshot")
     _attiva_el = bool(st.session_state.get("_dim_considera_el", False))
     if not _snap_el:
@@ -5837,316 +5859,347 @@ with tab_elettrico:
         if _cons_h.size == 0:
             _cons_h = np.full(len(HOURS_2024),
                               float(_snap_el.get("E_elettrica", 0)) / len(HOURS_2024))
-
-        # produzione gia' disponibile: e' quella dei moduli ibridi eventualmente
-        # scelti nel dimensionamento termico. Il fotovoltaico dedicato si
-        # aggiunge dopo, a completare quanto manca.
-        _el_ibrido = np.asarray(st.session_state.get("_dim_serie_el_solare",
-                                                     np.zeros(len(HOURS_2024))), dtype=float)
-        if _el_ibrido.size != len(HOURS_2024):
-            _el_ibrido = np.zeros(len(HOURS_2024))
-        _conf_sol = st.session_state.get("_dim_solare_conf", {}) or {}
-
         _prezzi_h, _fonte_pr = carica_prezzi_elettrici()
+        _mt_el = serie_meteo_annua(pvgis)
+        _cop_rif = float(_snap_el.get("cop_alta", 4.5)) or 4.5
 
-        # =============================================================
-        # 1. SITUAZIONE ATTUALE
-        # =============================================================
-        st.markdown("#### Copertura attuale")
-        _res0 = dispatch_elettrico(_el_ibrido, _cons_h)
-        _a1, _a2, _a3, _a4 = st.columns(4)
-        _a1.metric("Consumo pompe di calore",
-                   f"{_res0['E_consumo']:,.0f} MWh/a".replace(",", "."),
+        # =================================================================
+        # 1. SITUAZIONE DI PARTENZA
+        # =================================================================
+        st.markdown("#### Punto di partenza")
+        _p1, _p2, _p3 = st.columns(3)
+        _p1.metric("Consumo delle pompe di calore",
+                   f"{_cons_h.sum():,.0f} MWh/a".replace(",", "."),
                    help=f"dal dispatch termico · {_snap_el.get('tecnologie', '')}")
-        _a2.metric("Produzione propria",
-                   f"{_res0['E_produzione']:,.0f} MWh/a".replace(",", "."),
-                   help=(f"dai moduli ibridi: {_conf_sol.get('tipo', '')}, "
-                         f"{_conf_sol.get('area_m2', 0):,} m²".replace(",", ".")
-                         if _res0["E_produzione"] > 0 else "nessuna"))
-        _a3.metric("Coperto da produzione propria",
-                   f"{_res0['E_autoconsumo']:,.0f} MWh/a".replace(",", "."))
-        _a4.metric("Copertura", f"{_res0['copertura_pct']:.1f} %",
-                   help="Quota del fabbisogno elettrico coperta senza prelievo di rete.")
+        _p2.metric("Oggi coperto da", "rete elettrica",
+                   help="Senza impianti di generazione propri tutto il fabbisogno "
+                        "viene acquistato.")
+        _p3.metric("Prezzi zonali", f"{_prezzi_h.mean():.0f} €/MWh medi",
+                   help=f"da {_fonte_pr} · ore 10-16 "
+                        f"{_prezzi_h[HOURS_2024.hour.isin(range(10, 17))].mean():.0f} · "
+                        f"ore 18-21 "
+                        f"{_prezzi_h[HOURS_2024.hour.isin(range(18, 22))].mean():.0f}")
 
-        if _res0["E_produzione"] <= 0:
-            st.caption("Non è stato scelto un impianto ibrido nel dimensionamento, "
-                       "quindi al momento tutta l'elettricità viene prelevata dalla rete.")
-        else:
-            st.caption(f"I moduli ibridi coprono il {_res0['copertura_pct']:.1f} % del "
-                       f"fabbisogno. Il resto, **{_res0['E_prelevato']:,.0f} MWh/a**, "
-                       f"viene acquistato.".replace(",", "."))
-
-        # =============================================================
-        # 2. FOTOVOLTAICO DEDICATO
-        # =============================================================
+        # =================================================================
+        # 2. PARAMETRI DEGLI IMPIANTI
+        # =================================================================
         st.divider()
-        _agg_pv = st.checkbox("Aggiungi un impianto fotovoltaico dedicato", value=False,
-                              key="el_agg_pv",
-                              help="Impianto destinato a coprire i consumi della "
-                                   "centrale, che si somma all'eventuale produzione "
-                                   "dei moduli ibridi.")
+        st.markdown("#### Impianti considerati")
+        st.caption("Si impostano qui i costi e le caratteristiche; le taglie le trova "
+                   "l'ottimizzazione più sotto.")
 
-        if not _agg_pv:
-            _res_el = _res0
-            _kwp = 0.0
-            _batt = 0.0
-            _prod_h = _el_ibrido
-            _c_rate = 0.5
-            _eff_b = 0.90
-        else:
-            _mt_el = serie_meteo_annua(pvgis)
-            _g1, _g2 = st.columns(2)
-            with _g1:
-                _con_batt = st.radio("Accumulo elettrochimico", ["Senza batteria",
-                                                                 "Con batteria"],
-                                     key="el_con_batt", horizontal=True,
-                                     help="Senza accumulo la copertura si ferma dove "
-                                          "arriva la contemporaneità fra sole e consumo; "
-                                          "la batteria sposta l'energia nelle ore serali "
-                                          "e notturne, ma va ripagata.")
-                _eff_b = st.slider("Rendimento di ciclo (%)", 70, 98, 90, step=1,
-                                   key="el_eff_batt") / 100.0
-                _c_rate = st.slider("Potenza in rapporto alla capacità (C-rate)",
-                                    0.25, 2.0, 0.5, step=0.25, key="el_crate",
-                                    help="0,5 significa che una batteria da 4 MWh eroga "
-                                         "2 MW: è il rapporto tipico degli accumuli "
-                                         "stazionari.")
-            with _g2:
-                _mod_dim = st.radio("Come dimensionare",
-                                    ["Taglia scelta", "Copertura obiettivo"],
-                                    key="el_mod_pv",
-                                    help="Si può fissare la taglia e vedere che "
-                                         "copertura se ne ricava, oppure indicare la "
-                                         "quota di consumo da coprire e lasciare che "
-                                         "sia il programma a cercarla.")
-                _costo_kwp = st.slider("Costo del fotovoltaico (€/kWp)", 400, 2000, 900,
-                                       step=50, key="el_costo_kwp",
-                                       help="Chiavi in mano. Impianti sopra i 500 kWp "
-                                            "su copertura esistente stanno di norma "
-                                            "fra 700 e 1.100 €/kWp.")
-                _costo_kwh_b = st.slider("Costo della batteria (€/kWh)", 100, 800, 350,
-                                         step=25, key="el_costo_batt",
-                                         help="Sistema completo, comprensivo di "
-                                              "conversione e installazione.")
-                _bos_pv = st.slider("Perdite di sistema del fotovoltaico (%)", 5, 25, 14,
-                                    step=1, key="el_bos_pv",
-                                    help="Inverter, cablaggi, sporcamento dei moduli, "
-                                         "disaccoppiamento e temperatura di cella. Un "
-                                         "impianto ben progettato sta fra il 12 e il 15 %.")
-                # Senza un vincolo fisico la ricerca dell'ottimo non ha soluzione:
-                # finche' l'energia immessa vale piu' del suo costo di produzione,
-                # conviene sempre ingrandire l'impianto. Il limite reale e' la
-                # superficie disponibile, oppure la potenza che il gestore di rete
-                # accetta in immissione.
-                _sup_pv = st.number_input("Superficie disponibile per il fotovoltaico (m²)",
-                                          min_value=0, max_value=200000, value=5000,
-                                          step=500, key="el_sup_pv",
-                                          help="Coperture e aree utilizzabili. Servono "
-                                               "circa 6,5 m² per kWp comprensivi degli "
-                                               "spazi fra le file.")
-                _kwp_max = _sup_pv / 6.5
-                st.caption(f"Potenza massima installabile: **{_kwp_max:,.0f} kWp**"
-                           .replace(",", "."))
-
-            # Produzione oraria per kWp installato. Un kWp e' DEFINITO come la potenza
-            # erogata dal modulo a 1.000 W/m2 in condizioni standard, quindi il
-            # rendimento di conversione e' gia' dentro la definizione di kWp:
-            # applicarlo di nuovo lo conterebbe due volte. Resta da togliere il solo
-            # BOS, cioe' le perdite di sistema a valle del modulo.
-            _pv_unit = (_mt_el["G_totale"].values / 1000.0
-                        * (1.0 - _bos_pv / 100.0) / 1000.0)   # MWh/h per kWp
-            _resa_kwp = float(_pv_unit.sum()) * 1000.0
-
-            _oneri = st.slider("Oneri, trasporto e imposte sul prelievo (€/MWh)",
-                               0, 200, 110, step=5, key="el_oneri",
-                               help="Si sommano al prezzo zonale sull'energia "
-                                    "acquistata. L'energia immessa è invece remunerata "
-                                    "al solo prezzo zonale: è questo divario a rendere "
-                                    "conveniente l'autoconsumo.")
-            st.caption(f"Prezzi zonali orari da **{_fonte_pr}** · media "
-                       f"{_prezzi_h.mean():.1f} €/MWh · nelle ore 10-16 "
-                       f"{_prezzi_h[HOURS_2024.hour.isin(range(10, 17))].mean():.1f} · "
-                       f"nelle ore 18-21 "
-                       f"{_prezzi_h[HOURS_2024.hour.isin(range(18, 22))].mean():.1f} · "
-                       f"resa attesa {_resa_kwp:.0f} kWh/kWp")
-
-            # --- funzione di valutazione di una configurazione ---
-            _crf_el = crf(0.04, 20)
-            _costo_base = float((_cons_h * (_prezzi_h + _oneri)).sum())
-
-            def _valuta_el(kwp, batt):
-                _p = _el_ibrido + _pv_unit * kwp
-                _r = dispatch_elettrico(_p, _cons_h, batteria_mwh=batt,
-                                        p_batt_mw=batt * _c_rate, eff_batt=_eff_b)
-                _cc = float((_r["prelevato"] * (_prezzi_h + _oneri)).sum())
-                _ri = float((_r["immesso"] * _prezzi_h).sum())
-                _cap = kwp * _costo_kwp + batt * 1000.0 * _costo_kwh_b
-                _benef = (_costo_base - _cc) + _ri
-                return {"kwp": kwp, "batt": batt, "res": _r, "capex": _cap,
-                        "beneficio": _benef, "netto": _benef - _cap * _crf_el,
-                        "costo_rete": _cc, "ricavo": _ri}
-
-            _batt_max = 0.0 if _con_batt == "Senza batteria" else 30.0
-
-            if _mod_dim == "Taglia scelta":
-                _t1, _t2 = st.columns(2)
-                _kwp = _t1.number_input("Potenza fotovoltaica (kWp)", min_value=0,
-                                        max_value=int(max(_kwp_max, 1)),
-                                        value=int(min(500, max(_kwp_max, 1))),
-                                        step=50, key="el_kwp",
-                                        help=f"Limite di {_kwp_max:,.0f} kWp dato dalla "
-                                             f"superficie disponibile.".replace(",", "."))
-                _batt = (_t2.slider("Capacità della batteria (MWh)", 0.0, 30.0, 2.0,
-                                    step=0.5, key="el_batt")
-                         if _con_batt == "Con batteria" else 0.0)
-                _v = _valuta_el(float(_kwp), float(_batt))
-                _res_el = _v["res"]
+        _i1, _i2, _i3 = st.columns(3)
+        with _i1:
+            st.markdown("**☀️ Solare ibrido**")
+            _usa_ibr = st.checkbox("Considera moduli ibridi", value=False,
+                                   key="el_usa_ibrido",
+                                   help="I moduli ibridi producono elettricità e calore "
+                                        "con la stessa superficie. Il calore alimenta "
+                                        "l'anello basso della rete, quindi entra anche "
+                                        "nel bilancio termico.")
+            if _usa_ibr:
+                _mod_ibr = st.selectbox("Modello", list(CATALOGO_PVT.keys()), index=0,
+                                        key="el_modello_ibr")
+                _mp_el = CATALOGO_PVT[_mod_ibr]
+                _tf_ibr = st.slider("Temperatura di esercizio (°C)", 25, 80, 40, step=5,
+                                    key="el_tf_ibrido",
+                                    help="Il calore prodotto va all'anello basso, quindi "
+                                         "conviene una temperatura bassa: la resa termica "
+                                         "sale e quella elettrica non ne risente quasi.")
+                _costo_ibr = st.slider("Costo per modulo (€)", 200, 2000,
+                                       900 if "Abora" in _mp_el["nome"] else 500,
+                                       step=25, key="el_costo_ibrido")
+                if _tf_ibr > _mp_el.get("t_max_circuito_c", 100):
+                    st.error(f"Oltre il limite di circuito del modulo "
+                             f"({_mp_el['t_max_circuito_c']:.0f} °C).")
             else:
-                _cop_obj = st.slider("Copertura del consumo da raggiungere (%)",
-                                     5, 100, 50, step=5, key="el_cop_obj")
-                _batt = 0.0
-                if _con_batt == "Con batteria":
-                    _batt = st.slider("Capacità della batteria (MWh)", 0.0, 30.0, 4.0,
-                                      step=0.5, key="el_batt_obj",
-                                      help="La copertura raggiungibile dipende molto "
-                                           "dall'accumulo: senza, il fotovoltaico non "
-                                           "può superare una certa soglia.")
-                _lo, _hi = 0.0, float(_kwp_max)
-                for _ in range(45):
-                    _m = (_lo + _hi) / 2.0
-                    if _valuta_el(_m, _batt)["res"]["copertura_pct"] < _cop_obj:
-                        _lo = _m
-                    else:
-                        _hi = _m
-                _kwp = round(_hi / 10.0) * 10.0
-                _v = _valuta_el(_kwp, _batt)
-                _res_el = _v["res"]
-                if _kwp >= _kwp_max * 0.99 or _res_el["copertura_pct"] < _cop_obj - 1:
-                    _mot = ("la superficie disponibile non basta"
-                            if _kwp >= _kwp_max * 0.99
-                            else "produzione e consumo sono troppo sfasati")
-                    st.error(f"⚠️ La copertura del {_cop_obj} % non è raggiungibile: "
-                             f"{_mot}. Il massimo praticabile è circa "
-                             f"**{_res_el['copertura_pct']:.0f} %**. "
-                             + ("Aggiungi un accumulo: di notte non si produce."
-                                if _batt == 0 else
-                                "Aumenta l'accumulo o la superficie disponibile."))
-                else:
-                    st.success(f"Per coprire il **{_cop_obj} %** servono "
-                               f"**{_kwp:,.0f} kWp**"
-                               .replace(",", ".")
-                               + (f" e **{_batt:.1f} MWh** di accumulo" if _batt else "")
-                               + f", pari a circa {_kwp * 6.5:,.0f} m² di superficie."
-                               .replace(",", "."))
+                _mod_ibr = list(CATALOGO_PVT.keys())[0]
+                _mp_el = CATALOGO_PVT[_mod_ibr]
+                _tf_ibr, _costo_ibr = 40, 900
 
-            # --- esito della configurazione scelta ---
-            st.divider()
-            st.markdown("#### Configurazione scelta")
-            _e1, _e2, _e3, _e4 = st.columns(4)
-            _e1.metric("Copertura", f"{_res_el['copertura_pct']:.1f} %",
-                       delta=f"{_res_el['copertura_pct'] - _res0['copertura_pct']:+.1f} "
-                             f"punti rispetto a oggi")
-            _e2.metric("Autoconsumo della produzione",
-                       f"{_res_el['autoconsumo_pct']:.0f} %",
-                       help="Quota della produzione usata sul posto invece che immessa "
-                            "in rete. È questa a determinarne il valore.")
-            _e3.metric("Investimento", f"{_v['capex'] / 1e6:.2f} M€",
-                       help=f"{_kwp:,.0f} kWp".replace(",", ".")
-                            + (f" + {_batt:.1f} MWh di accumulo" if _batt else ""))
-            _e4.metric("Beneficio annuo", f"{_v['beneficio'] / 1000:,.0f} k€/a".replace(",", "."),
-                       delta=f"netto {_v['netto'] / 1000:+,.0f} k€/a".replace(",", "."),
-                       delta_color="normal" if _v["netto"] > 0 else "inverse",
-                       help="Risparmio in bolletta più vendita dell'energia immessa. "
-                            "Il netto sottrae l'investimento annualizzato a 20 anni.")
+        with _i2:
+            st.markdown("**\U0001F50B Fotovoltaico e accumulo**")
+            _usa_pv = st.checkbox("Considera fotovoltaico", value=True, key="el_usa_pv")
+            _costo_kwp = st.slider("Costo del fotovoltaico (€/kWp)", 400, 2000, 900,
+                                   step=50, key="el_costo_kwp",
+                                   help="Chiavi in mano. Impianti sopra i 500 kWp su "
+                                        "copertura esistente stanno di norma fra 700 "
+                                        "e 1.100 €/kWp.")
+            _usa_batt = st.checkbox("Considera l'accumulo elettrochimico", value=True,
+                                    key="el_usa_batt")
+            _costo_kwh_b = st.slider("Costo della batteria (€/kWh)", 100, 800, 350,
+                                     step=25, key="el_costo_batt")
+            _bos_pv = st.slider("Perdite di sistema (%)", 5, 25, 14, step=1,
+                                key="el_bos_pv",
+                                help="Inverter, cablaggi, sporcamento, temperatura di "
+                                     "cella. Un impianto ben progettato sta fra il 12 "
+                                     "e il 15 %.")
 
-            # =============================================================
-            # 3. CONFIGURAZIONI OTTIME
-            # =============================================================
-            st.divider()
-            st.markdown("#### Configurazioni ottime")
-            st.caption("Due criteri diversi portano a due impianti diversi: massimizzare "
-                       "il ritorno economico porta a un impianto più piccolo, "
-                       "massimizzare l'autonomia dalla rete a uno molto più grande. "
-                       "La scelta dipende da cosa si vuole ottenere.")
+        with _i3:
+            st.markdown("**\U0001F4B6 Valorizzazione**")
+            _oneri = st.slider("Oneri e imposte sul prelievo (€/MWh)", 0, 200, 110,
+                               step=5, key="el_oneri",
+                               help="Si sommano al prezzo zonale sull'energia "
+                                    "acquistata, e sono la vera ragione per cui "
+                                    "l'autoconsumo conviene.")
+            _val_imm = st.slider("Valore dell'energia immessa (% del prezzo zonale)",
+                                 0, 100, 0, step=5, key="el_val_imm",
+                                 help="A zero l'impianto è valutato come puro "
+                                      "approvvigionamento: l'eccedenza non vale nulla "
+                                      "e l'ottimizzazione trova una taglia finita. "
+                                      "Alzandolo si tratta l'impianto anche come "
+                                      "vendita, e la taglia ottima cresce.")
+            _val_cal_el = st.slider("Valore del calore da moduli ibridi (€/MWh)",
+                                    0, 200,
+                                    int(round(float(st.session_state.get(
+                                        "dim_prezzo_el", 180)) / _cop_rif)), step=5,
+                                    key="el_val_calore",
+                                    help="Costo che si evita producendo quel calore con "
+                                         "le pompe di calore invece che con i moduli. "
+                                         "Il valore proposto è il prezzo dell'elettricità "
+                                         f"diviso il COP di sistema ({_cop_rif:.1f}).")
+            _anni_el = st.slider("Vita utile per l'annualizzazione (anni)", 10, 30, 20,
+                                 key="el_anni")
 
-            with st.spinner("Ricerca delle configurazioni ottime..."):
-                _kwp_grid = np.unique(np.round(
-                    np.geomspace(max(_kwp_max / 60.0, 20.0), max(_kwp_max, 50.0), 16)
-                    / 10) * 10)
-                _batt_grid = ([0.0] if _batt_max == 0
-                              else [0.0, 1.0, 2.0, 4.0, 8.0, 15.0, 25.0])
-                _prove = []
-                for _k in _kwp_grid:
-                    for _b in _batt_grid:
-                        _prove.append(_valuta_el(float(_k), float(_b)))
+        if _val_imm == 0:
+            st.caption("Con l'eccedenza a valore nullo l'ottimizzazione cerca la "
+                       "configurazione che **minimizza il costo di approvvigionamento**: "
+                       "oltre una certa taglia si produrrebbe solo surplus inutile, "
+                       "quindi l'ottimo esiste ed è interno. È la lettura più prudente.")
+        else:
+            st.caption(f"Valorizzando l'eccedenza al {_val_imm} % del prezzo zonale "
+                       f"l'impianto è trattato anche come vendita: la taglia ottima "
+                       f"cresce, e può arrivare al limite della ricerca. In quel caso "
+                       f"il vincolo non è più energetico ma di superficie o di "
+                       f"potenza di connessione, da verificare a parte.")
 
-            _best_fin = max(_prove, key=lambda r: r["netto"])
-            _best_aut = max(_prove, key=lambda r: r["res"]["copertura_pct"])
+        # --- serie unitarie: si calcolano una volta e si scalano, perche' la
+        #     resa e' proporzionale alla taglia a parita' di temperatura ---
+        _pv_unit = (_mt_el["G_totale"].values / 1000.0
+                    * (1.0 - _bos_pv / 100.0) / 1000.0)        # MWh/h per kWp
+        _resa_kwp = float(_pv_unit.sum()) * 1000.0
+        _AREA_RIF = 1000.0
+        _n_rif = max(int(_AREA_RIF / _mp_el["area_lorda_m2"]), 1)
+        _s_rif = genera_offerta_pvt(pvgis, _n_rif, float(_tf_ibr), _mod_ibr).set_index("datetime")
+        _ibr_el_u = (_s_rif["MWh_el"].reindex(HOURS_2024, fill_value=0).values
+                     / _AREA_RIF)                               # MWh/h per m2
+        _ibr_th_u = (_s_rif["MWh_term"].reindex(HOURS_2024, fill_value=0).values
+                     / _AREA_RIF)
+        _costo_ibr_m2 = _costo_ibr / _mp_el["area_lorda_m2"]
 
-            _o1, _o2 = st.columns(2)
-            with _o1:
-                st.markdown("**Migliore ritorno economico**")
-                st.metric("Beneficio netto",
-                          f"{_best_fin['netto'] / 1000:,.0f} k€/a".replace(",", "."),
-                          help="Beneficio annuo meno l'investimento annualizzato")
-                st.caption(f"**{_best_fin['kwp']:,.0f} kWp**".replace(",", ".")
-                           + (f" con **{_best_fin['batt']:.0f} MWh** di accumulo"
-                              if _best_fin["batt"] else " senza accumulo")
-                           + f" · investimento {_best_fin['capex'] / 1e6:.2f} M€ · "
-                           f"copertura {_best_fin['res']['copertura_pct']:.0f} % · "
-                           f"autoconsumo {_best_fin['res']['autoconsumo_pct']:.0f} %")
-                _pb_fin = (_best_fin["capex"] / _best_fin["beneficio"]
-                           if _best_fin["beneficio"] > 0 else None)
-                if _pb_fin:
-                    st.caption(f"Tempo di ritorno semplice: **{_pb_fin:.1f} anni**")
-                if _best_fin["kwp"] >= _kwp_max * 0.95:
-                    st.warning(
-                        f"L'ottimo economico coincide con il limite di superficie "
-                        f"({_kwp_max:,.0f} kWp su {_sup_pv:,} m²): con più spazio "
-                        f"converrebbe un impianto ancora più grande. Finché l'energia "
-                        f"immessa in rete vale più di quanto costa produrla, il "
-                        f"criterio economico non ha un massimo interno — il limite è "
-                        f"fisico, non energetico.".replace(",", "."))
-            with _o2:
-                st.markdown("**Massima autonomia dalla rete**")
-                st.metric("Copertura", f"{_best_aut['res']['copertura_pct']:.0f} %")
-                st.caption(f"**{_best_aut['kwp']:,.0f} kWp**".replace(",", ".")
-                           + (f" con **{_best_aut['batt']:.0f} MWh** di accumulo"
-                              if _best_aut["batt"] else " senza accumulo")
-                           + f" · investimento {_best_aut['capex'] / 1e6:.2f} M€ · "
-                           f"beneficio netto "
-                           f"{_best_aut['netto'] / 1000:+,.0f} k€/a".replace(",", ".")
-                           + f" · autoconsumo {_best_aut['res']['autoconsumo_pct']:.0f} %")
-                if _best_aut["netto"] < 0:
-                    st.caption("Questa configurazione non si ripaga: l'energia in "
-                               "eccesso viene immessa in rete a un prezzo molto "
-                               "inferiore a quello di acquisto.")
+        # =================================================================
+        # 3. OTTIMIZZAZIONE DI SISTEMA
+        # =================================================================
+        st.divider()
+        st.markdown("#### \U0001F3AF Ottimizzazione di sistema")
+        st.caption("Cerca la combinazione di moduli ibridi, fotovoltaico e accumulo che "
+                   "rende minimo il costo complessivo di approvvigionamento elettrico: "
+                   "investimento annualizzato più energia acquistata, al netto di quanto "
+                   "si ricava dall'eccedenza e del calore che gli ibridi risparmiano "
+                   "alle pompe.")
 
-            _f_ott = go.Figure()
-            for _b in _batt_grid:
-                _sel = [r for r in _prove if r["batt"] == _b]
-                _f_ott.add_trace(go.Scatter(
+        _crf_el = crf(0.04, int(_anni_el))
+        _costo_base = float((_cons_h * (_prezzi_h + _oneri)).sum())
+
+        def _valuta_sistema(area_ibr, kwp, batt):
+            """Costo annuo di approvvigionamento per una data configurazione.
+
+            Comprende l'investimento annualizzato, l'energia acquistata, il
+            ricavo dall'eccedenza e il calore che i moduli ibridi sottraggono
+            alle pompe di calore: senza quest'ultimo l'ibrido risulterebbe
+            sempre perdente rispetto al fotovoltaico, perche' rende meno
+            elettricita' a parita' di superficie.
+            """
+            prod = _ibr_el_u * area_ibr + _pv_unit * kwp
+            r = dispatch_elettrico(prod, _cons_h, batteria_mwh=batt,
+                                   p_batt_mw=batt * 0.5, eff_batt=0.90)
+            acquisto = float((r["prelevato"] * (_prezzi_h + _oneri)).sum())
+            ricavo = float((r["immesso"] * _prezzi_h).sum()) * (_val_imm / 100.0)
+            calore = float((_ibr_th_u * area_ibr).sum())
+            capex = (area_ibr * _costo_ibr_m2 + kwp * _costo_kwp
+                     + batt * 1000.0 * _costo_kwh_b)
+            costo = capex * _crf_el + acquisto - ricavo - calore * _val_cal_el
+            return {"area_ibr": area_ibr, "kwp": kwp, "batt": batt, "res": r,
+                    "capex": capex, "acquisto": acquisto, "ricavo": ricavo,
+                    "calore_mwh": calore, "costo": costo,
+                    "risparmio": _costo_base - costo}
+
+        _col_o1, _col_o2 = st.columns([1, 2])
+        with _col_o1:
+            _lim_kwp = st.number_input("Limite superiore della ricerca (kWp)",
+                                       min_value=100, max_value=50000, value=3000,
+                                       step=100, key="el_lim_kwp",
+                                       help="Serve solo a delimitare la ricerca. Se "
+                                            "l'ottimo lo tocca significa che con "
+                                            "questi prezzi converrebbe un impianto "
+                                            "ancora più grande.")
+            _lancia = st.button("\U0001F3AF Trova la configurazione ottima",
+                                key="el_btn_opt", width="stretch", type="primary")
+        with _col_o2:
+            st.caption(f"Senza alcun impianto l'energia costa "
+                       f"**{_costo_base / 1000:,.0f} k€/a** "
+                       f"({_costo_base / max(_cons_h.sum(), 1e-9):.0f} €/MWh medi). "
+                       f"È il riferimento da battere.".replace(",", "."))
+            st.caption(f"Resa attesa del fotovoltaico **{_resa_kwp:.0f} kWh/kWp**; "
+                       f"dei moduli ibridi "
+                       f"**{_ibr_el_u.sum() * 1000:.0f} kWh/m² elettrici** e "
+                       f"**{_ibr_th_u.sum() * 1000:.0f} kWh/m² termici** a {_tf_ibr} °C.")
+
+        if _lancia:
+            with st.spinner("Esploro le combinazioni..."):
+                _g_ibr = [0.0]
+                if _usa_ibr:
+                    _g_ibr = [0.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0]
+                _g_kwp = [0.0]
+                if _usa_pv:
+                    _g_kwp = [0.0] + list(np.unique(np.round(
+                        np.geomspace(50, float(_lim_kwp), 12) / 10) * 10))
+                _g_batt = [0.0]
+                if _usa_batt:
+                    _g_batt = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0]
+                _prove = [_valuta_sistema(a, k, b)
+                          for a in _g_ibr for k in _g_kwp for b in _g_batt]
+            st.session_state["_el_prove"] = _prove
+
+        _prove = st.session_state.get("_el_prove")
+        if not _prove:
+            st.info("Premi **Trova la configurazione ottima** per esplorare le "
+                    "combinazioni di taglie.")
+        else:
+            _best = min(_prove, key=lambda r: r["costo"])
+            _senza = _valuta_sistema(0.0, 0.0, 0.0)
+
+            st.success(
+                f"Configurazione a costo minimo: "
+                + (f"**{_best['area_ibr']:,.0f} m²** di moduli ibridi · ".replace(",", ".")
+                   if _best["area_ibr"] else "")
+                + (f"**{_best['kwp']:,.0f} kWp** di fotovoltaico".replace(",", ".")
+                   if _best["kwp"] else "nessun fotovoltaico")
+                + (f" · **{_best['batt']:.1f} MWh** di accumulo"
+                   if _best["batt"] else " · senza accumulo"))
+
+            _r1, _r2, _r3, _r4 = st.columns(4)
+            _r1.metric("Costo dell'energia",
+                       f"{_best['costo'] / 1000:,.0f} k€/a".replace(",", "."),
+                       delta=f"{(_best['costo'] - _costo_base) / 1000:+,.0f} k€/a"
+                             .replace(",", "."),
+                       delta_color="inverse",
+                       help="Investimento annualizzato più acquisti, al netto di "
+                            "eccedenza e calore risparmiato.")
+            _r2.metric("Investimento", f"{_best['capex'] / 1e6:.2f} M€")
+            _r3.metric("Copertura del consumo",
+                       f"{_best['res']['copertura_pct']:.0f} %")
+            _r4.metric("Autoconsumo della produzione",
+                       f"{_best['res']['autoconsumo_pct']:.0f} %",
+                       help="Quota della produzione usata sul posto. Con l'eccedenza "
+                            "a valore nullo l'ottimizzazione tende a tenerla alta.")
+
+            if _best["kwp"] >= float(_lim_kwp) * 0.95:
+                st.warning(
+                    f"L'ottimo tocca il limite di ricerca ({_lim_kwp:,.0f} kWp): con "
+                    f"questi prezzi converrebbe un impianto ancora più grande. Alza il "
+                    f"limite, oppure verifica quale sia il vero vincolo — superficie "
+                    f"disponibile o potenza di connessione in immissione."
+                    .replace(",", "."))
+            if _best["area_ibr"] > 0:
+                st.caption(
+                    f"I moduli ibridi contribuiscono con "
+                    f"**{(_ibr_el_u * _best['area_ibr']).sum():,.0f} MWh/a elettrici** e "
+                    f"**{_best['calore_mwh']:,.0f} MWh/a termici**, questi ultimi "
+                    f"valorizzati {_val_cal_el} €/MWh come calore che le pompe non "
+                    f"devono più produrre. Senza contare il calore l'ibrido non "
+                    f"risulterebbe mai conveniente rispetto al fotovoltaico."
+                    .replace(",", "."))
+
+            # --- confronto delle configurazioni esplorate ---
+            _df_p = pd.DataFrame([{
+                "Ibridi (m²)": r["area_ibr"], "FV (kWp)": r["kwp"],
+                "Accumulo (MWh)": r["batt"],
+                "Copertura (%)": round(r["res"]["copertura_pct"], 1),
+                "Autoconsumo (%)": round(r["res"]["autoconsumo_pct"], 1),
+                "Investimento (k€)": round(r["capex"] / 1000),
+                "Costo energia (k€/a)": round(r["costo"] / 1000),
+                "Risparmio (k€/a)": round(r["risparmio"] / 1000),
+            } for r in _prove]).sort_values("Costo energia (k€/a)")
+
+            _fig_o = go.Figure()
+            for _b in sorted({r["batt"] for r in _prove}):
+                _sel = sorted([r for r in _prove if r["batt"] == _b],
+                              key=lambda r: r["res"]["copertura_pct"])
+                _fig_o.add_trace(go.Scatter(
                     x=[r["res"]["copertura_pct"] for r in _sel],
-                    y=[r["netto"] / 1000 for r in _sel],
-                    mode="lines+markers", name=(f"{_b:.0f} MWh" if _b else "senza batteria"),
-                    hovertemplate="%{x:.0f} %% copertura<br>%{y:.0f} k€/a<extra></extra>"))
-            _f_ott.add_hline(y=0, line_dash="dot", line_color="#888")
-            _f_ott.update_layout(height=380, xaxis_title="Copertura del consumo (%)",
-                                 yaxis_title="Beneficio netto (k€/anno)",
+                    y=[r["costo"] / 1000 for r in _sel], mode="lines+markers",
+                    name=(f"{_b:.1f} MWh" if _b else "senza accumulo"),
+                    hovertemplate="copertura %{x:.0f}%%<br>%{y:.0f} k€/a<extra></extra>"))
+            _fig_o.add_hline(y=_costo_base / 1000, line_dash="dot", line_color="#888",
+                             annotation_text="solo rete", annotation_position="right")
+            _fig_o.add_trace(go.Scatter(
+                x=[_best["res"]["copertura_pct"]], y=[_best["costo"] / 1000],
+                mode="markers", name="ottimo",
+                marker=dict(size=16, color=COLOR_OFFERTA, symbol="star")))
+            _fig_o.update_layout(height=400, xaxis_title="Copertura del consumo (%)",
+                                 yaxis_title="Costo dell'energia (k€/anno)",
                                  legend=dict(orientation="h", yanchor="bottom", y=1.02),
                                  margin=dict(t=30, b=10))
-            st.plotly_chart(_f_ott, width="stretch")
-            st.caption("Ogni curva è una taglia di accumulo, ogni punto una potenza "
-                       "fotovoltaica. Dove la curva scende sotto lo zero l'impianto non "
-                       "si ripaga: si sta producendo energia che finisce in rete a un "
-                       "prezzo inferiore a quello di acquisto.")
+            st.plotly_chart(_fig_o, width="stretch")
+            st.caption("Ogni punto è una configurazione. La linea tratteggiata è il "
+                       "costo senza alcun impianto: tutto ciò che sta sotto conviene. "
+                       "La curva ha un minimo perché oltre una certa taglia si produce "
+                       "solo eccedenza, che qui non è valorizzata.")
 
-            _prod_h = _el_ibrido + _pv_unit * _kwp
+            with st.expander("Tutte le configurazioni esplorate"):
+                st.dataframe(_df_p, width="stretch", hide_index=True)
+                st.download_button("⬇️ Scarica (CSV)",
+                                   data=_df_p.to_csv(index=False).encode("utf-8"),
+                                   file_name="maniago_ottimizzazione_elettrica.csv",
+                                   mime="text/csv", key="el_dl_opt")
 
-        # =============================================================
-        # 4. ANDAMENTO NELL'ANNO
-        # =============================================================
-        if _agg_pv or _res0["E_produzione"] > 0:
+            # =============================================================
+            # 4. RIALLINEAMENTO DEL BILANCIO TERMICO
+            # =============================================================
+            _th_ott = float((_ibr_th_u * _best["area_ibr"]).sum())
+            _th_attuale = float(np.asarray(
+                st.session_state.get("_dim_serie_el_solare_term",
+                                     np.zeros(len(HOURS_2024)))).sum())
+            if _best["area_ibr"] > 0:
+                st.divider()
+                st.markdown("#### \U0001F504 Riallineamento del bilancio termico")
+                _scarto_th = abs(_th_ott - _th_attuale)
+                if _scarto_th > max(_th_ott * 0.02, 1.0):
+                    st.warning(
+                        f"I moduli ibridi trovati qui produrrebbero "
+                        f"**{_th_ott:,.0f} MWh/a** di calore, mentre il dimensionamento "
+                        f"termico ne sta considerando {_th_attuale:,.0f}. I due conti "
+                        f"sono disallineati: le pompe di calore risultano più grandi "
+                        f"del necessario e il costo del calore è sovrastimato."
+                        .replace(",", "."))
+                    if st.button("Trasferisci al dimensionamento termico",
+                                 key="el_btn_allinea", type="primary"):
+                        st.session_state["_el_ibrido_da_elettrico"] = {
+                            "attivo": True, "area_m2": float(_best["area_ibr"]),
+                            "modello": _mod_ibr, "T_esercizio": float(_tf_ibr),
+                            "costo_pannello": float(_costo_ibr),
+                            "serie_termica": _ibr_th_u * _best["area_ibr"],
+                            "serie_elettrica": _ibr_el_u * _best["area_ibr"],
+                            "termico_mwh": _th_ott,
+                        }
+                        st.success("Trasferito. Torna nella scheda **Dimensionamento** "
+                                   "e rilancia il dimensionamento: il calore degli "
+                                   "ibridi è ora incluso.")
+                        st.rerun()
+                    st.caption("Il calore degli ibridi alleggerisce il carico delle "
+                               "pompe, che a loro volta determinano il consumo "
+                               "elettrico calcolato qui: i due conti vanno chiusi "
+                               "insieme. Trasferendo e rilanciando il dimensionamento "
+                               "una volta si arriva quasi sempre a convergenza.")
+                else:
+                    st.success("✅ Bilancio termico allineato: il dimensionamento sta "
+                               "già considerando il calore di questi moduli ibridi.")
+
+            # =============================================================
+            # 5. ANDAMENTO NELL'ANNO
+            # =============================================================
+            _res_el = _best["res"]
             st.divider()
             st.markdown("#### Come si distribuisce nell'anno")
             _mese = HOURS_2024.month.values
@@ -6175,15 +6228,18 @@ with tab_elettrico:
                        "d'estate: è questo sfasamento a limitare l'autoconsumo, molto "
                        "più della taglia dell'accumulo.")
 
-        st.session_state["_el_risultato"] = {
-            "consumo_mwh": round(_res_el["E_consumo"], 1),
-            "produzione_mwh": round(_res_el["E_produzione"], 1),
-            "autoconsumo_mwh": round(_res_el["E_autoconsumo"], 1),
-            "immesso_mwh": round(_res_el["E_immesso"], 1),
-            "prelevato_mwh": round(_res_el["E_prelevato"], 1),
-            "copertura_pct": round(_res_el["copertura_pct"], 1),
-            "kwp_pv": float(_kwp), "batteria_mwh": float(_batt),
-        }
+            st.session_state["_el_risultato"] = {
+                "consumo_mwh": round(_res_el["E_consumo"], 1),
+                "produzione_mwh": round(_res_el["E_produzione"], 1),
+                "autoconsumo_mwh": round(_res_el["E_autoconsumo"], 1),
+                "immesso_mwh": round(_res_el["E_immesso"], 1),
+                "prelevato_mwh": round(_res_el["E_prelevato"], 1),
+                "copertura_pct": round(_res_el["copertura_pct"], 1),
+                "kwp_pv": float(_best["kwp"]), "batteria_mwh": float(_best["batt"]),
+                "ibrido_m2": float(_best["area_ibr"]),
+                "costo_energia_eur": round(_best["costo"]),
+                "capex_eur": round(_best["capex"]),
+            }
 
 
 
