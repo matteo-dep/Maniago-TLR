@@ -99,4 +99,10 @@ Se vuoi un solo branch pulito:
    private e condominiali (prima il picco calava aggiungendo utenze).
 8. **Adduzioni senza OSM**: le lunghezze stimate (linea d'aria × 1,35) entrano
    comunque nell'analisi economica, segnalate come stima (prima valevano zero).
+10. **Mappa stradale incompleta**: la copia salvata della mappa OSM
+   (`maniago_strade_cache.json`) ora registra il riquadro scaricato e viene
+   riscaricata se non copre l'area di studio (le versioni vecchie, con raggio
+   1,5 km, lasciavano fuori il centro). Il raggio passa a 3,6 km per includere
+   Fratta, la Biblioteca e tutti i privati. Gli edifici si agganciano solo alla
+   rete stradale principale, non a frammenti isolati (cortili, parcheggi).
 9. Colonna "Pozzi" del confronto sorgenti resa omogenea (errore Arrow).

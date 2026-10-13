@@ -278,7 +278,7 @@ MAX_SNAP_M = 120.0
 # industriale in qualunque configurazione.
 GRAFO_CENTRO_LAT = 46.1495
 GRAFO_CENTRO_LON = 12.7175
-GRAFO_RAGGIO_KM = 3.0
+GRAFO_RAGGIO_KM = 3.6   # copre Fratta e Biblioteca (46,177 N) e tutti i privati
 
 def calcola_sottocentrale(bmap_df):
     """Calcola la sottocentrale come punto intermedio tra il baricentro
@@ -616,14 +616,31 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
     # precedente ha salvato una risposta vuota (Overpass sovraccarico, limite di
     # richieste raggiunto), il file resterebbe corrotto e ogni avvio successivo
     # fallirebbe allo stesso modo. In quel caso si riscarica.
+    # La cache registra il riquadro scaricato. Una cache senza riquadro, o con
+    # un riquadro che non copre quello richiesto, viene da una versione
+    # precedente (centro mobile, raggio 1,5 km): usarla lasciava fuori dal
+    # grafo interi quartieri, i cui edifici risultavano irraggiungibili e
+    # venivano collegati con lunghi tratti in linea d'aria.
+    bb_rich = _bbox(centro_lat, centro_lon, raggio_km)
+
+    def _copre(c):
+        _b = c.get("_bbox") if isinstance(c, dict) else None
+        if not _b or len(_b) != 4:
+            return False
+        return (_b[0] <= bb_rich[0] + 1e-6 and _b[1] <= bb_rich[1] + 1e-6
+                and _b[2] >= bb_rich[2] - 1e-6 and _b[3] >= bb_rich[3] - 1e-6)
+
     data = None
     err = None
+    _vecchia = None
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 _c = json.load(f)
-            if _conta_nodi(_c) > 0:
+            if _conta_nodi(_c) > 0 and _copre(_c):
                 data = _c
+            elif _conta_nodi(_c) > 0:
+                _vecchia = _c          # tenuta come ripiego se il download fallisce
             else:
                 os.remove(cache_file)
         except Exception:
@@ -635,17 +652,22 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
 
     if data is None:
         data, err = _osm_download_strade(centro_lat, centro_lon, raggio_km)
-        if data is None:
-            return None, err
-        if _conta_nodi(data) == 0:
-            return None, ("Overpass ha risposto senza dati: di solito è un limite "
-                          "di richieste temporaneo. Riprova fra qualche minuto.")
-        # si salva solo una risposta valida
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+        if data is None or _conta_nodi(data) == 0:
+            if _vecchia is not None:
+                data = _vecchia        # meglio una mappa parziale che nessuna
+            elif data is None:
+                return None, err
+            else:
+                return None, ("Overpass ha risposto senza dati: di solito è un limite "
+                              "di richieste temporaneo. Riprova fra qualche minuto.")
+        else:
+            data["_bbox"] = list(bb_rich)
+            # si salva solo una risposta valida
+            try:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+            except Exception:
+                pass
 
     # parse: nodi + strade. Il filtro sui tipi di viabilita' si applica qui e
     # non nella query, perche' un'espressione regolare lunga rallenta Overpass
@@ -701,14 +723,48 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
         strade_dense.append(nuova)
     strade = strade_dense
 
-    node_ids = list(nodi.keys())
+    # ------------------------------------------------------------------
+    # COMPONENTE CONNESSA PRINCIPALE
+    # Il grafo OSM contiene frammenti isolati: viabilita' interna di cortili e
+    # parcheggi, strade private collegate solo da sentieri (esclusi dal filtro),
+    # tratti tagliati al bordo del riquadro. Se un edificio "aggancia" il nodo
+    # piu' vicino e questo sta su un frammento, il percorso verso la centrale
+    # non esiste. Lo snap si fa quindi solo sui nodi della componente piu'
+    # grande, che e' la rete stradale vera e propria.
+    # ------------------------------------------------------------------
+    _padre = {}
+
+    def _trova(x):
+        while _padre.get(x, x) != x:
+            _padre[x] = _padre.get(_padre[x], _padre[x])
+            x = _padre[x]
+        return x
+
+    for way in strade:
+        _w = [n for n in way if n in nodi]
+        for a, b in zip(_w[:-1], _w[1:]):
+            ra, rb = _trova(a), _trova(b)
+            if ra != rb:
+                _padre[ra] = rb
+    _comp = {}
+    for way in strade:
+        for n in way:
+            if n in nodi:
+                _comp.setdefault(_trova(n), set()).add(n)
+    _principale = max(_comp.values(), key=len) if _comp else set(nodi.keys())
+    n_frammenti = max(len(_comp) - 1, 0)
+
+    node_ids = [i for i in nodi.keys() if i in _principale]
     _lat_nodi = np.array([nodi[i][0] for i in node_ids], dtype=float)
     _lon_nodi = np.array([nodi[i][1] for i in node_ids], dtype=float)
     _x_nodi, _y_nodi = _latlon_a_xy(_lat_nodi, _lon_nodi)
     pts = np.column_stack([_x_nodi, _y_nodi])
     kd = cKDTree(pts)
     return {"nodi": nodi, "strade": strade, "kd": kd,
-            "node_ids": node_ids, "pts_xy": pts}, None
+            "node_ids": node_ids, "pts_xy": pts,
+            "n_frammenti": n_frammenti,
+            "bbox": data.get("_bbox"),
+            "copre_richiesta": _copre(data)}, None
 
 
 def build_grafo_stradale(strade_data):
@@ -3648,6 +3704,11 @@ with tab_domanda:
                                               raggio_km=GRAFO_RAGGIO_KM) if usa_strade else (None, None)
             _strade, _osm_err = _strade_res if isinstance(_strade_res, tuple) else (_strade_res, None)
             _uso_osm = _strade is not None
+            if _uso_osm and not _strade.get("copre_richiesta", True):
+                st.warning("⚠️ La mappa stradale in uso è una copia salvata che non copre "
+                           "tutta l'area di studio (il nuovo download non è riuscito). "
+                           "Gli edifici fuori dal riquadro risultano collegati in linea "
+                           "d'aria: riprova il download o riavvia l'app.")
             if usa_strade and not _uso_osm:
                 _msg_err = f" — causa: `{_osm_err}`" if _osm_err else ""
                 st.warning(f"⚠️ Rete stradale non disponibile{_msg_err}. "
@@ -3704,7 +3765,8 @@ with tab_domanda:
                             else:
                                 with open("maniago_strade_cache.json", "w",
                                           encoding="utf-8") as _f:
-                                    json.dump({"elements": _els}, _f)
+                                    json.dump({"elements": _els,
+                                               "_bbox": list(_bbm)}, _f)
                                 try:
                                     carica_grafo_strade.clear()
                                 except Exception:
