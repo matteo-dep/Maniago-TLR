@@ -7,18 +7,18 @@ App Streamlit unica per domanda, offerta di calore di scarto, dimensionamento
 
 ```bash
 pip install -r requirements.txt
-streamlit run provaTLRManiago.py
+streamlit run "TLR 2.py"
 ```
 
 Su **Streamlit Cloud**: nelle impostazioni dell'app (Manage app → Settings) il
-*Main file path* deve puntare a `provaTLRManiago.py`. Se prima era impostato su
+*Main file path* deve puntare a `TLR 2.py`. Se prima era impostato su
 `app.py`, cambialo qui — era questa la causa dell'app che eseguiva codice vecchio.
 
 ## Cosa contiene la root (i soli file che l'app legge)
 
 | File | A cosa serve |
 |------|--------------|
-| `provaTLRManiago.py` | l'applicazione (unico script, tutto calcolato live) |
+| `TLR 2.py` | l'applicazione (unico script, tutto calcolato live) |
 | `requirements.txt` | dipendenze |
 | `maniago_domanda_edifici.csv` | anagrafica edifici: zona, tipologia, tipo utenza (pubblico/privato) |
 | `maniago_domanda_oraria_8760h_HDD_reale.csv` | domanda oraria per edificio, separata riscaldamento/ACS |
@@ -75,3 +75,28 @@ Se vuoi un solo branch pulito:
 3. Su Streamlit Cloud verifica che il *Main file* sia `provaTLRManiago.py`.
 4. Se non ti serve più `prova`, cancellalo (Settings → Branches, o
    `git push origin --delete prova`).
+
+## Correzioni del 13/10/2026
+
+1. **Edifici "esclusi per densità < 0.0"**: gli edifici che il grafo stradale OSM
+   non raggiunge non vengono più etichettati come potati dalla soglia. Restano
+   serviti con un allaccio in linea d'aria × tortuosità (incluso in lunghezza e
+   CAPEX della rete) e sono elencati in un avviso dedicato.
+2. **Coordinate mancanti**: corretti in `edifici_pubblici_coordinate.csv` i nomi
+   di "Asilo Nido / Scuola materna (via Campagna 50)" e "Sede Agenzia delle
+   Entrate e Centro per l'impiego"; l'abbinamento ora ignora maiuscole e spazi e
+   gli edifici pubblici ancora senza coordinate sono segnalati per nome.
+3. **Dimensionamento ed Economia sugli edifici SERVITI**: i pubblici potati o
+   senza coordinate non entrano più in domanda, taglie e ricavi. I condomini
+   applicano consumo per unità e tasso di adesione anche nel dimensionamento.
+4. **Privati coerenti fra rete e dimensionamento**: la quota nel buffer si calcola
+   sull'energia (non sul numero di edifici); sottostazioni, utenze, quote fisse e
+   contemporaneità contano i privati che si allacciano davvero (buffer × tasso).
+5. **Margine anno 1** comprende l'acquisto del calore di scarto.
+6. **Calore rinnovabile / totale fornito**: il calore della HP bassa T non è più
+   contato due volte al denominatore.
+7. **Picco della dorsale**: la contemporaneità QM si applica alle sole utenze
+   private e condominiali (prima il picco calava aggiungendo utenze).
+8. **Adduzioni senza OSM**: le lunghezze stimate (linea d'aria × 1,35) entrano
+   comunque nell'analisi economica, segnalate come stima (prima valevano zero).
+9. Colonna "Pozzi" del confronto sorgenti resa omogenea (errore Arrow).

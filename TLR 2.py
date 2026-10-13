@@ -808,8 +808,12 @@ def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
     import networkx as nx
     # 1) albero completo
     archi_full, _, _ = albero_steiner_su_strade(G, nodi_target, radice_nodo)
+    # target_esclusi contiene SOLO i target potati per densita'. Quelli che il
+    # grafo non riesce a raggiungere non compaiono ne' fra i serviti ne' fra gli
+    # esclusi: e' il chiamante a decidere come collegarli.
     if not archi_full:
-        return [], 0.0, set(), set(nodi_target)
+        _serv0 = {radice_nodo} & set(nodi_target)
+        return [], 0.0, _serv0, set()
 
     # 2) costruisco l'albero come grafo diretto radicato in 'radice_nodo'
     #    (BFS/DFS dalla radice sull'albero non orientato per orientarlo)
@@ -817,8 +821,8 @@ def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
     for a, b, w in archi_full:
         T.add_edge(a, b, weight=w)
     if radice_nodo not in T:
-        # la radice non e' entrata (target isolato): tutto potato
-        return [], 0.0, set(), set(nodi_target)
+        # la radice non e' entrata: nessun target raggiungibile sul grafo
+        return [], 0.0, set(), set()
 
     parent = {radice_nodo: None}
     order = []
@@ -2221,7 +2225,15 @@ def load_data():
     buildings = pd.read_csv("maniago_domanda_edifici.csv")
     try:
         _coord = pd.read_csv("edifici_pubblici_coordinate.csv")[["edificio", "lat", "lon", "indirizzo"]]
-        buildings = buildings.merge(_coord, on="edificio", how="left")
+        # Abbinamento per nome normalizzato (maiuscole e spazi ignorati): una
+        # differenza di sola grafia faceva perdere le coordinate all'edificio,
+        # che restava nei consumi ma spariva dal tracciato della rete.
+        def _norm_nome(x):
+            return " ".join(str(x).casefold().split())
+        _coord["_k"] = _coord["edificio"].map(_norm_nome)
+        _coord = _coord.drop_duplicates("_k").drop(columns=["edificio"])
+        buildings["_k"] = buildings["edificio"].map(_norm_nome)
+        buildings = buildings.merge(_coord, on="_k", how="left").drop(columns=["_k"])
     except Exception:
         buildings["lat"] = np.nan
         buildings["lon"] = np.nan
@@ -3122,11 +3134,20 @@ with tab_domanda:
         liv_est = 6 if sel_priv_zone else 0
 
         # --- P5: conteggio utenze private/condominiali per la contemporaneita QM ---
+        # Si contano le utenze che si ALLACCIANO davvero: i privati in base al
+        # tasso di allacciamento, i condomini in base al tasso di adesione.
+        # Contare tutti i potenziali sovrastimava la contemporaneita' (e quindi
+        # sottostimava il picco di dimensionamento).
         _n_priv_reale = 0
+        _fatt_all_qm = (fattore_correzione / 100.0) if sel_priv_zone else 1.0
         if sel_priv_zone and not privati.empty:
-            _n_priv_reale += int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
+            _n_priv_reale += int(round(len(privati[privati["cluster"].isin(sel_priv_zone)])
+                                       * _fatt_all_qm))
+        _n_cond_uni = 0
         if sel_cond_zone and not condomini.empty:
-            _n_priv_reale += int(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum())
+            _n_cond_uni = int(round(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum()
+                                    * tasso_cond / 100.0))
+            _n_priv_reale += _n_cond_uni
         # Se un buffer sul tracciato ha ristretto i privati agganciabili, correggo
         # anche il conteggio utenze per la contemporaneita QM.
         _buff_records_qm = st.session_state.get("_dom_priv_in_buffer", None)
@@ -3134,10 +3155,7 @@ with tab_domanda:
             _n_priv_zone_tot = int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
             if _n_priv_zone_tot > 0:
                 # scalo la parte "privati" (non i condomini) alla quota buffer
-                _n_cond_uni = 0
-                if sel_cond_zone and not condomini.empty:
-                    _n_cond_uni = int(condomini[condomini["cluster"].isin(sel_cond_zone)]["unita"].sum())
-                _n_priv_reale = int(round(len(_buff_records_qm))) + _n_cond_uni
+                _n_priv_reale = int(round(len(_buff_records_qm) * _fatt_all_qm)) + _n_cond_uni
         st.session_state["_dom_n_privati"] = _n_priv_reale
         if _n_priv_reale > 1:
             _f_sim_ui = coeff_simultaneita_QM(_n_priv_reale)
@@ -3183,14 +3201,20 @@ with tab_domanda:
     # il fattore di allacciamento in modo che rappresenti la quota realmente
     # servita rispetto al totale della zona. Aggregando su zona/anello questo
     # e l'unico modo di rispettare il vincolo geometrico senza cambiare i dati.
+    # La quota si calcola sull'ENERGIA e non sul numero di edifici: i privati
+    # lungo il tubo sono in media piu' grandi di quelli della zona, quindi la
+    # quota per conteggio sottostimava la domanda rispetto a quella che la rete
+    # dichiara di servire (es. 1.893 contro 2.146 MWh/a).
     _buff_records = st.session_state.get("_dom_priv_in_buffer", None)
-    _priv_zone_totali = 0
-    _priv_zone_buffer = 0
+    _priv_zone_totali = 0.0
+    _priv_zone_buffer = 0.0
     if sel_priv_zone and not privati.empty:
-        _priv_zone_totali = int(len(privati[privati["cluster"].isin(sel_priv_zone)]))
+        _priv_zone_totali = float(privati.loc[privati["cluster"].isin(sel_priv_zone),
+                                              "consumo_annuo_MWh"].sum())
     if _buff_records is not None:
-        _priv_zone_buffer = int(len(_buff_records))
-    quota_buffer = (_priv_zone_buffer / _priv_zone_totali
+        _priv_zone_buffer = float(sum(float(r.get("consumo_annuo_MWh", 0.0) or 0.0)
+                                      for r in _buff_records))
+    quota_buffer = (min(_priv_zone_buffer / _priv_zone_totali, 1.0)
                     if _priv_zone_totali > 0 and _buff_records is not None else 1.0)
     fattore_effettivo = (fattore_correzione / 100.0) * quota_buffer
 
@@ -3212,6 +3236,15 @@ with tab_domanda:
     fatt_c = (mwh_unita / MWH_PER_UNITA) * (tasso_cond / 100.0)
     dom.loc[is_cond, "MWh_riscaldamento"] = dom.loc[is_cond, "MWh_riscaldamento"] * fatt_c
     dom.loc[is_cond, "MWh_ACS"] = dom.loc[is_cond, "MWh_ACS"] * fatt_c
+
+    # Edifici effettivamente SERVITI dalla rete. Valore iniziale = selezionati;
+    # la sezione del tracciato, piu' sotto, lo restringe togliendo i pubblici
+    # potati o privi di coordinate. Dimensionamento e Analisi economica leggono
+    # questo elenco, cosi' ricavi e taglie si riferiscono al calore che la rete
+    # tracciata consegna davvero e non a quello solo selezionato.
+    st.session_state["_dom_edifici_serviti"] = list(selected_buildings)
+    st.session_state["_dom_fattore_condomini"] = fatt_c
+    st.session_state["_dom_esclusi_rete"] = []
 
     with col_contenuto:
         if dom.empty or not (show_risc or show_acs):
@@ -3285,9 +3318,18 @@ with tab_domanda:
                     height=430, margin=dict(t=10, b=0, l=0, r=0),
                     legend=dict(orientation="h", yanchor="bottom", y=1.01))
                 st.plotly_chart(fig_map, width="stretch")
-                _senza = bsel.shape[0] - bmap.shape[0]
-                if _senza > 0:
-                    st.caption(f"{_senza} edifici senza coordinate non mostrati.")
+                _pub_senza = bsel[(bsel["tipo_utenza"] == "Pubblico")
+                                  & (bsel["lat"].isna() | bsel["lon"].isna())]
+                if not _pub_senza.empty:
+                    st.warning(
+                        f"⚠️ {len(_pub_senza)} edifici pubblici selezionati non hanno "
+                        f"coordinate in `edifici_pubblici_coordinate.csv` (controlla che "
+                        f"il nome coincida con quello del file della domanda): "
+                        + ", ".join(f"**{e}**" for e in _pub_senza["edificio"])
+                        + ". Non possono essere collegati al tracciato e restano esclusi "
+                          "da dimensionamento e analisi economica ("
+                        + f"{_pub_senza['consumo_annuo_MWh'].sum():,.0f}".replace(",", ".")
+                        + " MWh/a).")
 
                 st.markdown("##### \U0001F525 Densità della domanda termica")
                 dc1, dc2 = st.columns([2, 1])
@@ -3726,8 +3768,16 @@ with tab_domanda:
                 # e comunque entro il limite di snap.
                 _um_lat, _um_lon = [], []
                 _len_ultimi = 0.0
+                _len_linea_aria = 0.0
                 _obb_servi_mask = []
                 _obb_esclusi_info = []
+                _non_raggiunti = []
+                # Nodi a cui si puo' agganciare un edificio non raggiungibile sul
+                # grafo: quelli del tubo gia' posato, piu' la sottocentrale.
+                _nodi_aggancio = list(_nodi_tubo | {_rad_nodo})
+                _xy_aggancio = _latlon_a_xy(
+                    np.array([_strade["nodi"][k][0] for k in _nodi_aggancio]),
+                    np.array([_strade["nodi"][k][1] for k in _nodi_aggancio]))
                 for i in range(len(_obb)):
                     _n = _nodi_obb[i + 1]
                     _d_snap = float(_dsnap_obb[i + 1])
@@ -3742,15 +3792,35 @@ with tab_domanda:
                         _um_lon += [_lon_ed, _lon_n, None]
                         _len_ultimi += _d_snap
                         _obb_servi_mask.append(True)
-                    else:
-                        # unico motivo di esclusione: convenienza economica del ramo
+                    elif _n in _target_escl:
+                        # potato davvero dalla soglia di densita' lineare del ramo
                         _obb_servi_mask.append(False)
                         _obb_esclusi_info.append({"edificio": _lab,
                                                   "tipo": _tipo,
                                                   "MWh/a": round(_mwh, 1),
                                                   "motivo": "sotto soglia densità",
                                                   "lat": _lat_ed, "lon": _lon_ed})
-                _len_pub_t = _len_pub_osm + _len_ultimi
+                    else:
+                        # NON raggiungibile sul grafo stradale (componente OSM
+                        # isolata, strade private o interne non mappate). In
+                        # precedenza finiva fra gli "esclusi per densita'" anche
+                        # con soglia zero, pur restando nei consumi. Coerentemente
+                        # con la regola "nessuna esclusione per motivi
+                        # cartografici", si collega in linea d'aria al punto piu'
+                        # vicino del tubo, con la tortuosita' impostata.
+                        _xe, _ye = _latlon_a_xy(np.array([_lat_ed]), np.array([_lon_ed]))
+                        _dd = np.hypot(_xy_aggancio[0] - _xe[0], _xy_aggancio[1] - _ye[0])
+                        _k = int(np.argmin(_dd))
+                        _nk = _nodi_aggancio[_k]
+                        _lat_k, _lon_k = _strade["nodi"][_nk]
+                        _l_aria = float(_dd[_k]) * tort
+                        _len_linea_aria += _l_aria
+                        _archi_pub.append(((_lat_k, _lon_k), (_lat_ed, _lon_ed), _l_aria))
+                        _obb_servi_mask.append(True)
+                        _non_raggiunti.append({"edificio": _lab, "tipo": _tipo,
+                                               "MWh/a": round(_mwh, 1),
+                                               "allaccio in linea d'aria (m)": round(_l_aria)})
+                _len_pub_t = _len_pub_osm + _len_ultimi + _len_linea_aria
             else:
                 # --- FALLBACK: MST + tortuosita (nessuna potatura per densita') ---
                 _archi_pub, _len_pub = mst_archi(_obb["lat"].values, _obb["lon"].values,
@@ -3761,6 +3831,7 @@ with tab_domanda:
                 _obb_servi_mask = [True] * len(_obb)
                 _obb_esclusi_info = []
                 _snap_lunghi = []
+                _non_raggiunti = []
 
             # --- 2. Buffer privati: aggancio via strade se disponibili ---
             _priv_in = pd.DataFrame()
@@ -4003,6 +4074,23 @@ with tab_domanda:
                     st.dataframe(_df_esc[_cols], width="stretch", hide_index=True)
 
             # --- nota tecnica: allacci lontani dalla viabilita' mappata ---
+            if _uso_osm and _non_raggiunti:
+                _mwh_nr = sum(r["MWh/a"] for r in _non_raggiunti)
+                _m_nr = sum(r["allaccio in linea d'aria (m)"] for r in _non_raggiunti)
+                _mwh_nr_s = f"{_mwh_nr:,.0f}".replace(",", ".")
+                _m_nr_s = f"{_m_nr:,.0f}".replace(",", ".")
+                st.info(
+                    f"🧭 **{len(_non_raggiunti)} edifici non raggiungibili sul grafo "
+                    f"stradale** ({_mwh_nr_s} MWh/a): la mappa OSM non li collega al "
+                    f"resto della rete (strade interne o private non mappate, tratti "
+                    f"isolati). Restano serviti con un allaccio in linea d'aria × "
+                    f"tortuosità, per {_m_nr_s} m complessivi già compresi nella "
+                    f"lunghezza e nel costo della rete. Verifica il percorso reale sul "
+                    f"posto.")
+                with st.expander(f"📋 Dettaglio {len(_non_raggiunti)} edifici collegati in linea d'aria"):
+                    st.dataframe(pd.DataFrame(_non_raggiunti), width="stretch",
+                                 hide_index=True)
+
             if _uso_osm and _snap_lunghi:
                 with st.expander(f"ℹ️ {len(_snap_lunghi)} edifici distanti dalla viabilità mappata "
                                  f"(sono comunque collegati)"):
@@ -4024,25 +4112,56 @@ with tab_domanda:
             _bmap_srv_e = bmap[~bmap["edificio"].isin(_nomi_pub_esclusi)] if not bmap.empty else bmap
             _E_pub = float(_bmap_srv_e["consumo_annuo_MWh"].sum()) if not _bmap_srv_e.empty else 0.0
             _E_cond = 0.0
+            _E_cond_tutti = 0.0
             _n_cond_serviti = 0
+            _n_cond_unita_all = 0
             if sel_cond_zone and not condomini.empty:
                 _cond_sel = condomini[condomini["cluster"].isin(sel_cond_zone)]
+                _E_cond_tutti = float(_cond_sel["unita"].sum()) * mwh_unita * tasso_cond / 100.0
                 if _uso_osm and _nomi_pub_esclusi:
                     _cond_sel = _cond_sel[~_cond_sel["denominazione"].fillna("").astype(str).isin(_nomi_pub_esclusi)]
                 _E_cond = float(_cond_sel["unita"].sum()) * mwh_unita * tasso_cond / 100.0
                 _n_cond_serviti = len(_cond_sel)
+                _n_cond_unita_all = int(round(float(_cond_sel["unita"].sum()) * tasso_cond / 100.0))
             _E_priv = float(_priv_in["consumo_annuo_MWh"].sum()) * _fatt_priv if not _priv_in.empty else 0.0
             _E_tot = _E_pub + _E_cond + _E_priv
-            _n_utenze_tot = (len(_bmap_srv_e) + _n_cond_serviti
-                             + (len(_priv_in) if not _priv_in.empty else 0))
+            # Privati che si allacciano davvero: il tasso di allacciamento riduce
+            # l'energia, e deve ridurre allo stesso modo il numero di utenze (e
+            # quindi sottostazioni, quote fisse e contributi di allacciamento).
+            _n_priv_buffer = len(_priv_in) if not _priv_in.empty else 0
+            _n_priv_allacciati = int(round(_n_priv_buffer * _fatt_priv))
+            _n_utenze_tot = len(_bmap_srv_e) + _n_cond_serviti + _n_priv_allacciati
+
+            # --- elenco degli edifici SERVITI, per Dimensionamento ed Economia ---
+            _pub_serviti_set = set(_bmap_srv_e["edificio"]) if not _bmap_srv_e.empty else set()
+            _tipo_di = buildings.set_index("edificio")["tipo_utenza"].to_dict()
+            st.session_state["_dom_edifici_serviti"] = [
+                e for e in selected_buildings
+                if _tipo_di.get(e) != "Pubblico" or e in _pub_serviti_set]
+            _esclusi_rete = [e for e in selected_buildings
+                             if _tipo_di.get(e) == "Pubblico" and e not in _pub_serviti_set]
+            st.session_state["_dom_esclusi_rete"] = _esclusi_rete
+            # condomini: la domanda e' aggregata per zona, quindi i condomini
+            # esclusi si tolgono scalando il fattore sulla quota di energia servita
+            st.session_state["_dom_fattore_condomini"] = (
+                fatt_c * (_E_cond / _E_cond_tutti) if _E_cond_tutti > 0 else fatt_c)
+
+            def _picco_rete_kw(ore_eq):
+                """Picco alla partenza della dorsale. La contemporaneita' QM
+                si applica solo alle utenze private e condominiali, come nel
+                Dimensionamento: applicarla anche ai grandi edifici pubblici
+                faceva CALARE il picco aggiungendo utenze."""
+                _n_res = _n_priv_allacciati + _n_cond_unita_all
+                _f_res = coeff_simultaneita_QM(_n_res) if _n_res > 1 else 1.0
+                return (potenza_da_energia(_E_pub, ore_eq, 1.0)
+                        + potenza_da_energia(_E_cond + _E_priv, ore_eq, _f_res)), _f_res
 
             # ---- CAPEX della rete, differenziato per diametro ----
             # La dorsale porta l'intera potenza, i rami di allaccio solo quella
             # delle utenze che servono: applicare a tutta la rete il costo della
             # dorsale sovrastimerebbe sensibilmente gli allacci.
             _dT_r = max(T_mandata_ideale - T_ritorno_ideale, 1)
-            _f_sim_r = coeff_simultaneita_QM(max(_n_utenze_tot, 1))
-            _P_dors = potenza_da_energia(_E_tot, 1900.0, _f_sim_r)
+            _P_dors, _f_sim_r = _picco_rete_kw(1900.0)
             _dn_d0, _, _, _ = dimensiona_dn(_P_dors, _dT_r, 1.5)
             _c_dors = costo_condotta_eur_m(_dn_d0, costo_m_tr)
             # ramo tipo: potenza di una singola utenza, con la sua contemporaneita'
@@ -4057,8 +4176,8 @@ with tab_domanda:
                            f"{_len_stub_t / 1000:.2f} km (tortuosità {tort})")
             t2.metric("Utenze totali servite",
                       f"{_n_utenze_tot}",
-                      help=f"pubblici + condomini + {len(_priv_in) if not _priv_in.empty else 0} privati nel buffer"
-                           f" (edifici sopra soglia densità)")
+                      help=f"pubblici + condomini + {_n_priv_allacciati} privati allacciati "
+                           f"({_n_priv_buffer} nel buffer × tasso di allacciamento)")
             t3.metric("CAPEX rete", f"{_capex_rete_tot / 1e6:.2f} M€",
                       help=f"dorsale DN{_dn_d0} a {_c_dors:.0f} €/m · "
                            f"allacci DN{_dn_r0} a {_c_ramo:.0f} €/m")
@@ -4083,8 +4202,8 @@ with tab_domanda:
                 st.caption(
                     f"Costo medio della rete **{_c_medio:.0f} €/m**. Il diametro degli "
                     f"allacci è calcolato sulla potenza di una singola utenza, quello "
-                    f"della dorsale sulla potenza complessiva con la contemporaneità QM "
-                    f"({_f_sim_r:.2f}). Sui piccoli diametri lo scavo pesa per la maggior "
+                    f"della dorsale sulla potenza complessiva, con la contemporaneità QM "
+                    f"({_f_sim_r:.2f}) applicata alle sole utenze private e condominiali. Sui piccoli diametri lo scavo pesa per la maggior "
                     f"parte del costo, quindi un allaccio DN{_dn_r0} non costa una "
                     f"frazione della dorsale ma circa "
                     f"{_c_ramo / max(_c_dors, 1) * 100:.0f} %.")
@@ -4154,14 +4273,12 @@ with tab_domanda:
                              f"(impostati in alto a sinistra)")
 
             # potenza di picco alla partenza della dorsale, con contemporaneita QM
-            _n_ut_dim = max(_n_utenze_tot, 1)
-            _f_sim_rete = coeff_simultaneita_QM(_n_ut_dim)
-            _P_dorsale = potenza_da_energia(_E_tot, _ore_eq, _f_sim_rete)
+            _P_dorsale, _f_sim_rete = _picco_rete_kw(_ore_eq)
             _dn_d, _dint_d, _v_d, _q_d = dimensiona_dn(_P_dorsale, _dT_rete, _v_max)
 
             _pd1, _pd2, _pd3, _pd4 = st.columns(4)
             _pd1.metric("Potenza di picco dorsale", f"{_P_dorsale:,.0f} kW".replace(",", "."),
-                        help=f"{_E_tot:,.0f} MWh/a su {_ore_eq} h · contemporaneità {_f_sim_rete:.2f}".replace(",", "."))
+                        help=f"{_E_tot:,.0f} MWh/a su {_ore_eq} h · contemporaneità {_f_sim_rete:.2f} sulle sole utenze private e condominiali".replace(",", "."))
             _pd2.metric("Diametro dorsale", f"DN {_dn_d}",
                         help=f"diametro interno {_dint_d:.1f} mm")
             _pd3.metric("Velocità effettiva", f"{_v_d:.2f} m/s")
@@ -4197,6 +4314,7 @@ with tab_domanda:
                 "densita": float(_dens),
                 "n_utenze": int(_n_utenze_tot),
                 "n_privati_agganciati": int(_n_priv_dentro),
+                "n_privati_allacciati": int(_n_priv_allacciati),
                 "buffer_m": int(buffer_m),
                 "costo_m": int(costo_m_tr),
                 "traccia_lat": _lat_l, "traccia_lon": _lon_l,
@@ -4447,16 +4565,20 @@ taglia verrebbe sottostimata.
                            (min(_lon_tutte) + max(_lon_tutte)) / 2, 13.6),
             height=470, margin=dict(t=10, b=0, l=0, r=0))
         st.plotly_chart(fig_src, width="stretch")
+        # Lunghezze delle adduzioni salvate SEMPRE, anche senza grafo stradale:
+        # prima, senza OSM, la scheda Analisi economica le contava come zero e
+        # l'allacciamento alle aziende risultava gratuito.
+        _att_len = {k: v for k, v in _len_add.items()
+                    if any(str(x).startswith(k) for x in _pw.index)}
+        st.session_state["_off_lunghezze_adduzione"] = _att_len
+        st.session_state["_off_adduzione_stimata"] = _G_off is None
         if _G_off is not None:
-            _att_len = {k: v for k, v in _len_add.items()
-                        if any(str(x).startswith(k) for x in _pw.index)}
             if _att_len:
                 st.caption("Condotte di adduzione lungo le strade: "
                            + " · ".join(f"**{k}** {v:,.0f} m".replace(",", ".")
                                         for k, v in sorted(_att_len.items(),
                                                            key=lambda x: x[1]))
                            + f" — in totale **{sum(_att_len.values()):,.0f} m**".replace(",", "."))
-                st.session_state["_off_lunghezze_adduzione"] = _att_len
         else:
             st.warning("⚠️ Rete stradale non disponibile: i collegamenti sono mostrati "
                        "in linea d'aria con tortuosità 1,35, quindi come segmenti "
@@ -4634,17 +4756,28 @@ taglia verrebbe sottostimata.
 with tab_dimensionamento:
     st.markdown("### Dimensionamento — schema a cascata (3 accumuli + 2 HP)")
 
-    edifici_dim = st.session_state.get("_dom_edifici") or \
-        buildings.loc[buildings["tipo_utenza"] == "Pubblico", "edificio"].tolist()
+    # Si dimensiona sugli edifici effettivamente SERVITI dal tracciato, non su
+    # tutti quelli selezionati: i pubblici potati o senza coordinate non hanno
+    # un tubo che li raggiunga, quindi non generano ne' domanda ne' ricavi.
+    edifici_dim = (st.session_state.get("_dom_edifici_serviti")
+                   or st.session_state.get("_dom_edifici")
+                   or buildings.loc[buildings["tipo_utenza"] == "Pubblico", "edificio"].tolist())
+    _esclusi_dim = st.session_state.get("_dom_esclusi_rete") or []
     flussi_dim = st.session_state.get("_off_flussi") or flussi["id_flusso"].tolist()
     eredita_ok = bool(st.session_state.get("_dom_edifici")) and bool(st.session_state.get("_off_flussi"))
     zone_dim = st.session_state.get("_dom_zone", [])
     fattore_priv = st.session_state.get("_dom_fattore_privato", 1.0)
+    fattore_cond = st.session_state.get("_dom_fattore_condomini", 1.0)
 
     dom_dim = domanda[domanda["edificio"].isin(edifici_dim)].copy()
     is_priv = dom_dim["tipo_utenza"] == "Privato (potenziale)"
     dom_dim.loc[is_priv, "MWh_riscaldamento"] *= fattore_priv
     dom_dim.loc[is_priv, "MWh_ACS"] *= fattore_priv
+    # i condomini prima entravano al 100 % a 9 MWh/unita', ignorando consumo per
+    # unita' e tasso di adesione impostati nella scheda Domanda
+    is_cond_d = dom_dim["tipo_utenza"] == "Condominio"
+    dom_dim.loc[is_cond_d, "MWh_riscaldamento"] *= fattore_cond
+    dom_dim.loc[is_cond_d, "MWh_ACS"] *= fattore_cond
     dom_dim_series = dom_dim.groupby("datetime")[["MWh_riscaldamento", "MWh_ACS"]].sum().sum(axis=1)
     idx_h = dom_dim_series.index
     dom_arr = dom_dim_series.values
@@ -5215,7 +5348,11 @@ with tab_dimensionamento:
     # % di calore rinnovabile/recuperato sul totale effettivamente fornito:
     #   scarto industriale recuperato + calore ambiente (suolo) + biomassa.
     #   NON conta l'elettricita di rete delle HP ne il gas fossile.
-    E_fornito = E_hot + E_alta + E_bassa + E_bk
+    # Calore consegnato alla rete. La HP bassa T NON va sommata: il suo calore
+    # entra nell'anello intermedio ed e' gia' contenuto in quello che la HP alta
+    # T consegna in mandata. Contarlo due volte abbassava la quota (58 % invece
+    # di ~77 % nello scenario dei pubblici).
+    E_fornito = E_hot + E_alta + E_bk
     E_rinnovabile = (E_scarto_tot + E_ground
                      + (E_bk if backup_tipo == "biomassa" else 0.0))
     pct_rinnovabile = E_rinnovabile / E_fornito * 100 if E_fornito > 0 else 0.0
@@ -5228,6 +5365,15 @@ with tab_dimensionamento:
                        f"**{T_int}°C**.")
         else:
             st.info(f"Valori predefiniti ({len(edifici_dim)} edifici pubblici, {len(flussi_dim)} flussi).")
+        if _esclusi_dim:
+            _mwh_escl_dim = float(buildings.loc[buildings["edificio"].isin(_esclusi_dim),
+                                                "consumo_annuo_MWh"].sum())
+            st.warning(
+                f"⚠️ {len(_esclusi_dim)} edifici pubblici selezionati non sono serviti dal "
+                f"tracciato (potati dalla soglia di densità o privi di coordinate) e sono "
+                f"esclusi dal dimensionamento: "
+                f"{_mwh_escl_dim:,.0f}".replace(",", ".") + " MWh/a. "
+                f"Dettaglio nella scheda **Domanda**.")
 
         st.info(
             f"\U0001F4C9 **Perdite di rete QM (Fig. 12.3)**: {_perd_pct:.1f} % — densità "
@@ -5242,8 +5388,9 @@ with tab_dimensionamento:
         if _quota_buf < 0.999 and _buffer_m_dim > 0:
             st.info(
                 f"\U0001F6E4\ufe0f **Buffer di tracciato**: {_buffer_m_dim} m. "
-                f"Dei privati delle zone attive, **{_quota_buf * 100:.0f} %** ({_n_priv_agg}) "
-                f"cade nel buffer del tubo pubblico e viene servito; il resto e escluso. "
+                f"Cade nel buffer del tubo pubblico il **{_quota_buf * 100:.0f} %** della "
+                f"domanda privata delle zone attive ({_n_priv_agg} edifici): solo quella, "
+                f"ridotta dal tasso di allacciamento, entra nel dimensionamento. "
                 f"Domanda dei privati e picco corretti di conseguenza."
             )
         if _n_priv > 1:
@@ -5481,7 +5628,7 @@ with tab_dimensionamento:
                     _rg.append({
                         "Sorgente": _t,
                         "Dimensione": f"{_d['quantita']:,.0f} {_d['unita']}".replace(",", "."),
-                        "Pozzi": _d["n_pozzi"] or "—",
+                        "Pozzi": str(_d["n_pozzi"]) if _d["n_pozzi"] else "—",
                         "Superficie": (f"{_s / 10000:.2f} ha" if _s >= 5000
                                        else f"{_s:,.0f} m²".replace(",", ".")),
                         "Costo (k€)": round(_d["costo"] / 1000),
@@ -6563,8 +6710,11 @@ with tab_economia:
             _r1.metric("Scambiatori e opere", f"{_costo_he_tot / 1000:,.0f} k€".replace(",", "."),
                        help=f"quotati {_costo_he_noto:,.0f} € · stimati "
                             f"{_p_senza * _costo_he_stima:,.0f} € su {_p_senza:,.0f} kW".replace(",", "."))
+            _add_stim = bool(st.session_state.get("_off_adduzione_stimata", False))
             _r2.metric("Condotte di adduzione", f"{_costo_add_tot / 1000:,.0f} k€".replace(",", "."),
-                       help=f"{_m_add:,.0f} m lungo le strade".replace(",", "."))
+                       help=(f"{_m_add:,.0f} m in linea d'aria × 1,35 (rete stradale non "
+                             f"disponibile: stima)" if _add_stim
+                             else f"{_m_add:,.0f} m lungo le strade").replace(",", "."))
             _r3.metric("Totale allacciamenti", f"{capex_allacci / 1e6:.2f} M€")
             if not _q_all.empty:
                 _tb = _q_all[["azienda", "flusso", "P_kW", "costo_allacciamento_eur",
@@ -6600,8 +6750,8 @@ with tab_economia:
         # tenuta distinta dal costo della condotta.
         # ------------------------------------------------------------------
         _ri = st.session_state.get("_rete_info", {}) or {}
-        _n_pub_ut = int(_ri.get("n_utenze", 0)) - int(_ri.get("n_privati_agganciati", 0))
-        _n_priv_ut = int(_ri.get("n_privati_agganciati", 0))
+        _n_priv_ut = int(_ri.get("n_privati_allacciati", _ri.get("n_privati_agganciati", 0)))
+        _n_pub_ut = int(_ri.get("n_utenze", 0)) - _n_priv_ut
         _e_pub_ut = float(_ri.get("E_pubblico", 0.0)) + float(_ri.get("E_condomini", 0.0))
         _e_priv_ut = float(_ri.get("E_privati", 0.0))
 
@@ -6684,7 +6834,11 @@ with tab_economia:
         _van = van(flussi_cassa, wacc)
         _tir = tir(flussi_cassa)
         _pb = payback_semplice(flussi_cassa)
-        margine_0 = ricavi_0 - opex_energia_0 - costo_pompaggio_0 - om_0 - costi_fissi_0
+        # il margine comprende anche l'acquisto del calore di scarto, che nei
+        # flussi di cassa c'e' gia': escluderlo qui lo faceva sembrare positivo
+        # anche quando la gestione era in pareggio
+        margine_0 = (ricavi_0 - opex_energia_0 - costo_pompaggio_0 - costo_scarto_0
+                     - om_0 - costi_fissi_0)
 
         # LCOH completo: include rete, O&M, pompaggio; riferito al calore VENDUTO
         _crf_eco = crf(wacc, orizzonte)
@@ -6701,7 +6855,10 @@ with tab_economia:
                   help="Non definito se i flussi non cambiano mai segno.")
         m3.metric("Payback semplice", f"{_pb:.1f} anni" if _pb is not None else "> orizzonte",
                   help="Non attualizzato.")
-        m4.metric("Margine anno 1", f"{margine_0 / 1000:.0f} k\u20ac/a")
+        m4.metric("Margine anno 1", f"{margine_0 / 1000:.0f} k\u20ac/a",
+                  help="Ricavi meno tutti i costi di esercizio dell'anno 1: energia, "
+                       "pompaggio, acquisto del calore di scarto, O&M, personale e "
+                       "varie. Non comprende il rientro dell'investimento.")
 
         n1, n2, n3, n4 = st.columns(4)
         n1.metric("CAPEX totale", f"{capex_tot / 1e6:.2f} M\u20ac",
