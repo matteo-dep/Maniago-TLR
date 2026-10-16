@@ -4911,14 +4911,24 @@ with tab_offerta:
                    "(\u20ac/MWh termico ceduto alla rete). Confluisce nei flussi di cassa "
                    "della scheda *Analisi economica*.")
         _metodo_scarto = st.radio(
-            "Metodo di prezzo", ["Scala exergetica (riferimento gas)",
-                                 "Formula su PSV: PSV \u00d7 (a + b\u00b7w)",
+            "Metodo di prezzo", ["Formula su PSV: PSV \u00d7 (a + b\u00b7w)",
+                                 "Scala exergetica (riferimento gas)",
                                  "Prezzi fissi per azienda"],
             key="off_metodo_prezzo",
             help="Scala exergetica: quota del valore del calore venduto, in base alla "
                  "qualita' (parametri in Dimensionamento, passo 4). Formula su PSV: "
                  "\u20ac/MWh ceduto = PSV del mese \u00d7 (a + b\u00b7w), con w peso exergetico "
                  "orario del flusso. Prezzi fissi: \u20ac/MWh costanti.")
+        _psv_sel_off = st.selectbox(
+            "Serie PSV mensile", list(PSV_SERIE_EUR_MWH.keys()),
+            index=len(PSV_SERIE_EUR_MWH) - 1, key="ex_psv_serie",
+            help="Medie mensili ARERA del PSV day ahead (\u20ac/Smc convertiti con 10,70 "
+                 "kWh/Smc). Serve alla formula, alla scala exergetica e al prezzo di vendita "
+                 "agli utenti (gas \u2212 sconto).")
+        _psv_off = PSV_SERIE_EUR_MWH[_psv_sel_off]
+        st.caption("PSV (\u20ac/MWh): " + " · ".join(
+            f"{MONTH_NAMES[i]} {v:.0f}" for i, v in enumerate(_psv_off))
+            + f" · media {float(np.mean(_psv_off)):.1f}")
         if _metodo_scarto.startswith("Formula"):
             _fa1, _fa2 = st.columns(2)
             _fa1.number_input("a: quota fissa (% del PSV)", 0.0, 100.0, 20.0, step=0.5,
@@ -6516,12 +6526,12 @@ with tab_dimensionamento:
                 "(MWh ceduti, elettricita') vengono dal dispatch; il valore si divide per i "
                 "MWh realmente ceduti. Chiusura mensile per tener conto degli accumuli; tetto "
                 "pari al margine dopo l'elettricita' delle pompe.")
-            _psv_sel = st.selectbox("Serie PSV mensile", list(PSV_SERIE_EUR_MWH.keys()),
-                                    index=len(PSV_SERIE_EUR_MWH) - 1, key="ex_psv_serie",
-                                    help="Medie mensili ARERA del PSV day ahead. Il valore del "
-                                         "mese vale come target in tutte le ore del mese.")
+            # la serie PSV si sceglie in Offerta, accanto al metodo di prezzo
+            _psv_sel = st.session_state.get("ex_psv_serie", list(PSV_SERIE_EUR_MWH.keys())[-1])
+            if _psv_sel not in PSV_SERIE_EUR_MWH:
+                _psv_sel = list(PSV_SERIE_EUR_MWH.keys())[-1]
             _psv_ex = PSV_SERIE_EUR_MWH[_psv_sel]
-            st.caption("PSV (€/MWh): " + " · ".join(
+            st.caption(f"Serie PSV **{_psv_sel}** (si cambia in Offerta) · €/MWh: " + " · ".join(
                 f"{MONTH_NAMES[i]} {v:.0f}" for i, v in enumerate(_psv_ex)))
             _x1, _x2, _x3, _x4 = st.columns(4)
             _sconto_ex = _x1.slider("Sconto sul gas (%)", 0, 40, 15, key="ex_sconto") / 100.0
