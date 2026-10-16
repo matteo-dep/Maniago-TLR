@@ -227,15 +227,15 @@ COLOR_GROUND = "#8C6D46"
 
 ZONE_NOMI = {
     1: "Zona 1 - Comune NE",
-    2: "Zona 2 - Maniago Sud",
+    2: "Zona 2 - Caserme",
     3: "Zona 3 - Sud",
     4: "Zona 4 - Centro",
     5: "Zona 5 - Ovest",
 }
-ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Maniago Sud"]
+ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Caserme"]
 ZONA_COLORI = {
     "Zona 1 - Comune NE": "#2D7DC0",
-    "Zona 2 - Maniago Sud": "#E63946",
+    "Zona 2 - Caserme": "#E63946",
     "Zona 3 - Sud": "#E9C46A",
     "Zona 4 - Centro": "#9B5DE5",
     "Zona 5 - Ovest": "#3FA34D",
@@ -1656,6 +1656,18 @@ PSV_SERIE_EUR_SMC = {
                                              0.607, 0.686, 0.843, 0.354, 0.349, 0.328],
 }
 PSV_SERIE_EUR_MWH = {k: np.array(v) / PCS_MWH_PER_SMC for k, v in PSV_SERIE_EUR_SMC.items()}
+# Fattore di emissione del gas naturale riferito al PCS, coerente con il PSV in
+# EUR/MWh: 1,96 kg CO2/Smc / 10,70 kWh/Smc = 0,183 t CO2/MWh. Serve a tradurre il
+# prezzo ETS2 (edifici, operativo dal 2028) in EUR per MWh di gas.
+EF_GAS_T_MWH_PCS = 0.00196 / PCS_MWH_PER_SMC
+
+
+def formula_scarto_da_sessione():
+    """(a, b) in frazione se in Offerta e' scelta la formula su PSV, altrimenti None."""
+    if str(st.session_state.get("off_metodo_prezzo", "")).startswith("Formula"):
+        return (float(st.session_state.get("off_formula_a", 20.0)) / 100.0,
+                float(st.session_state.get("off_formula_b", 15.0)) / 100.0)
+    return None
 
 
 def exergia_scala(T_c, T0_c):
@@ -1673,7 +1685,8 @@ def exergia_scala(T_c, T0_c):
 
 def prezzo_scarto_exergetico(off_df, idx_h, sim, T0_h, prezzo_el_h, mandata, T_int,
                              psv_mese, spread, eta_caldaia, sconto, quota_fissa,
-                             hp_bassa_attiva):
+                             hp_bassa_attiva, ets2=0.0, caldaia_evitata=0.0,
+                             formula_psv=None):
     """Prezzo del calore di scarto per azienda con la scala exergetica T0 -> mandata.
 
     Regola (concordata):
@@ -1684,14 +1697,17 @@ def prezzo_scarto_exergetico(off_df, idx_h, sim, T0_h, prezzo_el_h, mandata, T_i
       - il valore attribuito allo scarto si divide per i MWh realmente ceduti.
 
     Valore di riferimento: costo del calore a gas per l'utente,
-    C_gas = (PSV mensile + spread) / rendimento caldaia, scontato del target:
+    C_gas = (PSV mensile + spread + ETS2 x fattore di emissione) / rendimento
+    caldaia + costi evitati della caldaia (manutenzione e sostituzione),
+    scontato del target:
     P_target = (1 - sconto) * C_gas.
 
-    Valore orario attribuito allo scarto:
-      - uso diretto (scarto >= mandata): P_target * q_diretto (peso 1);
-      - via pompe di calore: P_target * q_alta * s_w * w_medio, dove s_w e' la
-        quota di scarto fra i calori "gratuiti" entrati negli evaporatori
-        (scarto, terreno, solare) e w_medio il peso medio dei flussi ceduti.
+    Valore attribuito allo scarto:
+      - uso diretto (scarto >= mandata): P_target * q_diretto (peso 1), ora per ora;
+      - via pompe di calore, mese per mese: P_target * q_alta * sum(ceduto * w) /
+        calore gratuito entrato negli evaporatori (scarto, terreno, solare). Il
+        peso w e' orario (dipende da T0), ma il rapporto si chiude sul mese perche'
+        gli accumuli spostano il calore da un'ora all'altra.
 
     Chiusura mensile: i pesi sono orari, ma gli accumuli spostano il calore nel
     tempo, quindi il valore di ogni mese si ripartisce fra le aziende in
@@ -1702,7 +1718,8 @@ def prezzo_scarto_exergetico(off_df, idx_h, sim, T0_h, prezzo_el_h, mandata, T_i
     """
     n = len(idx_h)
     mesi = np.asarray(idx_h.month.values)
-    C_gas = (np.asarray(psv_mese)[mesi - 1] + spread) / eta_caldaia
+    C_gas = ((np.asarray(psv_mese)[mesi - 1] + spread + ets2 * EF_GAS_T_MWH_PCS) / eta_caldaia
+             + caldaia_evitata)
     P_t = (1.0 - sconto) * C_gas
     T0_h = np.asarray(T0_h, dtype=float)
     p_el = np.asarray(prezzo_el_h, dtype=float)
@@ -1763,6 +1780,32 @@ def prezzo_scarto_exergetico(off_df, idx_h, sim, T0_h, prezzo_el_h, mandata, T_i
     V = {"diretto": P_t * q_dir, "hp": P_t * q_alta * s_w * w_hp}
     margine = P_t * (q_dir + q_alta) - p_el * W
 
+    if formula_psv is not None:
+        # Prezzo per formula: EUR/MWh ceduto = PSV del mese x (a + b x w), con w
+        # orario (T0 e temperatura del flusso). Nessun riparto di valore.
+        _a, _b = float(formula_psv[0]), float(formula_psv[1])
+        _psv_h = np.asarray(psv_mese)[mesi - 1]
+        righe = []
+        for m in range(1, 13):
+            sel = mesi == m
+            if not sel.any():
+                continue
+            agg = {}
+            for x in serie:
+                c = float(x["ceduto"][sel].sum())
+                cw = float((x["ceduto"][sel] * x["w"][sel]).sum())
+                costo = float((x["ceduto"][sel] * _psv_h[sel] * (_a + _b * x["w"][sel])).sum())
+                r = agg.setdefault(x["azienda"], [0.0, 0.0, 0.0])
+                r[0] += c
+                r[1] += cw
+                r[2] += costo
+            for az, (c, cw, costo) in agg.items():
+                righe.append({"azienda": az, "mese": m, "MWh_ceduti": c,
+                              "w_medio": cw / c if c > 1e-9 else 0.0, "costo_eur": costo,
+                              "eur_mwh": costo / c if c > 1e-9 else 0.0,
+                              "tetto_attivo": False, "P_target": float(P_t[sel].mean())})
+        return _riassumi_prezzi_scarto(righe, C_gas, P_t, p_el, W, margine)
+
     righe = []
     for m in range(1, 13):
         sel = mesi == m
@@ -1777,7 +1820,20 @@ def prezzo_scarto_exergetico(off_df, idx_h, sim, T0_h, prezzo_el_h, mandata, T_i
                     continue
                 c = float(x["ceduto"][sel].sum())
                 cw = float((x["ceduto"][sel] * x["w"][sel]).sum())
-                v = float(V[perc][sel].sum()) * (cw / den) if den > 1e-12 else 0.0
+                if perc == "hp":
+                    # Valore del mese sul percorso pompe: target x calore prodotto,
+                    # per la quota di exergia che lo scarto porta nel mese
+                    # = sum(ceduto x w) / calore gratuito entrato negli evaporatori.
+                    # Pesare ora per ora (versione precedente) era sbagliato con gli
+                    # accumuli: il calore di ZML immagazzinato e usato nel weekend
+                    # prendeva il peso del calore ceduto in quell'ora (Pietro Rosa a
+                    # 25 °C, quasi zero), e ZML risultava pagato il 40 % in meno.
+                    _grat_m = float(gratuito[sel].sum())
+                    _quota_ex = min(den / _grat_m, 1.0) if _grat_m > 1e-12 else 0.0
+                    V_m = float((P_t[sel] * q_alta[sel]).sum()) * _quota_ex
+                else:
+                    V_m = float(V[perc][sel].sum())
+                v = V_m * (cw / den) if den > 1e-12 else 0.0
                 r = quote.setdefault(x["azienda"], {"ceduto": 0.0, "cw": 0.0, "var": 0.0})
                 r["ceduto"] += c
                 r["cw"] += cw
@@ -1793,9 +1849,14 @@ def prezzo_scarto_exergetico(off_df, idx_h, sim, T0_h, prezzo_el_h, mandata, T_i
                           "eur_mwh": costo / r["ceduto"] if r["ceduto"] > 1e-9 else 0.0,
                           "tetto_attivo": fatt < 0.999,
                           "P_target": float(P_t[sel].mean())})
+    return _riassumi_prezzi_scarto(righe, C_gas, P_t, p_el, W, margine)
+
+
+def _riassumi_prezzi_scarto(righe, C_gas, P_t, p_el, W, margine):
+    """Tabelle mensile e annua per azienda a partire dalle righe mensili."""
     df_m = pd.DataFrame(righe)
     if df_m.empty:
-        return vuoto
+        return pd.DataFrame(), pd.DataFrame(), {}
     df_a = (df_m.groupby("azienda")
             .agg(MWh_ceduti=("MWh_ceduti", "sum"), costo_eur=("costo_eur", "sum"),
                  mesi_tetto=("tetto_attivo", "sum"))
@@ -1814,7 +1875,8 @@ def valuta_combinazioni_aziende(off_all, idx_h, dom_arr, soil_arr, mandata, rito
                                 eta_hp, V_hot, V_int, V_low, P_alta, P_bassa, backup_tipo,
                                 P_bk, backup_cop, antigelo, perd, strat_on, solar_low,
                                 tipo_sorgente, resa_sorgente, costo_sorgente,
-                                T0_h, prezzo_el_h, psv, spread, eta_cald, sconto, quota_fissa):
+                                T0_h, prezzo_el_h, psv, spread, eta_cald, sconto, quota_fissa,
+                                ets2=0.0, caldaia_evitata=0.0, formula_psv=None):
     """Ripete il dispatch annuale per ogni combinazione di aziende allacciate.
 
     Taglie di macchine e accumuli restano quelle dello scenario: cambia solo
@@ -1853,7 +1915,8 @@ def valuta_combinazioni_aziende(off_all, idx_h, dom_arr, soil_arr, mandata, rito
             if comb:
                 _m, _a, _i = prezzo_scarto_exergetico(
                     o, idx_h, s, T0_h, prezzo_el_h, mandata, T_int, psv, spread,
-                    eta_cald, sconto, quota_fissa, is_hp)
+                    eta_cald, sconto, quota_fissa, is_hp, ets2, caldaia_evitata,
+                    formula_psv)
                 if not _a.empty:
                     costo_sc = float(_a["costo_eur"].sum())
                     per_az = dict(zip(_a["azienda"], _a["MWh_ceduti"]))
@@ -2341,6 +2404,133 @@ def ottimizza_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr
     return best
 
 
+def ottimizza_economico(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
+                        mandata, ritorno, T_int, dT_evap, eta_hp, parallelo,
+                        capex_hp_func, capex_backup_kw, opex_backup_mwh, backup_cop,
+                        prezzo_el, costo_m3, capex_solare_fisso, perdita_func, antigelo,
+                        picco_kw, v_max, sorgente, economia, costo_scarto_func,
+                        q_int_bins=None, bin_T_int=None, stratificato=True,
+                        solare_low=None, n_griglia=5):
+    """Dimensionamento con lo stesso obiettivo dell'Analisi economica.
+
+    Minimizza il costo annuo delle voci di centrale che dipendono dalle taglie:
+      investimento (pompe, caldaia, accumuli, sorgente fredda, solare) al netto
+      del contributo, annualizzato al WACC sull'orizzonte dell'Analisi economica
+      + manutenzione di centrale in % del CAPEX
+      + elettricita' delle pompe al prezzo effettivo
+      + combustibile di backup
+      + acquisto del calore di scarto (scala exergetica o prezzi fissi).
+    Rete, sottostazioni, allacciamenti e ricavi non dipendono dalle taglie, quindi
+    a parita' di domanda minimizzare questo costo massimizza il VAN.
+
+    Diversamente dal dimensionamento a LCOH, cerca anche le POTENZE:
+      - con HP bassa T: HP alta sul picco (non c'e' backup), HP bassa variabile;
+      - con caldaia: caldaia sul picco come riserva, HP alta variabile, cosi' la
+        pompa lavora in base e il combustibile copre solo le punte.
+    Ricerca a coordinate: volumi alla potenza di riferimento, poi potenza con i
+    volumi trovati, poi di nuovo i volumi alla potenza scelta.
+
+    sorgente: dict(tipo, resa, costo) per la sorgente fredda della HP bassa T.
+    economia: dict(wacc, anni, contributo_pct, om_pct).
+    costo_scarto_func(sim) -> EUR/a di calore di scarto acquistato.
+    """
+    dom_tot = float(np.sum(dom_arr))
+    if dom_tot <= 0:
+        return None
+    is_hp = (parallelo == "HP bassa T")
+    cop_a_ref = float(cop_singola(T_int - dT_evap, mandata, eta_hp))
+    frac_a = max(1.0 - 1.0 / cop_a_ref, 0.0)
+    fattore = crf(economia["wacc"], economia["anni"]) * (1.0 - economia["contributo_pct"] / 100.0)
+    om = economia["om_pct"] / 100.0
+
+    def _griglia(vmax, n=n_griglia):
+        if vmax <= 0:
+            return [0.0]
+        passi = np.unique(np.round(np.geomspace(50.0, max(vmax, 100.0), n) / 50.0) * 50.0)
+        return [0.0] + [float(v) for v in passi if v <= vmax]
+
+    ha_hot = float(np.sum(q_hot_arr)) > 1e-6
+    v_hot_c = _griglia(v_max) if ha_hot else [0.0]
+    v_int_c = _griglia(v_max)
+    v_low_c = _griglia(v_max) if is_hp else [0.0]
+    if is_hp:
+        P_ref = picco_kw * frac_a * 1.1
+        p_cands = [round(P_ref * f / 100.0) * 100.0 for f in (0.25, 0.35, 0.5, 0.65, 0.8, 1.0)]
+    else:
+        P_ref = picco_kw
+        p_cands = [round(picco_kw * f / 100.0) * 100.0 for f in (0.25, 0.35, 0.5, 0.65, 0.8, 1.0)]
+    cache = {}
+
+    def _valuta(P_var, vh, vi, vl):
+        chiave = (P_var, vh, vi, vl)
+        if chiave in cache:
+            return cache[chiave]
+        if is_hp:
+            P_alta, P_bassa, P_bk = picco_kw, P_var, 0.0
+        else:
+            P_alta, P_bassa, P_bk = P_var, 0.0, picco_kw
+        r = dispatch_cascata(dom_arr, q_hot_arr, q_int_arr, q_low_bins, bin_T, soil_arr,
+                             mandata, ritorno, T_int, dT_evap, eta_hp,
+                             vh, vi, vl, P_alta, P_bassa,
+                             parallelo=parallelo, P_backup_kw=P_bk, backup_cop=backup_cop,
+                             antigelo=antigelo,
+                             perdita_sett_pct=perdita_func(max(vi, vl, vh)),
+                             q_int_bins=q_int_bins, bin_T_int=bin_T_int,
+                             stratificato=stratificato, solare_low=solare_low)
+        capex_g = 0.0
+        if is_hp:
+            pk_g = float(r["q_ground"].max()) * 1000.0
+            if pk_g > 0:
+                capex_g = float(dimensiona_sorgente_bassa_t(
+                    pk_g, sorgente["tipo"], sorgente["resa"], sorgente["costo"])["costo"])
+        capex = (P_alta * capex_hp_func(P_alta)
+                 + (P_bassa * capex_hp_func(P_bassa) if is_hp and P_bassa > 0 else 0.0)
+                 + (P_bk * capex_backup_kw if not is_hp else 0.0)
+                 + (vh + vi + vl) * costo_m3 + capex_solare_fisso + capex_g)
+        c_scarto = float(costo_scarto_func(r))
+        opex = r["E_el_tot"] * prezzo_el + r["E_backup"] * opex_backup_mwh
+        costo = capex * fattore + capex * om + opex + c_scarto
+        E_fer = (r["E_hot_diretto"] + r["E_hp_alta"]
+                 + (r["E_backup"] if parallelo == "biomassa" else 0.0))
+        out = {"v_hot": vh, "v_int": vi, "v_low": vl, "P_alta": P_alta, "P_bassa": P_bassa,
+               "P_bk": P_bk, "costo_annuo": costo, "lcoh": costo / dom_tot,
+               "quota_fer": E_fer / dom_tot * 100, "capex": capex, "capex_sorgente": capex_g,
+               "costo_scarto": c_scarto, "E_hot": r["E_hot_diretto"], "E_alta": r["E_hp_alta"],
+               "E_bassa": r["E_hp_bassa"], "E_backup": r["E_backup"], "E_el": r["E_el_tot"],
+               "ore_scoperte": r["ore_non_coperte"], "cop_alta": r["cop_alta_medio"],
+               "cop_bassa": r["cop_bassa_medio"], "obiettivo": "economico"}
+        cache[chiave] = out
+        return out
+
+    def _migliore(cands):
+        cands = list(cands)
+        min_sc = min(c["ore_scoperte"] for c in cands)
+        ok = [c for c in cands if c["ore_scoperte"] <= min_sc]
+        return min(ok, key=lambda c: c["costo_annuo"])
+
+    def _volumi(P_var):
+        return _migliore(_valuta(P_var, vh, vi, vl)
+                         for vh in v_hot_c for vi in v_int_c for vl in v_low_c)
+
+    # copertura di riferimento: la migliore ottenibile alla potenza piena
+    ref = _volumi(p_cands[-1])
+    soglia = ref["ore_scoperte"]
+    best = ref
+    for _giro in range(2):
+        prove = [_valuta(P, best["v_hot"], best["v_int"], best["v_low"]) for P in p_cands]
+        prove = [c for c in prove if c["ore_scoperte"] <= soglia]
+        if prove:
+            cand = min(prove, key=lambda c: c["costo_annuo"])
+            P_sel = cand["P_bassa"] if is_hp else cand["P_alta"]
+            vol = _volumi(P_sel)
+            nuovo = vol if vol["ore_scoperte"] <= soglia else cand
+            if nuovo["costo_annuo"] < best["costo_annuo"] - 1e-6:
+                best = nuovo
+                continue
+        break
+    return best
+
+
 # =============================================================================
 # GENERAZIONE PROFILI DI OFFERTA
 # =============================================================================
@@ -2612,12 +2802,13 @@ def load_data():
         if _esclusi.any():
             buildings = buildings[~_esclusi].copy()
     else:
-        # compatibilita' con i vecchi nomi usati nei CSV, compreso "Ex Bioman"
-        # che nel frattempo e' diventato "Maniago Sud"
+        # compatibilita' con i vecchi nomi usati nei CSV: "Ex Bioman" e "Maniago
+        # Sud" sono la stessa zona 2, ora chiamata "Caserme"
         buildings["cluster"] = buildings["cluster"].replace({
             "NE-Centro": "Zona 1 - Comune NE",
-            "Ex Bioman": "Zona 2 - Maniago Sud",
-            "Maniago Sud": "Zona 2 - Maniago Sud",
+            "Caserme": "Zona 2 - Caserme",
+            "Ex Bioman": "Zona 2 - Caserme",
+            "Maniago Sud": "Zona 2 - Caserme",
             "Campagna": "Zona 3 - Sud", "Ovest": "Zona 5 - Ovest"})
     domanda = domanda[domanda["edificio"].isin(buildings["edificio"])].copy()
     domanda = domanda.drop(columns=["cluster"], errors="ignore").merge(
@@ -4721,11 +4912,32 @@ with tab_offerta:
                    "(\u20ac/MWh termico ceduto alla rete). Confluisce nei flussi di cassa "
                    "della scheda *Analisi economica*.")
         _metodo_scarto = st.radio(
-            "Metodo di prezzo", ["Scala exergetica (riferimento gas)", "Prezzi fissi per azienda"],
+            "Metodo di prezzo", ["Formula su PSV: PSV \u00d7 (a + b\u00b7w)",
+                                 "Scala exergetica (riferimento gas)",
+                                 "Prezzi fissi per azienda"],
             key="off_metodo_prezzo",
-            help="Scala exergetica: prezzo orario per azienda legato al PSV e alla qualita' "
-                 "del calore; parametri in Dimensionamento, passo 4. Prezzi fissi: "
-                 "\u20ac/MWh costanti impostati qui sotto.")
+            help="Scala exergetica: quota del valore del calore venduto, in base alla "
+                 "qualita' (parametri in Dimensionamento, passo 4). Formula su PSV: "
+                 "\u20ac/MWh ceduto = PSV del mese \u00d7 (a + b\u00b7w), con w peso exergetico "
+                 "orario del flusso. Prezzi fissi: \u20ac/MWh costanti.")
+        _psv_sel_off = st.selectbox(
+            "Serie PSV mensile", list(PSV_SERIE_EUR_MWH.keys()),
+            index=len(PSV_SERIE_EUR_MWH) - 1, key="ex_psv_serie",
+            help="Medie mensili ARERA del PSV day ahead (\u20ac/Smc convertiti con 10,70 "
+                 "kWh/Smc). Serve alla formula, alla scala exergetica e al prezzo di vendita "
+                 "agli utenti (gas \u2212 sconto).")
+        _psv_off = PSV_SERIE_EUR_MWH[_psv_sel_off]
+        st.caption("PSV (\u20ac/MWh): " + " · ".join(
+            f"{MONTH_NAMES[i]} {v:.0f}" for i, v in enumerate(_psv_off))
+            + f" · media {float(np.mean(_psv_off)):.1f}")
+        if _metodo_scarto.startswith("Formula"):
+            _fa1, _fa2 = st.columns(2)
+            _fa1.number_input("a: quota fissa (% del PSV)", 0.0, 100.0, 20.0, step=0.5,
+                              key="off_formula_a")
+            _fa2.number_input("b: quota legata alla qualit\u00e0 (% del PSV)", 0.0, 200.0, 15.0,
+                              step=0.5, key="off_formula_b")
+            st.caption("Esempio: con PSV 50 \u20ac/MWh, a = 20 % e b = 15 %, un flusso con "
+                       "w = 0,5 costa 50 \u00d7 (0,20 + 0,15 \u00d7 0,5) = 13,75 \u20ac/MWh.")
         _prezzi_scarto = {}
         if _metodo_scarto == "Prezzi fissi per azienda":
             for az in selected_fonti:
@@ -5320,7 +5532,13 @@ with tab_dimensionamento:
                                            key="dim_prezzo_gas")
                     capex_kw_bk = st.slider("CAPEX caldaia (€/kW)", 60, 300, 120, step=10,
                                             key="dim_capex_gas")
-                    opex_bk_mwh = prezzo_gas / rend_gas
+                    # ETS2 anche sul gas della centrale (impianto sotto i 20 MW,
+                    # fuori dall'ETS1): stesso prezzo impostato per il riferimento utente
+                    _ets2_bk = float(st.session_state.get("ex_ets2", 85))
+                    opex_bk_mwh = (prezzo_gas + _ets2_bk * EF_GAS_T_MWH_PCS) / rend_gas
+                    st.caption(f"Comprende l'ETS2 a {_ets2_bk:.0f} €/t "
+                               f"(+{_ets2_bk * EF_GAS_T_MWH_PCS:.1f} €/MWh di gas), impostato "
+                               f"nel riquadro della scala exergetica al passo 4.")
                 else:
                     rend_bio = st.slider("Rendimento caldaia (%)", 75, 92, 85,
                                          key="dim_rend_bio") / 100.0
@@ -5337,7 +5555,7 @@ with tab_dimensionamento:
         st.divider()
         _a1, _a2 = st.columns(2)
         with _a1:
-            costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 1000, step=20,
+            costo_m3 = st.slider("CAPEX accumuli (€/m³)", 80, 1500, 500, step=20,
                                  key="dim_costo_m3",
                              help="IEA DHC F1 Tab.3: 110-200 €/m³ sopra i 2.000 m³; "
                                       "1.000 €/m³ è conservativo per serbatoi in acciaio piccoli.")
@@ -5525,17 +5743,68 @@ with tab_dimensionamento:
             st.metric("Picco da coprire", f"{picco_kw:,.0f} kW".replace(",", "."),
                       help=f"contemporaneità QM applicata: {_f_sim:.2f}")
 
-        if st.button("⚙️ Dimensiona a costo minimo", key="dim_btn_opt", width="stretch",
-                     type="primary"):
+        if st.button("⚙️ Dimensiona a costo minimo (obiettivo dell'Analisi economica)",
+                     key="dim_btn_opt", width="stretch", type="primary",
+                     help="Cerca potenze e volumi che rendono minimo il costo annuo di "
+                          "centrale con gli stessi parametri dell'Analisi economica: WACC, "
+                          "orizzonte, contributo, manutenzione, prezzo effettivo "
+                          "dell'elettricita' e acquisto del calore di scarto."):
             with st.spinner("Ricerca della configurazione a costo minimo..."):
-                best = ottimizza_cascata(
+                # parametri economici: quelli impostati nell'Analisi economica
+                _eco_par = {"wacc": float(st.session_state.get("eco_wacc", 4.0)) / 100.0,
+                            "anni": int(st.session_state.get("eco_anni", 25)),
+                            "contributo_pct": float(st.session_state.get("eco_contributo", 40)),
+                            "om_pct": float(st.session_state.get("eco_om", 2.0))}
+                # prezzo effettivo dell'elettricita' (come nel passo 4)
+                _pel_opt = float(prezzo_el)
+                if considera_el:
+                    _rel_o = st.session_state.get("_el_risultato") or {}
+                    if "acquisto_eur" in _rel_o and float(_rel_o.get("consumo_mwh", 0)) > 0:
+                        _pel_opt = ((float(_rel_o["acquisto_eur"])
+                                     - float(_rel_o.get("ricavo_eur", 0)))
+                                    / float(_rel_o["consumo_mwh"]))
+                # costo del calore di scarto, con il metodo scelto in Offerta
+                _met_o = serie_meteo_annua(pvgis)
+                _T0_o = (pd.Series(_met_o["T2m"].values, index=pd.to_datetime(_met_o["datetime"]))
+                         .reindex(idx_h).interpolate().bfill().ffill().values)
+                _pz_o, _ = carica_prezzi_elettrici()
+                _pz_o = pd.Series(_pz_o, index=HOURS_2024).reindex(idx_h).ffill().bfill().values
+                _pz_o = _pz_o * (_pel_opt / max(float(np.mean(_pz_o)), 1e-9))
+                _ss = st.session_state
+                _psv_o = PSV_SERIE_EUR_MWH.get(_ss.get("ex_psv_serie"),
+                                               list(PSV_SERIE_EUR_MWH.values())[-1])
+                _exergetico = str(_ss.get("off_metodo_prezzo",
+                                          "Scala exergetica")).startswith(("Scala", "Formula"))
+                _prezzi_fissi = _ss.get("_off_prezzi_scarto", {}) or {}
+
+                def _costo_scarto_opt(r):
+                    if _exergetico:
+                        _m, _a, _i = prezzo_scarto_exergetico(
+                            off_all, idx_h, r, _T0_o, _pz_o, float(T_mandata_ideale),
+                            float(T_int), _psv_o, float(_ss.get("ex_spread", 50)),
+                            float(_ss.get("ex_eta", 0.90)),
+                            float(_ss.get("ex_sconto", 15)) / 100.0,
+                            float(_ss.get("ex_fisso", 0)), is_hp_par,
+                            float(_ss.get("ex_ets2", 85)), float(_ss.get("ex_caldaia", 0)),
+                            formula_scarto_da_sessione())
+                        return float(_a["costo_eur"].sum()) if not _a.empty else 0.0
+                    _u = utilizzo_per_azienda(off_all, idx_h, float(T_mandata_ideale),
+                                              float(T_int), r, dom_arr)
+                    if _u is None or _u.empty:
+                        return 0.0
+                    return float(sum(float(_prezzi_fissi.get(a, 0)) * float(e)
+                                     for a, e in zip(_u["azienda"], _u["utilizzata_mwh"])))
+
+                best = ottimizza_economico(
                     dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
                     float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
                     backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
-                    prezzo_el, costo_m3, capex_solare, crf(0.04, 20), perdita_func,
-                    float(antigelo), q_int_bins=q_int_bins, bin_T_int=bin_T_int,
-                    stratificato=strat_on, picco_kw_override=picco_kw,
-                    v_max_m3=float(v_max_acc))
+                    _pel_opt, costo_m3, capex_solare, perdita_func, float(antigelo),
+                    float(picco_kw), float(v_max_acc),
+                    {"tipo": tipo_sorgente, "resa": resa_sorgente, "costo": costo_sorgente},
+                    _eco_par, _costo_scarto_opt,
+                    q_int_bins=q_int_bins, bin_T_int=bin_T_int, stratificato=strat_on,
+                    solare_low=(solar_low if solare_on else None))
             if best:
                 # arrotondamento per ECCESSO: al centinaio piu' vicino la taglia
                 # poteva restare qualche kW sotto il picco, lasciando scoperta
@@ -5556,8 +5825,15 @@ with tab_dimensionamento:
                        else f"caldaia **{_ores['P_bk']:.0f} kW**")
             _sg.append(f"accumuli **{_ores['v_hot']:.0f}+{_ores['v_int']:.0f}"
                        f"+{_ores['v_low']:.0f} m³**")
-            st.success(f"Configurazione a costo minimo · LCOH **{_ores['lcoh']:.1f} €/MWh** "
-                       f"· quota FER **{_ores['quota_fer']:.0f}%** — " + " · ".join(_sg))
+            if _ores.get("obiettivo") == "economico":
+                st.success(f"Configurazione a costo minimo · costo annuo di centrale "
+                           f"**{_ores['costo_annuo'] / 1000:,.0f} k€/a** "
+                           f"({_ores['lcoh']:.1f} €/MWh prodotto, comprende scarto e "
+                           f"manutenzione) · quota FER **{_ores['quota_fer']:.0f}%** — ".replace(",", ".")
+                           + " · ".join(_sg))
+            else:
+                st.success(f"Configurazione a costo minimo · LCOH **{_ores['lcoh']:.1f} €/MWh** "
+                           f"· quota FER **{_ores['quota_fer']:.0f}%** — " + " · ".join(_sg))
         else:
             st.info("Non ancora dimensionato: i valori qui sotto sono di primo tentativo. "
                     "Premi **Dimensiona** per la configurazione a costo minimo.")
@@ -6251,12 +6527,12 @@ with tab_dimensionamento:
                 "(MWh ceduti, elettricita') vengono dal dispatch; il valore si divide per i "
                 "MWh realmente ceduti. Chiusura mensile per tener conto degli accumuli; tetto "
                 "pari al margine dopo l'elettricita' delle pompe.")
-            _psv_sel = st.selectbox("Serie PSV mensile", list(PSV_SERIE_EUR_MWH.keys()),
-                                    index=len(PSV_SERIE_EUR_MWH) - 1, key="ex_psv_serie",
-                                    help="Medie mensili ARERA del PSV day ahead. Il valore del "
-                                         "mese vale come target in tutte le ore del mese.")
+            # la serie PSV si sceglie in Offerta, accanto al metodo di prezzo
+            _psv_sel = st.session_state.get("ex_psv_serie", list(PSV_SERIE_EUR_MWH.keys())[-1])
+            if _psv_sel not in PSV_SERIE_EUR_MWH:
+                _psv_sel = list(PSV_SERIE_EUR_MWH.keys())[-1]
             _psv_ex = PSV_SERIE_EUR_MWH[_psv_sel]
-            st.caption("PSV (€/MWh): " + " · ".join(
+            st.caption(f"Serie PSV **{_psv_sel}** (si cambia in Offerta) · €/MWh: " + " · ".join(
                 f"{MONTH_NAMES[i]} {v:.0f}" for i, v in enumerate(_psv_ex)))
             _x1, _x2, _x3, _x4 = st.columns(4)
             _sconto_ex = _x1.slider("Sconto sul gas (%)", 0, 40, 15, key="ex_sconto") / 100.0
@@ -6267,6 +6543,19 @@ with tab_dimensionamento:
             _eta_ex = _x3.slider("Rendimento caldaia utente", 0.70, 1.05, 0.90, step=0.01,
                                  key="ex_eta")
             _fisso_ex = _x4.slider("Quota fissa (\u20ac/MWh ceduto)", 0, 30, 0, key="ex_fisso")
+            _y1, _y2 = st.columns(2)
+            _ets2_ex = _y1.slider("Prezzo ETS2 sul gas per edifici (\u20ac/tCO\u2082)", 0, 150, 85,
+                                  step=5, key="ex_ets2",
+                                  help="ETS2 operativo dal 2028 (rinviato dal 2027). Nei primi "
+                                       "anni la riserva di stabilita' interviene sopra 45 "
+                                       "\u20ac/t a prezzi 2020. 45 \u20ac/t valgono circa "
+                                       f"{45 * EF_GAS_T_MWH_PCS:.1f} \u20ac/MWh di gas.")
+            _cald_ex = _y2.slider("Costi evitati della caldaia (\u20ac/MWh di calore)", 0, 40, 0,
+                                  key="ex_caldaia",
+                                  help="Manutenzione, terzo responsabile e quota di "
+                                       "sostituzione della caldaia che l'utente non paga piu' "
+                                       "allacciandosi. Tipicamente 10-20 \u20ac/MWh per edifici "
+                                       "pubblici medi.")
 
             _met_ex = serie_meteo_annua(pvgis)
             _T0_ex = (pd.Series(_met_ex["T2m"].values, index=pd.to_datetime(_met_ex["datetime"]))
@@ -6279,14 +6568,16 @@ with tab_dimensionamento:
             _df_m_ex, _df_a_ex, _info_ex = prezzo_scarto_exergetico(
                 off_all, idx_h, sim, _T0_ex, _pz_ex, float(T_mandata_ideale), float(T_int),
                 _psv_ex, float(_spread_ex), float(_eta_ex),
-                float(_sconto_ex), float(_fisso_ex), backup_tipo == "HP bassa T")
+                float(_sconto_ex), float(_fisso_ex), backup_tipo == "HP bassa T",
+                float(_ets2_ex), float(_cald_ex), formula_scarto_da_sessione())
 
             _costo_scarto_ex = 0.0
             # prezzo di vendita coerente con il target: media pesata sulla domanda
             # oraria delle utenze del (PSV mensile + spread) / rendimento x (1 - sconto)
             _ut_h_all = dom_arr / _fatt_lordo
-            _C_gas_h_all = ((_psv_ex[np.asarray(idx_h.month.values) - 1] + float(_spread_ex))
-                            / float(_eta_ex))
+            _C_gas_h_all = ((_psv_ex[np.asarray(idx_h.month.values) - 1] + float(_spread_ex)
+                             + float(_ets2_ex) * EF_GAS_T_MWH_PCS) / float(_eta_ex)
+                            + float(_cald_ex))
             _den_ut = max(float(_ut_h_all.sum()), 1e-9)
             _costo_gas_mwh = float((_ut_h_all * _C_gas_h_all).sum()) / _den_ut
             _prezzo_target_mwh = _costo_gas_mwh * (1.0 - float(_sconto_ex))
@@ -6344,7 +6635,7 @@ with tab_dimensionamento:
     # segue il metodo scelto in Offerta
     _metodo_scarto_dim = st.session_state.get("off_metodo_prezzo",
                                               "Scala exergetica (riferimento gas)")
-    if _metodo_scarto_dim.startswith("Scala exergetica"):
+    if _metodo_scarto_dim.startswith(("Scala exergetica", "Formula")):
         costo_calore_acq = _costo_scarto_ex
 
     # CO2 evitata rispetto alla baseline gas.
@@ -7127,7 +7418,10 @@ with tab_economia:
             _metodo_eco = st.session_state.get("off_metodo_prezzo",
                                                "Scala exergetica (riferimento gas)")
             _orig_eco = ("scala exergetica, parametri in *Dimensionamento* passo 4"
-                         if _metodo_eco.startswith("Scala") else "prezzi fissi impostati in *Offerta*")
+                         if _metodo_eco.startswith("Scala")
+                         else ("formula PSV \u00d7 (a + b\u00b7w) impostata in *Offerta*"
+                               if _metodo_eco.startswith("Formula")
+                               else "prezzi fissi impostati in *Offerta*"))
             st.caption(f"Calore di scarto acquistato dalle aziende ({_orig_eco}): "
                        + f"**{_costo_scarto_base:,.0f} \u20ac/a**".replace(",", "."))
             _scarto_mult = st.slider("Correttivo sul costo del calore di scarto (\u00d7)",
@@ -7243,7 +7537,7 @@ with tab_economia:
                     _u2["capex_att"] * _crf_pre / _u2["utilizzata_mwh"], np.nan)
                 _tb2 = _u2[["azienda", "utilizzata_mwh", "capex_att", "eur_per_mwh"]].copy()
                 _tb2.columns = ["Azienda", "Calore utilizzato (MWh/a)",
-                                "CAPEX attribuito (€)", "Incidenza (€/MWh)"]
+                                "CAPEX attribuito (€)", "Incidenza allacciamento (€/MWh)"]
                 _tb2 = _tb2.round(1)
                 st.markdown("**Quanto costa il calore di ciascuna azienda**")
                 st.dataframe(_tb2, width="stretch", hide_index=True)
@@ -7272,7 +7566,8 @@ with tab_economia:
                         round(float(np.sum(solar_low)) if solare_on else 0.0, 3),
                         str(tipo_sorgente), str(resa_sorgente), str(costo_sorgente),
                         str(_psv_sel), float(_spread_ex), float(_eta_ex), float(_sconto_ex),
-                        float(_fisso_ex), float(prezzo_el_eff),
+                        float(_fisso_ex), float(prezzo_el_eff), float(_ets2_ex), float(_cald_ex),
+                        str(formula_scarto_da_sessione()),
                         round(float(np.sum(dom_arr)), 3), len(dom_arr))
             _cache_c = st.session_state.get("_eco_combinazioni")
             try:
@@ -7287,7 +7582,8 @@ with tab_economia:
                             perd, strat_on, (solar_low if solare_on else None),
                             tipo_sorgente, resa_sorgente, costo_sorgente,
                             _T0_ex, _pz_ex, _psv_ex, float(_spread_ex), float(_eta_ex),
-                            float(_sconto_ex), float(_fisso_ex))
+                            float(_sconto_ex), float(_fisso_ex), float(_ets2_ex), float(_cald_ex),
+                            formula_scarto_da_sessione())
                     st.session_state["_eco_combinazioni"] = (_firma_c, _combs)
             except Exception as _e_comb:
                 _combs = []
@@ -7420,6 +7716,17 @@ with tab_economia:
 
         E_venduto = float(_snap["carico_utenze_mwh"])
         E_prodotto = float(_snap["carico_centrale_mwh"])
+        # la domanda che la centrale non copre non si vende: senza questa
+        # correzione uno scenario sottodimensionato risultava il piu' redditizio
+        _E_nc = float(_snap.get("E_non_coperta", 0.0) or 0.0)
+        if _E_nc > 1e-6 and E_prodotto > 0:
+            _q_nc = min(_E_nc / E_prodotto, 1.0)
+            E_venduto = E_venduto * (1.0 - _q_nc)
+            if _q_nc > 0.005:
+                st.error(f"La centrale non copre {_E_nc:,.0f} MWh/a "
+                         f"({_q_nc * 100:.1f} % della domanda): i ricavi sono calcolati solo "
+                         f"sul calore effettivamente fornito. Controlla le taglie nel "
+                         f"Dimensionamento.".replace(",", "."))
 
         ricavo_calore_0 = E_venduto * prezzo_calore
         ricavo_fisso_0 = n_utenze_eco * quota_fissa
@@ -7787,7 +8094,9 @@ with tab_economia:
                              key="eco_valco2")
         amb3.metric("Valore CO\u2082 evitata / anno",
                     f"{_snap.get('co2_evitata_t', 0) * _val_co2 / 1000:,.0f} k\u20ac/a".replace(",", "."),
-                    help="Beneficio economico potenziale (non incluso nel VAN sopra).")
+                    help="Valore sociale della CO\u2082 evitata, solo indicativo. L'ETS2 che "
+                         "l'utente pagherebbe sul gas e' gia' nel prezzo di vendita (riquadro "
+                         "della scala exergetica in Dimensionamento): non va sommato di nuovo.")
 
         # ------------------------------------------------------------------
         # STRUTTURA FINANZIARIA
