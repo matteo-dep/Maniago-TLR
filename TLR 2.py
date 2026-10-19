@@ -5954,8 +5954,22 @@ with tab_dimensionamento:
             prezzo_el_eff = prezzo_el * (1.0 - quota_autocons)
     opex_lordo = sim["E_el_tot"] * prezzo_el_eff + E_bk * opex_bk_mwh
     opex = opex_lordo - ricavo_pvt_el
-    costo_annuo = capex_sistema * fattore_crf + opex
+    # l'investimento in autoproduzione si annualizza insieme alla centrale: il
+    # risparmio sull'elettricita' e' gia' nell'opex, senza l'investimento il LCOH
+    # degli scenari con fotovoltaico risultava troppo basso. Solo indicatore: i
+    # flussi di cassa dell'Analisi economica lo contavano gia'.
+    costo_annuo = (capex_sistema + capex_autoproduzione) * fattore_crf + opex
     lcoh = costo_annuo / dom_tot if dom_tot > 0 else np.nan
+    # taglie dell'autoproduzione e verifica che l'ottimizzazione elettrica sia
+    # stata fatta su questa configurazione (consumo delle pompe uguale)
+    _rel_s = (st.session_state.get("_el_risultato") or {}) if considera_el else {}
+    kwp_autoprod = float(_rel_s.get("kwp_pv", 0.0))
+    batt_autoprod = float(_rel_s.get("batteria_mwh", 0.0))
+    ibr_autoprod = float(_rel_s.get("ibrido_m2", 0.0))
+    _cons_ott = float(_rel_s.get("consumo_mwh", 0.0))
+    _cons_ora = float(sim["E_el_tot"])
+    autoprod_da_rifare = bool(considera_el) and (
+        not _rel_s or abs(_cons_ott - _cons_ora) > max(0.01 * _cons_ora, 1.0))
 
     el_hp = sim["el_alta"] + sim["el_bassa"]
     ground = sim["q_ground"]
@@ -6485,9 +6499,13 @@ with tab_dimensionamento:
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("CAPEX di sistema", f"{capex_sistema:,.0f} \u20ac".replace(",", "."))
         s2.metric("Costo annuo", f"{costo_annuo:,.0f} \u20ac/a".replace(",", "."),
-                  help=f"capitale {capex_sistema * fattore_crf:,.0f} + esercizio {opex:,.0f}".replace(",", "."))
+                  help=(f"capitale {(capex_sistema + capex_autoproduzione) * fattore_crf:,.0f}"
+                        + (f" (di cui autoproduzione {capex_autoproduzione * fattore_crf:,.0f})"
+                           if capex_autoproduzione > 0 else "")
+                        + f" + esercizio {opex:,.0f}").replace(",", "."))
         s3.metric("LCOH di sistema", f"{lcoh:.1f} \u20ac/MWh" if not np.isnan(lcoh) else "n/d",
-                  help="Costo del calore alla centrale. Non comprende rete, O&M e "
+                  help="Costo del calore alla centrale, compreso l'investimento in "
+                       "autoproduzione elettrica se attiva. Non comprende rete, O&M e "
                        "personale: quelli sono nella scheda Analisi economica.")
         s4.metric("Quota FER", f"{quota_fer:.0f}%")
 
@@ -6666,6 +6684,9 @@ with tab_dimensionamento:
         "autoproduzione_el": ("sì" if considera_el else "no"),
         "prezzo_el_effettivo": round(prezzo_el_eff),
         "capex_autoproduzione": round(capex_autoproduzione),
+        "kwp_autoproduzione": round(kwp_autoprod),
+        "batteria_autoproduzione_mwh": round(batt_autoprod, 1),
+        "ibridi_autoproduzione_m2": round(ibr_autoprod),
         "carico_utenze_mwh": round(dom_tot_utenze),
         "carico_centrale_mwh": round(dom_tot),
         "perdite_rete_pct": round(_perd_pct, 1),
@@ -6718,6 +6739,11 @@ with tab_dimensionamento:
 
     # --- salvataggio scenario (P9: rimovibili singolarmente) ---
     st.divider()
+    if autoprod_da_rifare:
+        st.warning("⚡ L'autoproduzione elettrica è stata ottimizzata per un'altra "
+                   "configurazione (consumo delle pompe diverso da quello attuale) o non "
+                   "è ancora stata calcolata. Rilancia **Trova la configurazione ottima** "
+                   "nella scheda *Carico elettrico* prima di salvare lo scenario.")
     sc1, sc2 = st.columns([3, 1])
     _nome_def = f"{backup_tipo} · {T_mandata_ideale}/{T_ritorno_ideale}°C"
     nome_scen = sc1.text_input("Nome dello scenario da salvare", value=_nome_def, key="dim_nome_scen")
@@ -7240,8 +7266,13 @@ with tab_confronto:
             ("co2_evitata_t", "CO\u2082 evitata (t/a)"),
             ("co2_sistema_t", "CO\u2082 residua sistema (t/a)"),
             ("ore_non_coperte", "Ore non coperte"),
-            ("capex_sistema", "CAPEX centrale (\u20ac)"),
+            ("capex_sistema", "CAPEX centrale, senza autoproduzione (\u20ac)"),
             ("capex_rete", "CAPEX rete (\u20ac)"),
+            ("capex_autoproduzione", "CAPEX autoproduzione elettrica (\u20ac)"),
+            ("kwp_autoproduzione", "Fotovoltaico (kWp)"),
+            ("batteria_autoproduzione_mwh", "Batteria (MWh)"),
+            ("ibridi_autoproduzione_m2", "Moduli ibridi da scheda elettrica (m²)"),
+            ("prezzo_el_effettivo", "Prezzo effettivo elettricità (\u20ac/MWh)"),
             ("costo_calore_acquistato", "Acquisto calore scarto (\u20ac/a)"),
             ("opex_annuo", "OPEX (\u20ac/a)"),
             ("costo_annuo", "Costo annuo equivalente (\u20ac/a)"),
