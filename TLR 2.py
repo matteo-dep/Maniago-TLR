@@ -5185,9 +5185,18 @@ taglia verrebbe sottostimata.
                               margin=dict(t=30, b=10))
             st.plotly_chart(_fu, width="stretch")
 
-            # costo di modifica in situ dichiarato nel CSV, per azienda
-            _cost_az = (flussi.assign(
-                _c=pd.to_numeric(flussi["costo_allacciamento_eur"], errors="coerce"))
+            # costo di modifica in situ per azienda, sui SOLI flussi selezionati
+            # (prima si sommavano tutti i flussi dell'azienda: Pietro Rosa
+            # risultava a 44.000 EUR, il costo della torre, anche con il solo
+            # maglio attivo). I flussi senza quotazione si stimano a potenza con
+            # lo stesso EUR/kW dell'Analisi economica, cosi' le due schede danno
+            # lo stesso numero.
+            _fl_sel_c = flussi[flussi["id_flusso"].isin(selected_flussi)]
+            _cq_sel = pd.to_numeric(_fl_sel_c["costo_allacciamento_eur"], errors="coerce")
+            _he_stima = float(st.session_state.get("eco_costo_he", 60))
+            _cost_az = (_fl_sel_c.assign(
+                _c=_cq_sel.fillna(pd.to_numeric(_fl_sel_c["P_kW"], errors="coerce")
+                                  .fillna(0.0) * _he_stima))
                 .groupby("azienda")["_c"].sum())
             _u["costo_modifica_eur"] = _u["azienda"].map(_cost_az).fillna(0.0)
             _u["eur_per_mwh_utile"] = np.where(
