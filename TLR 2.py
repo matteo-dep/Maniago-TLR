@@ -7584,13 +7584,15 @@ with step_el:
             _prezzo_acq_h = _forma_acq * (float(prezzo_el) / max(float(np.mean(_forma_acq)), 1e-9))
             st.caption(f"Prezzo d'acquisto medio **{float(np.mean(_prezzo_acq_h)):.0f} €/MWh** "
                        f"(dal Dimensionamento).")
-            _val_imm = st.slider("Valore dell'energia immessa (% del prezzo zonale)",
-                                 0, 100, 0, step=5, key="el_val_imm",
-                                 help="A zero l'impianto è valutato come puro "
-                                      "approvvigionamento: l'eccedenza non vale nulla "
-                                      "e l'ottimizzazione trova una taglia finita. "
-                                      "Alzandolo si tratta l'impianto anche come "
-                                      "vendita, e la taglia ottima cresce.")
+            _val_imm = st.slider("Prezzo di vendita dell'energia immessa (% del prezzo zonale)",
+                                 0, 100, 100, step=5, key="el_val_imm",
+                                 help="Serve solo a contare il ricavo dell'energia "
+                                      "prodotta in più e immessa in rete (costo netto "
+                                      "dell'elettricità e Analisi economica). NON entra "
+                                      "nel criterio di dimensionamento, che resta "
+                                      "tecnico: le taglie si scelgono come puro "
+                                      "approvvigionamento, con l'eccedenza a valore "
+                                      "nullo.")
             _val_cal_el = st.slider("Valore del calore da moduli ibridi (€/MWh)",
                                     0, 200,
                                     int(round(float(st.session_state.get(
@@ -7603,17 +7605,14 @@ with step_el:
             _anni_el = st.slider("Vita utile per l'annualizzazione (anni)", 10, 30, 20,
                                  key="el_anni")
 
-        if _val_imm == 0:
-            st.caption("Con l'eccedenza a valore nullo l'ottimizzazione cerca la "
-                       "configurazione che **minimizza il costo di approvvigionamento**: "
-                       "oltre una certa taglia si produrrebbe solo surplus inutile, "
-                       "quindi l'ottimo esiste ed è interno. È la lettura più prudente.")
-        else:
-            st.caption(f"Valorizzando l'eccedenza al {_val_imm} % del prezzo zonale "
-                       f"l'impianto è trattato anche come vendita: la taglia ottima "
-                       f"cresce, e può arrivare al limite della ricerca. In quel caso "
-                       f"il vincolo non è più energetico ma di superficie o di "
-                       f"potenza di connessione, da verificare a parte.")
+        st.caption("**Criterio di dimensionamento tecnico**: le taglie si scelgono come "
+                   "puro approvvigionamento delle pompe di calore, con l'eccedenza a valore "
+                   "nullo, cioè minimizzando investimento annualizzato + energia comprata "
+                   "dalla rete. Oltre una certa taglia si produrrebbe solo surplus, quindi "
+                   "l'ottimo è interno. L'energia prodotta in più viene comunque immessa "
+                   f"in rete e venduta al {_val_imm} % del prezzo zonale: il ricavo entra "
+                   "nel costo netto dell'elettricità e nell'Analisi economica, ma non "
+                   "cambia le taglie.")
 
         # --- serie unitarie: si calcolano una volta e si scalano, perche' la
         #     resa e' proporzionale alla taglia a parita' di temperatura ---
@@ -7656,11 +7655,14 @@ with step_el:
             r = dispatch_elettrico(prod, _cons_h, batteria_mwh=batt,
                                    p_batt_mw=batt * 0.5, eff_batt=0.90)
             acquisto = float((r["prelevato"] * _prezzo_acq_h).sum())
+            # ricavo della vendita dell'eccedenza: si conta nei costi, ma NON nel
+            # criterio di scelta delle taglie, che resta tecnico (eccedenza a
+            # valore nullo, come nella versione originale)
             ricavo = float((r["immesso"] * _prezzi_h).sum()) * (_val_imm / 100.0)
             calore = float((_ibr_th_u * area_ibr).sum())
             capex = (area_ibr * _costo_ibr_m2 + kwp * _costo_kwp
                      + batt * 1000.0 * _costo_kwh_b)
-            costo = capex * _crf_el + acquisto - ricavo - calore * _val_cal_el
+            costo = capex * _crf_el + acquisto - calore * _val_cal_el
             return {"area_ibr": area_ibr, "kwp": kwp, "batt": batt, "res": r,
                     "capex": capex, "acquisto": acquisto, "ricavo": ricavo,
                     "calore_mwh": calore, "costo": costo,
@@ -8292,25 +8294,38 @@ with tab_economia:
                                     0.25, 3.0, 0.75, step=0.25, key="eco_om_rete",
                                     help="Tubazioni preisolate e scambiatori richiedono poca "
                                          "manutenzione: di norma 0,5-1 % l'anno.")
-            pompaggio_kwh_mwh = st.slider("Elettricità di pompaggio (kWh el / MWh distribuito)",
-                                          0, 40, 12, step=1, key="eco_pomp",
-                                          help="QM: 8-20 kWh/MWh per reti ben progettate.")
+            pompaggio_kwh_mwh = st.slider(
+                "Consumo elettrico delle pompe di circolazione della rete "
+                "(kWh el per MWh distribuito)",
+                0, 40, 12, step=1, key="eco_pomp",
+                help="È un consumo, non un costo: l'elettricità che le pompe di "
+                     "circolazione della rete assorbono per ogni MWh di calore "
+                     "distribuito. Il costo si ottiene moltiplicando per il calore "
+                     "prodotto in centrale e per il prezzo dell'elettricità di rete del "
+                     "Dimensionamento (passo 2). QM: 8-20 kWh/MWh per reti ben progettate.")
+            _e_pomp_mwh = (float(_snap.get("carico_centrale_mwh", 0)) * pompaggio_kwh_mwh / 1000.0)
+            st.caption(f"Pompaggio: **{_e_pomp_mwh:,.0f} MWh/a** elettrici × "
+                       f"{float(_snap.get('prezzo_el', 0)):.0f} €/MWh = **"
+                       f"{_e_pomp_mwh * float(_snap.get('prezzo_el', 0)) / 1000:,.1f} k€/a**"
+                       .replace(",", "@").replace(".", ",").replace("@", "."))
             personale = st.slider("Personale e gestione (\u20ac/a)", 0, 200000, 45000, step=5000,
                                   key="eco_personale")
             assicuraz = st.slider("Assicurazioni, amministrazione, varie (\u20ac/a)",
                                   0, 100000, 15000, step=2500, key="eco_assic")
         with ec3:
             st.markdown("**Finanziario**")
-            orizzonte = st.slider("Orizzonte di analisi (anni)", 10, 40, 25, key="eco_anni")
+            orizzonte = st.slider("Durata progetto (anni)", 10, 40, 25, key="eco_anni")
             wacc = st.slider("Tasso di attualizzazione WACC (%)", 1.0, 12.0, 4.0, step=0.5,
                              key="eco_wacc") / 100.0
             contributo_pct = st.slider("Contributo a fondo perduto (% del CAPEX)", 0, 80, 40, step=5,
                                        key="eco_contributo")
-            esc_ricavi = st.slider("Escalation ricavi (%/a)", 0.0, 6.0, 2.0, step=0.25,
-                                   key="eco_esc_ric") / 100.0
+            esc_ricavi = st.slider("Inflazione vettore energetico gas (%/anno)", 0.0, 6.0, 2.0,
+                                   step=0.25, key="eco_esc_ric",
+                                   help="Crescita annua del prezzo di vendita del calore, "
+                                        "che segue il costo del gas per l'utente.") / 100.0
             esc_costi = st.slider("Escalation costi energia (%/a)", 0.0, 8.0, 2.0, step=0.25,
                                   key="eco_esc_cos") / 100.0
-            esc_om = st.slider("Escalation O&M (%/a)", 0.0, 6.0, 2.0, step=0.25,
+            esc_om = st.slider("Inflazione O&M (%/anno)", 0.0, 6.0, 2.0, step=0.25,
                                key="eco_esc_om") / 100.0
 
         # ---------------------------------------------------------------------
