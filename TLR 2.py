@@ -439,7 +439,15 @@ MAX_SNAP_M = 120.0
 # industriale in qualunque configurazione.
 GRAFO_CENTRO_LAT = 46.1495
 GRAFO_CENTRO_LON = 12.7175
-GRAFO_RAGGIO_KM = 3.6   # copre Fratta e Biblioteca (46,177 N) e tutti i privati
+GRAFO_RAGGIO_KM = 3.0
+# Riquadro (sud, ovest, nord, est) effettivamente scaricato: e' ritagliato
+# sull'area di studio (edifici pubblici, condomini, privati e aziende, con
+# ~300 m di margine) invece che su un quadrato attorno al centro. E' piu'
+# piccolo del quadrato da 3 km ma copre anche Fratta, la Biblioteca e i
+# privati piu' a nord e a ovest, che il quadrato lasciava fuori. Un riquadro
+# piu' grande (raggio 3,6 km) faceva scadere Overpass e superare all'API
+# ufficiale il limite di 50.000 nodi per richiesta (HTTP 400).
+GRAFO_BBOX = (46.1440, 12.6730, 46.1840, 12.7510)
 
 def calcola_sottocentrale(bmap_df):
     """Calcola la sottocentrale come punto intermedio tra il baricentro
@@ -739,23 +747,63 @@ def _osm_da_api_ufficiale(bb, timeout=90):
     return {"elements": elementi}, None
 
 
-def _osm_download_strade(centro_lat, centro_lon, raggio_km=1.5, timeout=60):
-    """Rete stradale del riquadro, da Overpass o dall'API ufficiale OSM.
+def _tasselli(bb, n):
+    """Divide il riquadro (s, o, n, e) in n x n tasselli."""
+    s_, o_, n_, e_ = bb
+    dl, dg = (n_ - s_) / n, (e_ - o_) / n
+    return [(s_ + i * dl, o_ + j * dg, s_ + (i + 1) * dl, o_ + (j + 1) * dg)
+            for i in range(n) for j in range(n)]
 
+
+def _unisci_osm(parti):
+    """Unisce le risposte di piu' tasselli eliminando nodi e strade doppi."""
+    visti, el = set(), []
+    for d in parti:
+        for e in d.get("elements", []):
+            k = (e.get("type"), e.get("id"))
+            if k in visti:
+                continue
+            visti.add(k)
+            el.append(e)
+    return {"elements": el}
+
+
+def _osm_download_strade(bb, timeout=120):
+    """Rete stradale del riquadro bb = (sud, ovest, nord, est).
+
+    Ordine dei tentativi:
+      1. Overpass sull'intero riquadro;
+      2. Overpass a tasselli 2 x 2 (richieste piu' leggere, meno timeout);
+      3. API ufficiale OSM a tasselli 3 x 3: l'API rifiuta con HTTP 400 le
+         richieste oltre 50.000 nodi, e l'area di Maniago intera li supera.
     Ritorna (dict, None) se va a buon fine, (None, messaggio) altrimenti.
     """
     try:
         import requests  # noqa: F401
     except ImportError:
         return None, "modulo 'requests' non installato (pip install requests)"
-    bb = _bbox(centro_lat, centro_lon, raggio_km)
     data, err1 = _osm_da_overpass(bb, timeout)
     if data is not None:
         return data, None
-    data, err2 = _osm_da_api_ufficiale(bb)
-    if data is not None:
-        return data, None
-    return None, f"Overpass ({err1}); API OSM ({err2})"
+    parti, err2 = [], None
+    for t in _tasselli(bb, 2):
+        d, e = _osm_da_overpass(t, 90)
+        if d is None:
+            err2 = e
+            break
+        parti.append(d)
+    if err2 is None and parti:
+        return _unisci_osm(parti), None
+    parti, err3 = [], None
+    for t in _tasselli(bb, 3):
+        d, e = _osm_da_api_ufficiale(t)
+        if d is None:
+            err3 = e
+            break
+        parti.append(d)
+    if err3 is None and parti:
+        return _unisci_osm(parti), None
+    return None, f"Overpass ({err1}); Overpass a tasselli ({err2}); API OSM a tasselli ({err3})"
 
 
 @st.cache_data(show_spinner="Scarico la rete stradale di Maniago (una volta sola)...")
@@ -782,7 +830,7 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
     # precedente (centro mobile, raggio 1,5 km): usarla lasciava fuori dal
     # grafo interi quartieri, i cui edifici risultavano irraggiungibili e
     # venivano collegati con lunghi tratti in linea d'aria.
-    bb_rich = _bbox(centro_lat, centro_lon, raggio_km)
+    bb_rich = GRAFO_BBOX
 
     def _copre(c):
         _b = c.get("_bbox") if isinstance(c, dict) else None
@@ -812,7 +860,7 @@ def carica_grafo_strade(centro_lat=CENTRALE_LAT, centro_lon=CENTRALE_LON,
             data = None
 
     if data is None:
-        data, err = _osm_download_strade(centro_lat, centro_lon, raggio_km)
+        data, err = _osm_download_strade(bb_rich)
         if data is None or _conta_nodi(data) == 0:
             if _vecchia is not None:
                 data = _vecchia        # meglio una mappa parziale che nessuna
@@ -4491,11 +4539,14 @@ with tab_domanda:
                             "tratta quasi sempre di un sovraccarico temporaneo o di un "
                             "proxy aziendale che blocca la richiesta.")
                 with st.expander("Scaricare la mappa manualmente"):
-                    _bbm = _bbox(GRAFO_CENTRO_LAT, GRAFO_CENTRO_LON, GRAFO_RAGGIO_KM)
-                    _url_m = (f"https://api.openstreetmap.org/api/0.6/map?"
-                              f"bbox={_bbm[1]:.5f},{_bbm[0]:.5f},{_bbm[3]:.5f},{_bbm[2]:.5f}")
+                    _bbm = GRAFO_BBOX
+                    # l'export di Overpass non ha il limite di 50.000 nodi dell'API
+                    # ufficiale, che sull'intera area di Maniago risponde HTTP 400
+                    _url_m = (f"https://overpass-api.de/api/map?"
+                              f"bbox={_bbm[1]:.4f},{_bbm[0]:.4f},{_bbm[3]:.4f},{_bbm[2]:.4f}")
                     st.markdown(
                         f"Da una rete senza restrizioni, apri [questo indirizzo]({_url_m}) "
+                        f"(export di OpenStreetMap tramite Overpass, qualche decina di MB) "
                         f"e salva il file `.osm` che viene restituito, poi caricalo qui "
                         f"sotto: viene convertito e messo in cache, e da quel momento il "
                         f"tracciato segue le strade senza bisogno di connessione.")
