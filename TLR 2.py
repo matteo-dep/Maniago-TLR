@@ -227,6 +227,14 @@ def _json_default(o):
     return str(o)
 
 
+def _firma_el(r):
+    """Impronta del risultato del passo Carico elettrico usata dal dimensionamento."""
+    if not r:
+        return None
+    return tuple(round(float(r.get(k, 0) or 0), 1) for k in
+                 ("consumo_mwh", "acquisto_eur", "ricavo_eur", "capex_eur", "copertura_pct"))
+
+
 def carica_scenari_file(percorso=FILE_SCENARI):
     try:
         with open(percorso, "r", encoding="utf-8") as f:
@@ -310,7 +318,7 @@ st.session_state["_widget_cur"] = set()
 
 # prefisso della chiave -> scheda in cui si trova il comando
 _SCHEDE_IPOTESI = [("dom_", "Domanda"), ("off_", "Offerta"), ("dim_", "Dimensionamento"),
-                   ("el_", "Carico elettrico"), ("eco_", "Analisi economica")]
+                   ("el_", "Dimensionamento · carico elettrico"), ("eco_", "Analisi economica")]
 # chiavi da non riportare singolarmente: le selezioni per edificio e per flusso
 # vengono riassunte negli elenchi, i pulsanti e i caricamenti non sono ipotesi
 _ESCLUSE_IPOTESI = ("dom_ed_", "dom_cl_", "dom_p_", "dom_c_", "off_az_", "off_fl_",
@@ -3855,11 +3863,12 @@ st.caption(
     "contemporaneità Fig. 12.2) e **IEA DHC TS5** (COP e CAPEX pompe di calore, accumuli)."
 )
 
-(tab_domanda, tab_offerta, tab_dimensionamento, tab_elettrico,
+# Il carico elettrico non e' piu' una scheda a se': e' il passo 4 del
+# Dimensionamento, fra "Taglie e accumuli" e "Risultati".
+(tab_domanda, tab_offerta, tab_dimensionamento,
  tab_confronto, tab_economia) = st.tabs(
     ["\U0001F3E0 Domanda", "\u267B\ufe0f Offerta", "\U0001F9EE Dimensionamento",
-     "\u26A1 Carico elettrico", "\U0001F4CA Confronto scenari",
-     "\U0001F4B6 Analisi economica"]
+     "\U0001F4CA Confronto scenari", "\U0001F4B6 Analisi economica"]
 )
 
 
@@ -5238,7 +5247,7 @@ with tab_offerta:
                                  "Prezzi fissi per azienda"],
             key="off_metodo_prezzo",
             help="Scala exergetica: quota del valore del calore venduto, in base alla "
-                 "qualita' (parametri in Dimensionamento, passo 4). Formula su PSV: "
+                 "qualita' (parametri in Dimensionamento, passo 5 · Risultati). Formula su PSV: "
                  "\u20ac/MWh ceduto = PSV del mese \u00d7 (a + b\u00b7w), con w peso exergetico "
                  "orario del flusso. Prezzi fissi: \u20ac/MWh costanti.")
         _psv_sel_off = st.selectbox(
@@ -5351,7 +5360,7 @@ taglia verrebbe sottostimata.
                    "di scarto selezionati sopra.")
 
     st.caption("I **moduli ibridi** non si impostano qui: producendo elettricità oltre "
-               "al calore, si dimensionano nella scheda **Carico elettrico**, dove i due "
+               "al calore, si dimensionano nel passo **4 · Carico elettrico** del Dimensionamento, dove i due "
                "prodotti si valutano insieme. Il calore che producono rientra poi nel "
                "bilancio termico con un trasferimento esplicito. Il **fotovoltaico** "
                "puro, che non produce calore, sta solo in quella scheda.")
@@ -5722,11 +5731,14 @@ with tab_dimensionamento:
     # Ogni passo mostra subito l'effetto della scelta, cosi' si procede
     # sapendo cosa si sta decidendo invece di riempire moduli.
     # =========================================================================
-    step1, step2, step3, step4 = st.tabs([
+    # step_el: passo 4 "Carico elettrico" (ex scheda separata); step4 resta il
+    # contenitore dei Risultati, che ora e' il passo 5
+    step1, step2, step3, step_el, step4 = st.tabs([
         "1 · Livelli termici",
         "2 · Tecnologie",
         "3 · Taglie e accumuli",
-        "4 · Risultati",
+        "4 · Carico elettrico",
+        "5 · Risultati",
     ])
 
     # ---------------------------------------------------------------- PASSO 1
@@ -5821,7 +5833,7 @@ with tab_dimensionamento:
                     help="Da dove la pompa a bassa temperatura preleva il calore "
                          "quando il calore di scarto non basta. La scelta pesa "
                          "molto su costi e ingombri: le opere sono confrontate "
-                         "nel passo 4, a valle del calcolo.")
+                         "nel passo 5 · Risultati, a valle del calcolo.")
                 _sp = SORGENTI_BASSA_T[tipo_sorgente]
                 if tipo_sorgente == "acqua di falda":
                     resa_sorgente = st.slider("Resa per pozzo (l/s)",
@@ -5868,7 +5880,7 @@ with tab_dimensionamento:
                     opex_bk_mwh = (prezzo_gas + _ets2_bk * EF_GAS_T_MWH_PCS) / rend_gas
                     st.caption(f"Comprende l'ETS2 a {_ets2_bk:.0f} €/t "
                                f"(+{_ets2_bk * EF_GAS_T_MWH_PCS:.1f} €/MWh di gas), impostato "
-                               f"nel riquadro della scala exergetica al passo 4.")
+                               f"nel riquadro della scala exergetica al passo 5.")
                 else:
                     rend_bio = st.slider("Rendimento caldaia (%)", 75, 92, 85,
                                          key="dim_rend_bio") / 100.0
@@ -5998,7 +6010,7 @@ with tab_dimensionamento:
                             f"{_s_ibr.sum():,.0f} MWh/a".replace(",", "."))
                 _c3i.metric("Elettricità",
                             f"{pvt_el_mwh:,.0f} MWh/a".replace(",", "."))
-                st.caption(f"Dimensionati nella scheda **Carico elettrico** "
+                st.caption(f"Dimensionati nel passo **4 · Carico elettrico** "
                            f"({CATALOGO_PVT[_ibr['modello']]['nome']}, "
                            f"{_ibr['T_esercizio']:.0f} °C) e trasferiti qui. "
                            f"Se li modifichi là, ritrasferiscili e rilancia il "
@@ -6020,31 +6032,35 @@ with tab_dimensionamento:
             if _ibr.get("attivo") else np.zeros(len(dom_arr)))
 
         # ------------------------------------------------------------------
-        # AUTOPRODUZIONE ELETTRICA
+        # AUTOPRODUZIONE ELETTRICA -> passo 4
+        # La scelta si fa in testa al passo 4 "Carico elettrico", dove si vede
+        # subito cosa comporta; il codice resta qui perche' il valore serve gia'
+        # all'ottimizzazione del passo 3.
         # ------------------------------------------------------------------
-        st.divider()
-        st.markdown("**⚡ Autoproduzione elettrica**")
-
-        if pvt_el_mwh > 0:
-            st.caption(f"L'impianto ibrido produce **{pvt_el_mwh:,.0f} MWh/a** elettrici. "
-                       f"Puoi tenerne conto nel costo dell'elettricità delle pompe di "
-                       f"calore, oppure ignorarli per mantenere il dimensionamento "
-                       f"termico indipendente.".replace(",", "."))
-        else:
-            st.caption("Nessuna produzione elettrica dal solare. Attivando l'opzione si "
-                       "può comunque dimensionare un fotovoltaico dedicato nella scheda "
-                       "**Carico elettrico**.")
-        considera_el = st.checkbox(
-            "Tieni conto dell'autoproduzione nel costo dell'elettricità",
-            value=False, key="dim_considera_el",
-            help="Se attivo si apre la scheda **Carico elettrico**, dove si calcolano "
-                 "autoconsumo e scambio con la rete; il costo dell'energia usato qui "
-                 "viene ridotto di conseguenza. Lasciandolo spento il dimensionamento "
-                 "termico resta indipendente dalle scelte elettriche, che è "
-                 "l'impostazione consigliata per confrontare scenari fra loro.")
-        if considera_el:
-            st.info("⚡ Scheda **Carico elettrico** attiva: configurala per calcolare "
-                    "l'autoconsumo, poi torna qui per vedere l'effetto sul costo.")
+        with step_el:
+            st.markdown("#### ⚡ Carico elettrico delle pompe di calore")
+            if pvt_el_mwh > 0:
+                st.caption(f"Il dimensionamento include moduli ibridi che producono "
+                           f"**{pvt_el_mwh:,.0f} MWh/a** elettrici.".replace(",", "."))
+            considera_el = st.checkbox(
+                "Includi l'autoproduzione elettrica (fotovoltaico, ibridi, batterie) "
+                "nel dimensionamento",
+                value=False, key="dim_considera_el",
+                help="Acceso: il costo dell'elettricità delle pompe di calore nei "
+                     "Risultati, nel costo del calore e nell'Analisi economica è quello "
+                     "che risulta da questo passo (acquisti dalla rete meno vendita "
+                     "dell'eccedenza) e l'investimento negli impianti si aggiunge al "
+                     "CAPEX. Spento: l'elettricità si paga tutta al prezzo del passo 2 "
+                     "e gli scenari restano confrontabili sulla sola parte termica.")
+            if considera_el:
+                st.success("✅ **Incluso.** Il risultato di questo passo entra nei "
+                           "Risultati (passo 5), nel confronto scenari e nell'Analisi "
+                           "economica. Rilanciando *Dimensiona* nel passo 3 le taglie "
+                           "vengono ricercate con il prezzo effettivo dell'elettricità.")
+            else:
+                st.info("**Non incluso.** Le pompe di calore comprano tutta "
+                        "l'elettricità dalla rete al prezzo del passo 2. Spunta la "
+                        "casella per dimensionare fotovoltaico, ibridi e batterie.")
         st.session_state["_dim_considera_el"] = considera_el
         st.session_state["_dim_serie_el_solare"] = _serie_el_dim
 
@@ -6058,7 +6074,7 @@ with tab_dimensionamento:
     with step3:
         st.markdown("#### Taglie delle macchine e volumi di accumulo")
         st.caption("Prima si lascia che il programma cerchi la configurazione migliore, "
-                   "poi si può ritoccarla. I risultati nel passo 4 si aggiornano a ogni "
+                   "poi si può ritoccarla. I risultati nel passo 5 si aggiornano a ogni "
                    "modifica, senza premere nulla.")
 
         _d1, _d2 = st.columns([1, 1])
@@ -6085,7 +6101,7 @@ with tab_dimensionamento:
                             "anni": int(st.session_state.get("eco_anni", 25)),
                             "contributo_pct": float(st.session_state.get("eco_contributo", 40)),
                             "om_pct": float(st.session_state.get("eco_om", 2.0))}
-                # prezzo effettivo dell'elettricita' (come nel passo 4)
+                # prezzo effettivo dell'elettricita' (come nei Risultati, passo 5)
                 _pel_opt = float(prezzo_el)
                 if considera_el:
                     _rel_o = st.session_state.get("_el_risultato") or {}
@@ -6270,6 +6286,11 @@ with tab_dimensionamento:
     prezzo_el_eff = prezzo_el
     quota_autocons = 0.0
     capex_autoproduzione = 0.0
+    # firma del risultato elettrico usato in questo calcolo: il passo 4 viene
+    # eseguito dopo, e se il suo risultato cambia la pagina si ricalcola subito,
+    # cosi' i Risultati non restano indietro di un'interazione
+    st.session_state["_el_usato"] = (_firma_el(st.session_state.get("_el_risultato"))
+                                     if considera_el else None)
     if considera_el:
         _rel = st.session_state.get("_el_risultato") or {}
         quota_autocons = float(_rel.get("copertura_pct", 0.0)) / 100.0
@@ -6512,13 +6533,13 @@ with tab_dimensionamento:
         # ---- schema di massima dell'impianto dimensionato ----
         if considera_el and quota_autocons > 0:
             st.info(f"⚡ Il costo dell'elettricità tiene conto dell'autoproduzione: "
-                    f"copertura **{quota_autocons * 100:.0f}%** dalla scheda *Carico "
+                    f"copertura **{quota_autocons * 100:.0f}%** dal passo *4 · Carico "
                     f"elettrico*, prezzo effettivo **{prezzo_el_eff:.0f} €/MWh** invece "
                     f"di {prezzo_el:.0f}. Per confrontare gli scenari su basi omogenee "
                     f"conviene disattivare l'opzione nel passo 2.")
         elif considera_el:
             st.warning("⚡ Autoproduzione attiva ma nessun risultato disponibile: "
-                       "apri la scheda **Carico elettrico** e configura la generazione.")
+                       "apri il passo **4 · Carico elettrico** e configura la generazione.")
 
         # ---- dimensionamento della sorgente fredda ----
         if is_hp_par and E_ground > 1:
@@ -7073,7 +7094,7 @@ with tab_dimensionamento:
         st.warning("⚡ L'autoproduzione elettrica è stata ottimizzata per un'altra "
                    "configurazione (consumo delle pompe diverso da quello attuale) o non "
                    "è ancora stata calcolata. Rilancia **Trova la configurazione ottima** "
-                   "nella scheda *Carico elettrico* prima di salvare lo scenario.")
+                   "nel passo *4 · Carico elettrico* prima di salvare lo scenario.")
     sc1, sc2 = st.columns([3, 1])
     _nome_def = f"{backup_tipo} · {T_mandata_ideale}/{T_ritorno_ideale}°C"
     nome_scen = sc1.text_input("Nome dello scenario da salvare", value=_nome_def, key="dim_nome_scen")
@@ -7099,22 +7120,14 @@ with tab_dimensionamento:
 # Volutamente separata dal dimensionamento termico: le scelte elettriche non
 # devono condizionare il dispatch del calore, che risponde a vincoli propri.
 # =============================================================================
-with tab_elettrico:
-    st.markdown("### ⚡ Copertura del carico elettrico")
+with step_el:
     _snap_el = st.session_state.get("_dim_snapshot")
     _attiva_el = bool(st.session_state.get("_dim_considera_el", False))
     if not _snap_el:
-        st.info("Configura prima un assetto nella scheda **Dimensionamento**: "
-                "da lì arrivano i consumi elettrici delle pompe di calore.")
+        st.info("Completa prima i passi 1-3: da lì arrivano i consumi elettrici "
+                "delle pompe di calore.")
     elif not _attiva_el:
-        st.warning(
-            "Questa scheda è disattivata. Per usarla vai nel **Dimensionamento**, "
-            "passo *2 · Tecnologie*, e spunta **«Tieni conto dell'autoproduzione "
-            "nel costo dell'elettricità»**.")
-        st.caption(
-            "La separazione è voluta: finché la spunta è spenta il dimensionamento "
-            "termico non dipende dalle scelte elettriche, e gli scenari restano "
-            "confrontabili fra loro sulla sola parte di calore.")
+        pass
     else:
         _serie_el = st.session_state.get("_dim_serie_elettriche", {}) or {}
         _cons_h = np.asarray(_serie_el.get("consumo_hp", []), dtype=float)
@@ -7453,8 +7466,8 @@ with tab_elettrico:
                             "serie_elettrica": _ibr_el_u * _best["area_ibr"],
                             "termico_mwh": _th_ott,
                         }
-                        st.success("Trasferito. Torna nella scheda **Dimensionamento** "
-                                   "e rilancia il dimensionamento: il calore degli "
+                        st.success("Trasferito. Rilancia il dimensionamento nel passo "
+                                   "3 · Taglie e accumuli: il calore degli "
                                    "ibridi è ora incluso.")
                         st.rerun()
                     st.caption("Il calore degli ibridi alleggerisce il carico delle "
@@ -7514,6 +7527,11 @@ with tab_elettrico:
                 "acquisto_eur": round(_best["acquisto"]),
                 "ricavo_eur": round(_best["ricavo"]),
             }
+            # il dimensionamento (gia' eseguito in questo giro) ha usato un
+            # risultato diverso: si ricalcola una volta per allinearlo
+            if (_firma_el(st.session_state["_el_risultato"])
+                    != st.session_state.get("_el_usato")):
+                st.rerun()
 
 
 
@@ -7788,7 +7806,7 @@ with tab_economia:
                 horizontal=True, key="eco_origine_prezzo",
                 help="Target: costo del calore a gas per l'utente, (PSV mensile + spread) / "
                      "rendimento caldaia, meno lo sconto; parametri in Dimensionamento, "
-                     "passo 4, riquadro della scala exergetica.")
+                     "passo 5, riquadro della scala exergetica.")
             if _origine_prezzo == "Target: gas scontato" and _pt_snap:
                 prezzo_calore = round(float(_pt_snap), 1)
                 st.caption(f"Costo del calore a gas per l'utente "
@@ -7821,7 +7839,7 @@ with tab_economia:
             _costo_scarto_base = float(_snap.get("costo_calore_acquistato", 0))
             _metodo_eco = st.session_state.get("off_metodo_prezzo",
                                                "Scala exergetica (riferimento gas)")
-            _orig_eco = ("scala exergetica, parametri in *Dimensionamento* passo 4"
+            _orig_eco = ("scala exergetica, parametri in *Dimensionamento* passo 5"
                          if _metodo_eco.startswith("Scala")
                          else ("formula PSV \u00d7 (a + b\u00b7w) impostata in *Offerta*"
                                if _metodo_eco.startswith("Formula")
