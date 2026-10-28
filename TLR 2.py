@@ -203,8 +203,159 @@ def applica_default_slider(force=False):
 if "_init_done" not in st.session_state:
     applica_default_slider(force=True)
     st.session_state["_init_done"] = True
+# -----------------------------------------------------------------------------
+# SCENARI PERSISTENTI
+# Gli scenari salvati vivevano solo nella sessione del browser: ricaricando la
+# pagina o riaprendo l'app sparivano. Ora vengono scritti anche in un file JSON
+# accanto allo script e riletti all'avvio di ogni sessione. Su Streamlit Cloud
+# il disco si azzera quando l'app viene riavviata o ridistribuita (per esempio
+# dopo un commit su GitHub): per conservarli in modo definitivo si usa
+# l'esportazione/importazione JSON della scheda Confronto scenari.
+# -----------------------------------------------------------------------------
+FILE_SCENARI = "scenari_salvati.json"
+
+
+def _json_default(o):
+    """Converte numpy e tipi non standard in valori serializzabili."""
+    if hasattr(o, "item"):
+        try:
+            return o.item()
+        except Exception:
+            pass
+    if isinstance(o, (set, tuple)):
+        return list(o)
+    return str(o)
+
+
+def carica_scenari_file(percorso=FILE_SCENARI):
+    try:
+        with open(percorso, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def salva_scenari_file(scenari, percorso=FILE_SCENARI):
+    """Scrive gli scenari su disco. Ritorna True se riuscito."""
+    try:
+        _tmp = percorso + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            json.dump(scenari, f, ensure_ascii=False, indent=1, default=_json_default)
+        os.replace(_tmp, percorso)
+        return True
+    except Exception:
+        return False
+
+
 if "_scenari" not in st.session_state:
-    st.session_state["_scenari"] = {}
+    st.session_state["_scenari"] = carica_scenari_file()
+
+# -----------------------------------------------------------------------------
+# REGISTRO DELLE IPOTESI
+# Per riportare nella scheda PDF TUTTE le ipotesi di uno scenario serve sapere,
+# per ogni comando, l'etichetta che l'utente vede. I comandi di input vengono
+# avvolti una sola volta per processo: ogni chiamata con una `key` registra
+# l'etichetta nella sessione. Il valore si legge poi da st.session_state.
+# -----------------------------------------------------------------------------
+_WIDGET_IPOTESI = ("slider", "select_slider", "number_input", "checkbox", "radio",
+                   "selectbox", "multiselect", "text_input", "toggle")
+
+
+def _registra_etichetta(label, kwargs):
+    try:
+        _k = kwargs.get("key")
+        if _k:
+            _reg = st.session_state.setdefault("_etichette_widget", {})
+            _reg[str(_k)] = str(label)
+            # comandi effettivamente mostrati in questa esecuzione: servono a non
+            # riportare valori rimasti in memoria di comandi oggi nascosti
+            st.session_state.setdefault("_widget_cur", set()).add(str(_k))
+    except Exception:
+        pass
+
+
+def _avvolgi_widget():
+    try:
+        from streamlit.delta_generator import DeltaGenerator as _DG
+    except Exception:
+        _DG = None
+    for _n in _WIDGET_IPOTESI:
+        if _DG is not None and hasattr(_DG, _n):
+            _orig = getattr(_DG, _n)
+            if not getattr(_orig, "_tlr_avvolto", False):
+                def _mk_m(orig):
+                    def _w(self, label, *a, **k):
+                        _registra_etichetta(label, k)
+                        return orig(self, label, *a, **k)
+                    _w._tlr_avvolto = True
+                    return _w
+                setattr(_DG, _n, _mk_m(_orig))
+        if hasattr(st, _n):
+            _orig_f = getattr(st, _n)
+            if not getattr(_orig_f, "_tlr_avvolto", False):
+                def _mk_f(orig):
+                    def _w(label, *a, **k):
+                        _registra_etichetta(label, k)
+                        return orig(label, *a, **k)
+                    _w._tlr_avvolto = True
+                    return _w
+                setattr(st, _n, _mk_f(_orig_f))
+
+
+_avvolgi_widget()
+# ad ogni esecuzione si ricorda quali comandi erano visibili in quella precedente
+st.session_state["_widget_prev"] = set(st.session_state.get("_widget_cur", set()))
+st.session_state["_widget_cur"] = set()
+
+# prefisso della chiave -> scheda in cui si trova il comando
+_SCHEDE_IPOTESI = [("dom_", "Domanda"), ("off_", "Offerta"), ("dim_", "Dimensionamento"),
+                   ("el_", "Carico elettrico"), ("eco_", "Analisi economica")]
+# chiavi da non riportare singolarmente: le selezioni per edificio e per flusso
+# vengono riassunte negli elenchi, i pulsanti e i caricamenti non sono ipotesi
+_ESCLUSE_IPOTESI = ("dom_ed_", "dom_cl_", "dom_p_", "dom_c_", "off_az_", "off_fl_",
+                    "dim_btn", "dim_nome_scen", "dom_osm_upload", "del_scen",
+                    "dom_retry", "off_retry", "dim_rimuovi", "dom_dens_vista",
+                    "dom_dens_cella", "dom_mostra_strade", "eco_dl", "conf_",
+                    "dim_dl", "dom_all_tip", "dom_view")
+
+
+def raccogli_ipotesi():
+    """Fotografa tutte le ipotesi correnti: valore di ogni comando con la sua
+    etichetta e la scheda, piu' gli elenchi di zone, edifici e flussi."""
+    _reg = st.session_state.get("_etichette_widget", {})
+    _visibili = (set(st.session_state.get("_widget_prev", set()))
+                 | set(st.session_state.get("_widget_cur", set())))
+    righe = []
+    for _k in sorted(st.session_state.keys()):
+        _k = str(_k)
+        _sch = next((s for p, s in _SCHEDE_IPOTESI if _k.startswith(p)), None)
+        if _sch is None or _k.startswith(_ESCLUSE_IPOTESI) or _k not in _visibili:
+            continue
+        _v = st.session_state.get(_k)
+        if isinstance(_v, (bytes, bytearray)) or callable(_v) or _v is None:
+            continue
+        if hasattr(_v, "item"):
+            _v = _v.item()
+        if isinstance(_v, tuple):
+            _v = list(_v)
+        if not isinstance(_v, (int, float, str, bool, list)):
+            continue
+        _lab = _reg.get(_k, _k)
+        _lab = _lab.replace("**", "").strip()
+        righe.append({"scheda": _sch, "chiave": _k, "ipotesi": _lab, "valore": _v})
+    _ordine = {s: i for i, (_, s) in enumerate(_SCHEDE_IPOTESI)}
+    righe.sort(key=lambda r: (_ordine.get(r["scheda"], 9), r["ipotesi"].lower()))
+    elenchi = {
+        "Zone selezionate": list(st.session_state.get("_dom_zone", []) or []),
+        "Edifici selezionati": list(st.session_state.get("_dom_edifici", []) or []),
+        "Edifici serviti dal tracciato": list(st.session_state.get("_dom_edifici_serviti", []) or []),
+        "Esclusi dal tracciato": list(st.session_state.get("_dom_esclusi_rete", []) or []),
+        "Flussi di calore di scarto": list(st.session_state.get("_off_flussi", []) or []),
+        "Prezzo del calore di scarto (€/MWh)": {
+            str(a): v for a, v in (st.session_state.get("_off_prezzi_scarto", {}) or {}).items()},
+    }
+    return {"parametri": righe, "elenchi": elenchi}
 
 # -----------------------------------------------------------------------------
 # PALETTE
@@ -227,15 +378,15 @@ COLOR_GROUND = "#8C6D46"
 
 ZONE_NOMI = {
     1: "Zona 1 - Comune NE",
-    2: "Zona 2 - Maniago Sud",
+    2: "Zona 2 - Caserme",
     3: "Zona 3 - Sud",
     4: "Zona 4 - Centro",
     5: "Zona 5 - Ovest",
 }
-ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Maniago Sud"]
+ZONE_DEFAULT = ["Zona 1 - Comune NE", "Zona 2 - Caserme"]
 ZONA_COLORI = {
     "Zona 1 - Comune NE": "#2D7DC0",
-    "Zona 2 - Maniago Sud": "#E63946",
+    "Zona 2 - Caserme": "#E63946",
     "Zona 3 - Sud": "#E9C46A",
     "Zona 4 - Centro": "#9B5DE5",
     "Zona 5 - Ovest": "#3FA34D",
@@ -2802,12 +2953,13 @@ def load_data():
         if _esclusi.any():
             buildings = buildings[~_esclusi].copy()
     else:
-        # compatibilita' con i vecchi nomi usati nei CSV, compreso "Ex Bioman"
-        # che nel frattempo e' diventato "Maniago Sud"
+        # compatibilita' con i vecchi nomi usati nei CSV: "Ex Bioman" e "Maniago
+        # Sud" sono la stessa zona 2, ora chiamata "Caserme"
         buildings["cluster"] = buildings["cluster"].replace({
             "NE-Centro": "Zona 1 - Comune NE",
-            "Ex Bioman": "Zona 2 - Maniago Sud",
-            "Maniago Sud": "Zona 2 - Maniago Sud",
+            "Caserme": "Zona 2 - Caserme",
+            "Ex Bioman": "Zona 2 - Caserme",
+            "Maniago Sud": "Zona 2 - Caserme",
             "Campagna": "Zona 3 - Sud", "Ovest": "Zona 5 - Ovest"})
     domanda = domanda[domanda["edificio"].isin(buildings["edificio"])].copy()
     domanda = domanda.drop(columns=["cluster"], errors="ignore").merge(
@@ -3262,10 +3414,138 @@ def genera_pdf_scenari(scenari, titolo="Confronto scenari"):
                 stile.append(("BACKGROUND", (0, r), (-1, r), colors.HexColor("#FAFAFA")))
             r += 1
 
+    # --- tutti gli altri risultati salvati nello scenario, senza perderne nessuno ---
+    _gia = {c for _, campi in gruppi for c, *_ in campi} | {"ipotesi", "salvato_il"}
+    _altri = sorted({k for n in nomi for k in scenari[n].keys()} - _gia)
+    if _altri:
+        dati.append(["Altri risultati salvati"] + [""] * len(nomi))
+        stile += [("BACKGROUND", (0, r), (-1, r), colors.HexColor("#D6EAF8")),
+                  ("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"),
+                  ("SPAN", (0, r), (-1, r))]
+        r += 1
+        for chiave in _altri:
+            _vals = [scenari[n].get(chiave) for n in nomi]
+            _dec = 2 if any(isinstance(v, float) for v in _vals) else 0
+            dati.append([chiave.replace("_", " ")] + [fmt(v, _dec) for v in _vals])
+            if r % 2 == 0:
+                stile.append(("BACKGROUND", (0, r), (-1, r), colors.HexColor("#FAFAFA")))
+            r += 1
+
     larg = [72 * mm] + [(196 - 72) / max(len(nomi), 1) * mm] * len(nomi)
     t = Table(dati, colWidths=larg, repeatRows=1)
     t.setStyle(TableStyle(stile))
     el.append(t)
+
+    # --- IPOTESI E DATI INSERITI: tutti i comandi impostati al salvataggio ---
+    from reportlab.platypus import PageBreak
+    cella = ParagraphStyle("cella", parent=ss["Normal"], fontSize=6.5, leading=8)
+    cella_b = ParagraphStyle("cella_b", parent=cella, fontName="Helvetica-Bold")
+
+    def _txt(v):
+        if v is None or v == "":
+            return "—"
+        if isinstance(v, bool):
+            return "sì" if v else "no"
+        if isinstance(v, dict):
+            return "; ".join(f"{k}: {_txt(x)}" for k, x in v.items()) or "—"
+        if isinstance(v, list):
+            return ", ".join(_txt(x) for x in v) or "—"
+        if isinstance(v, float):
+            s_ = f"{v:,.3f}".rstrip("0").rstrip(".")
+            return s_.replace(",", "@").replace(".", ",").replace("@", ".")
+        if isinstance(v, int):
+            return f"{v:,}".replace(",", ".")
+        return str(v)
+
+    def _esc(t_):
+        # i font standard del PDF non hanno emoji ne' apici/pedici: si
+        # sostituiscono i simboli comuni e si tolgono gli altri
+        t_ = str(t_)
+        for a_, b_ in (("³", "3"), ("²", "2"), ("₂", "2"), ("η", "eta"), ("Δ", "delta"),
+                       ("→", "->"), ("·", "·"), ("×", "x")):
+            t_ = t_.replace(a_, b_)
+        t_ = "".join(c for c in t_ if ord(c) <= 0xFF or c == "€").strip()
+        return t_.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    _ip = {n: (scenari[n].get("ipotesi") or {}) for n in nomi}
+    if any(_ip.values()):
+        el.append(PageBreak())
+        el.append(Paragraph("Ipotesi e dati inseriti", h1))
+        el.append(Paragraph(
+            "Valori di tutti i comandi delle schede Domanda, Offerta, Dimensionamento, "
+            "Carico elettrico e Analisi economica al momento del salvataggio di ciascuno "
+            "scenario. Le righe in cui gli scenari differiscono sono evidenziate.", sub))
+        el.append(Spacer(1, 4))
+        _salv = [scenari[n].get("salvato_il", "—") for n in nomi]
+        dati_i = [[Paragraph("<b>Ipotesi</b>", cella)]
+                  + [Paragraph(f"<b>{_esc(n)}</b><br/>salvato il {_esc(s_)}", cella)
+                     for n, s_ in zip(nomi, _salv)]]
+        stile_i = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D6EAF8")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ]
+        ri = 1
+        # elenchi (zone, edifici, flussi, prezzi)
+        _nomi_el = []
+        for n in nomi:
+            for k in (_ip[n].get("elenchi") or {}):
+                if k not in _nomi_el:
+                    _nomi_el.append(k)
+        if _nomi_el:
+            dati_i.append([Paragraph("Selezioni", cella_b)] + [""] * len(nomi))
+            stile_i += [("SPAN", (0, ri), (-1, ri)),
+                        ("BACKGROUND", (0, ri), (-1, ri), colors.HexColor("#EAF2F8"))]
+            ri += 1
+            for k in _nomi_el:
+                _vals = [(_ip[n].get("elenchi") or {}).get(k) for n in nomi]
+                dati_i.append([Paragraph(_esc(k), cella)]
+                              + [Paragraph(_esc(_txt(v)), cella) for v in _vals])
+                if len({_txt(v) for v in _vals}) > 1:
+                    stile_i.append(("BACKGROUND", (1, ri), (-1, ri), colors.HexColor("#FFF4D6")))
+                ri += 1
+        # parametri, raggruppati per scheda nell'ordine dell'app
+        _par = {}
+        _ord = []
+        for n in nomi:
+            for p_ in (_ip[n].get("parametri") or []):
+                _ch = p_.get("chiave")
+                if _ch not in _par:
+                    _par[_ch] = (p_.get("scheda", ""), p_.get("ipotesi", _ch))
+                    _ord.append(_ch)
+        _rank = {s_: i for i, (_, s_) in enumerate(_SCHEDE_IPOTESI)}
+        _ord.sort(key=lambda c: (_rank.get(_par[c][0], 9), _par[c][1].lower()))
+        _sch_corr = None
+        for _ch in _ord:
+            _sch, _lab = _par[_ch]
+            if _sch != _sch_corr:
+                dati_i.append([Paragraph(_esc(_sch), cella_b)] + [""] * len(nomi))
+                stile_i += [("SPAN", (0, ri), (-1, ri)),
+                            ("BACKGROUND", (0, ri), (-1, ri), colors.HexColor("#EAF2F8"))]
+                ri += 1
+                _sch_corr = _sch
+            _vals = []
+            for n in nomi:
+                _m = next((p_ for p_ in (_ip[n].get("parametri") or [])
+                           if p_.get("chiave") == _ch), None)
+                _vals.append(_m.get("valore") if _m else None)
+            dati_i.append([Paragraph(_esc(_lab), cella)]
+                          + [Paragraph(_esc(_txt(v)), cella) for v in _vals])
+            if len({_txt(v) for v in _vals}) > 1:
+                stile_i.append(("BACKGROUND", (1, ri), (-1, ri), colors.HexColor("#FFF4D6")))
+            ri += 1
+        _li = [80 * mm] + [(269 - 80) / max(len(nomi), 1) * mm] * len(nomi)
+        t_i = Table(dati_i, colWidths=_li, repeatRows=1)
+        t_i.setStyle(TableStyle(stile_i))
+        el.append(t_i)
+        _senza = [n for n in nomi if not _ip[n]]
+        if _senza:
+            el.append(Spacer(1, 4))
+            el.append(Paragraph(
+                "Scenari salvati con una versione precedente dell'app, senza la "
+                "fotografia delle ipotesi: " + _esc(", ".join(_senza)) + ".", note))
 
     el.append(Spacer(1, 8))
     el.append(Paragraph(
@@ -4747,6 +5027,48 @@ with tab_domanda:
                            f"({_quota_bff:.0f}% delle zone attive) · "
                            f"buffer {buffer_m} m · allacciamento {fattore_correzione}%")
 
+            # --- tabella degli edifici serviti e della loro domanda ---
+            # Un edificio per riga per i pubblici (anche quelli che sulla mappa
+            # stanno sotto lo stesso pallino perche' hanno le stesse coordinate),
+            # una riga aggregata per privati e una per condomini.
+            _righe_srv = []
+            if not _bmap_srv_e.empty:
+                for _r in _bmap_srv_e.sort_values("consumo_annuo_MWh", ascending=False).itertuples():
+                    _righe_srv.append({
+                        "Edificio": _r.edificio,
+                        "Tipo": getattr(_r, "tipologia", "Pubblico"),
+                        "Zona": str(_r.cluster).split(" - ")[0],
+                        "Domanda (MWh/a)": round(float(_r.consumo_annuo_MWh), 1)})
+            if _E_priv > 0:
+                _righe_srv.append({
+                    "Edificio": (f"Privati agganciati ({_n_priv_buffer} edifici nel buffer × "
+                                 f"{fattore_correzione}% allacciamento ≈ {_n_priv_allacciati} utenze)"),
+                    "Tipo": "Residenziale privato (aggregato)",
+                    "Zona": ", ".join(sorted(str(z).split(" - ")[0]
+                                             for z in _priv_in["cluster"].unique())),
+                    "Domanda (MWh/a)": round(_E_priv, 1)})
+            if _E_cond > 0:
+                _righe_srv.append({
+                    "Edificio": (f"Condomini ({_n_cond_serviti} edifici, adesione "
+                                 f"{tasso_cond}% ≈ {_n_cond_unita_all} unità)"),
+                    "Tipo": "Condominio (aggregato)",
+                    "Zona": ", ".join(sorted(str(z).split(" - ")[0]
+                                             for z in _cond_sel["cluster"].unique())),
+                    "Domanda (MWh/a)": round(_E_cond, 1)})
+            if _righe_srv:
+                _df_srv = pd.DataFrame(_righe_srv)
+                _df_srv["Quota (%)"] = (_df_srv["Domanda (MWh/a)"]
+                                        / max(_E_tot, 1e-9) * 100).round(1)
+                _df_srv = pd.concat([_df_srv, pd.DataFrame([{
+                    "Edificio": "TOTALE", "Tipo": "", "Zona": "",
+                    "Domanda (MWh/a)": round(_E_tot, 1), "Quota (%)": 100.0}])],
+                    ignore_index=True)
+                st.markdown("##### 🏢 Edifici serviti e domanda")
+                st.dataframe(_df_srv, width="stretch", hide_index=True)
+                st.caption("Domanda annua alle utenze, prima delle perdite di rete. Gli "
+                           "edifici con le stesse coordinate compaiono qui su righe "
+                           "distinte anche se sulla mappa si sovrappongono.")
+
             # --- opportunistici: zone senza ancora (nessun pubblico né condominio) ---
             _zone_ancora = set()
             if not bmap.empty:
@@ -5184,9 +5506,18 @@ taglia verrebbe sottostimata.
                               margin=dict(t=30, b=10))
             st.plotly_chart(_fu, width="stretch")
 
-            # costo di modifica in situ dichiarato nel CSV, per azienda
-            _cost_az = (flussi.assign(
-                _c=pd.to_numeric(flussi["costo_allacciamento_eur"], errors="coerce"))
+            # costo di modifica in situ per azienda, sui SOLI flussi selezionati
+            # (prima si sommavano tutti i flussi dell'azienda: Pietro Rosa
+            # risultava a 44.000 EUR, il costo della torre, anche con il solo
+            # maglio attivo). I flussi senza quotazione si stimano a potenza con
+            # lo stesso EUR/kW dell'Analisi economica, cosi' le due schede danno
+            # lo stesso numero.
+            _fl_sel_c = flussi[flussi["id_flusso"].isin(selected_flussi)]
+            _cq_sel = pd.to_numeric(_fl_sel_c["costo_allacciamento_eur"], errors="coerce")
+            _he_stima = float(st.session_state.get("eco_costo_he", 60))
+            _cost_az = (_fl_sel_c.assign(
+                _c=_cq_sel.fillna(pd.to_numeric(_fl_sel_c["P_kW"], errors="coerce")
+                                  .fillna(0.0) * _he_stima))
                 .groupby("azienda")["_c"].sum())
             _u["costo_modifica_eur"] = _u["azienda"].map(_cost_az).fillna(0.0)
             _u["eur_per_mwh_utile"] = np.where(
@@ -5953,8 +6284,22 @@ with tab_dimensionamento:
             prezzo_el_eff = prezzo_el * (1.0 - quota_autocons)
     opex_lordo = sim["E_el_tot"] * prezzo_el_eff + E_bk * opex_bk_mwh
     opex = opex_lordo - ricavo_pvt_el
-    costo_annuo = capex_sistema * fattore_crf + opex
+    # l'investimento in autoproduzione si annualizza insieme alla centrale: il
+    # risparmio sull'elettricita' e' gia' nell'opex, senza l'investimento il LCOH
+    # degli scenari con fotovoltaico risultava troppo basso. Solo indicatore: i
+    # flussi di cassa dell'Analisi economica lo contavano gia'.
+    costo_annuo = (capex_sistema + capex_autoproduzione) * fattore_crf + opex
     lcoh = costo_annuo / dom_tot if dom_tot > 0 else np.nan
+    # taglie dell'autoproduzione e verifica che l'ottimizzazione elettrica sia
+    # stata fatta su questa configurazione (consumo delle pompe uguale)
+    _rel_s = (st.session_state.get("_el_risultato") or {}) if considera_el else {}
+    kwp_autoprod = float(_rel_s.get("kwp_pv", 0.0))
+    batt_autoprod = float(_rel_s.get("batteria_mwh", 0.0))
+    ibr_autoprod = float(_rel_s.get("ibrido_m2", 0.0))
+    _cons_ott = float(_rel_s.get("consumo_mwh", 0.0))
+    _cons_ora = float(sim["E_el_tot"])
+    autoprod_da_rifare = bool(considera_el) and (
+        not _rel_s or abs(_cons_ott - _cons_ora) > max(0.01 * _cons_ora, 1.0))
 
     el_hp = sim["el_alta"] + sim["el_bassa"]
     ground = sim["q_ground"]
@@ -6484,9 +6829,13 @@ with tab_dimensionamento:
         s1, s2, s3, s4 = st.columns(4)
         s1.metric("CAPEX di sistema", f"{capex_sistema:,.0f} \u20ac".replace(",", "."))
         s2.metric("Costo annuo", f"{costo_annuo:,.0f} \u20ac/a".replace(",", "."),
-                  help=f"capitale {capex_sistema * fattore_crf:,.0f} + esercizio {opex:,.0f}".replace(",", "."))
+                  help=(f"capitale {(capex_sistema + capex_autoproduzione) * fattore_crf:,.0f}"
+                        + (f" (di cui autoproduzione {capex_autoproduzione * fattore_crf:,.0f})"
+                           if capex_autoproduzione > 0 else "")
+                        + f" + esercizio {opex:,.0f}").replace(",", "."))
         s3.metric("LCOH di sistema", f"{lcoh:.1f} \u20ac/MWh" if not np.isnan(lcoh) else "n/d",
-                  help="Costo del calore alla centrale. Non comprende rete, O&M e "
+                  help="Costo del calore alla centrale, compreso l'investimento in "
+                       "autoproduzione elettrica se attiva. Non comprende rete, O&M e "
                        "personale: quelli sono nella scheda Analisi economica.")
         s4.metric("Quota FER", f"{quota_fer:.0f}%")
 
@@ -6665,6 +7014,9 @@ with tab_dimensionamento:
         "autoproduzione_el": ("sì" if considera_el else "no"),
         "prezzo_el_effettivo": round(prezzo_el_eff),
         "capex_autoproduzione": round(capex_autoproduzione),
+        "kwp_autoproduzione": round(kwp_autoprod),
+        "batteria_autoproduzione_mwh": round(batt_autoprod, 1),
+        "ibridi_autoproduzione_m2": round(ibr_autoprod),
         "carico_utenze_mwh": round(dom_tot_utenze),
         "carico_centrale_mwh": round(dom_tot),
         "perdite_rete_pct": round(_perd_pct, 1),
@@ -6717,14 +7069,27 @@ with tab_dimensionamento:
 
     # --- salvataggio scenario (P9: rimovibili singolarmente) ---
     st.divider()
+    if autoprod_da_rifare:
+        st.warning("⚡ L'autoproduzione elettrica è stata ottimizzata per un'altra "
+                   "configurazione (consumo delle pompe diverso da quello attuale) o non "
+                   "è ancora stata calcolata. Rilancia **Trova la configurazione ottima** "
+                   "nella scheda *Carico elettrico* prima di salvare lo scenario.")
     sc1, sc2 = st.columns([3, 1])
     _nome_def = f"{backup_tipo} · {T_mandata_ideale}/{T_ritorno_ideale}°C"
     nome_scen = sc1.text_input("Nome dello scenario da salvare", value=_nome_def, key="dim_nome_scen")
     if sc2.button("\U0001F4BE Salva scenario", width="stretch", key="dim_btn_salva"):
         if nome_scen.strip():
-            st.session_state["_scenari"][nome_scen.strip()] = dict(st.session_state["_dim_snapshot"])
+            from datetime import datetime as _dt
+            _snap_s = dict(st.session_state["_dim_snapshot"])
+            # fotografia completa delle ipotesi, per la scheda PDF di confronto
+            _snap_s["ipotesi"] = raccogli_ipotesi()
+            _snap_s["salvato_il"] = _dt.now().strftime("%d/%m/%Y %H:%M")
+            st.session_state["_scenari"][nome_scen.strip()] = _snap_s
+            _ok_f = salva_scenari_file(st.session_state["_scenari"])
             st.success(f"Scenario **{nome_scen.strip()}** salvato "
-                       f"({len(st.session_state['_scenari'])} in memoria).")
+                       f"({len(st.session_state['_scenari'])} in memoria)"
+                       + ("." if _ok_f else ": non è stato possibile scriverlo su disco, "
+                          "esportalo dalla scheda Confronto scenari."))
         else:
             st.warning("Dai un nome allo scenario prima di salvarlo.")
 
@@ -7159,6 +7524,39 @@ with tab_confronto:
     st.markdown("### \U0001F4CA Confronto tra scenari salvati")
     _scen = st.session_state.get("_scenari", {})
 
+    # --- conservazione degli scenari fra una sessione e l'altra ---
+    with st.expander("💾 Esporta / importa gli scenari (copia permanente)",
+                     expanded=not _scen):
+        st.caption("Gli scenari salvati restano anche se ricarichi la pagina o la riapri "
+                   "più tardi, perché vengono scritti in un file sul server dell'app. Quel "
+                   "file però si cancella quando l'app viene riavviata o aggiornata (per "
+                   "esempio dopo un commit su GitHub): per conservarli davvero scarica il "
+                   "file JSON e ricaricalo quando serve.")
+        _x1, _x2 = st.columns(2)
+        if _scen:
+            _x1.download_button(
+                "⬇️ Scarica gli scenari (JSON)",
+                data=json.dumps(_scen, ensure_ascii=False, indent=1,
+                                default=_json_default).encode("utf-8"),
+                file_name="maniago_tlr_scenari.json", mime="application/json",
+                width="stretch", key="conf_dl_json")
+        _up_sc = _x2.file_uploader("Carica scenari da file JSON", type=["json"],
+                                   key="conf_up_json")
+        if _up_sc is not None:
+            _sig = (_up_sc.name, _up_sc.size)
+            if st.session_state.get("_conf_ultimo_import") != _sig:
+                try:
+                    _imp = json.loads(_up_sc.getvalue().decode("utf-8"))
+                    if not isinstance(_imp, dict):
+                        raise ValueError("formato non valido")
+                    st.session_state["_scenari"].update(_imp)
+                    salva_scenari_file(st.session_state["_scenari"])
+                    st.session_state["_conf_ultimo_import"] = _sig
+                    st.success(f"Importati {len(_imp)} scenari.")
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"File non leggibile: {_e}")
+
     if not _scen:
         st.info("Nessuno scenario salvato. Vai nella scheda **Dimensionamento**, configura un "
                 "assetto e premi *Salva scenario*. Puoi salvarne quanti vuoi e confrontarli qui.")
@@ -7178,11 +7576,13 @@ with tab_confronto:
                            + f" · FER {_s.get('quota_fer_pct', 0):.0f}%")
                 if g3.button("\u274c", key=f"del_scen_{_nome}", help=f"Rimuovi '{_nome}'"):
                     del st.session_state["_scenari"][_nome]
+                    salva_scenari_file(st.session_state["_scenari"])
                     st.rerun()
             st.divider()
             gz1, gz2 = st.columns([1, 4])
             if gz1.button("\U0001F5D1\ufe0f Svuota tutto", key="del_scen_all"):
                 st.session_state["_scenari"] = {}
+                salva_scenari_file({})
                 st.rerun()
             gz2.caption("Attenzione: *Svuota tutto* cancella l'intera lista senza conferma.")
 
@@ -7239,8 +7639,13 @@ with tab_confronto:
             ("co2_evitata_t", "CO\u2082 evitata (t/a)"),
             ("co2_sistema_t", "CO\u2082 residua sistema (t/a)"),
             ("ore_non_coperte", "Ore non coperte"),
-            ("capex_sistema", "CAPEX centrale (\u20ac)"),
+            ("capex_sistema", "CAPEX centrale, senza autoproduzione (\u20ac)"),
             ("capex_rete", "CAPEX rete (\u20ac)"),
+            ("capex_autoproduzione", "CAPEX autoproduzione elettrica (\u20ac)"),
+            ("kwp_autoproduzione", "Fotovoltaico (kWp)"),
+            ("batteria_autoproduzione_mwh", "Batteria (MWh)"),
+            ("ibridi_autoproduzione_m2", "Moduli ibridi da scheda elettrica (m²)"),
+            ("prezzo_el_effettivo", "Prezzo effettivo elettricità (\u20ac/MWh)"),
             ("costo_calore_acquistato", "Acquisto calore scarto (\u20ac/a)"),
             ("opex_annuo", "OPEX (\u20ac/a)"),
             ("costo_annuo", "Costo annuo equivalente (\u20ac/a)"),
@@ -7536,7 +7941,7 @@ with tab_economia:
                     _u2["capex_att"] * _crf_pre / _u2["utilizzata_mwh"], np.nan)
                 _tb2 = _u2[["azienda", "utilizzata_mwh", "capex_att", "eur_per_mwh"]].copy()
                 _tb2.columns = ["Azienda", "Calore utilizzato (MWh/a)",
-                                "CAPEX attribuito (€)", "Incidenza (€/MWh)"]
+                                "CAPEX attribuito (€)", "Incidenza allacciamento (€/MWh)"]
                 _tb2 = _tb2.round(1)
                 st.markdown("**Quanto costa il calore di ciascuna azienda**")
                 st.dataframe(_tb2, width="stretch", hide_index=True)
