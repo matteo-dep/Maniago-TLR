@@ -400,6 +400,8 @@ ZONA_COLORI = {
     "Zona 5 - Ovest": "#3FA34D",
 }
 CAMPAGNA_LON_MIN = 12.73
+# edifici pubblici non spuntati all'avvio (si possono comunque selezionare)
+PUBBLICI_NON_SPUNTATI = {"Centro sociale Dandolo", "Magazzino comunale"}
 
 MONTH_NAMES = ["Gen", "Feb", "Mar", "Apr", "Mag", "Giu", "Lug", "Ago", "Set", "Ott", "Nov", "Dic"]
 RHO_CP = 1.163          # kWh/(m3*K)
@@ -1028,7 +1030,7 @@ def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
     # esclusi: e' il chiamante a decidere come collegarli.
     if not archi_full:
         _serv0 = {radice_nodo} & set(nodi_target)
-        return [], 0.0, _serv0, set()
+        return [], 0.0, _serv0, set(), {}
 
     # 2) costruisco l'albero come grafo diretto radicato in 'radice_nodo'
     #    (BFS/DFS dalla radice sull'albero non orientato per orientarlo)
@@ -1037,7 +1039,7 @@ def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
         T.add_edge(a, b, weight=w)
     if radice_nodo not in T:
         # la radice non e' entrata: nessun target raggiungibile sul grafo
-        return [], 0.0, set(), set()
+        return [], 0.0, set(), set(), {}
 
     parent = {radice_nodo: None}
     order = []
@@ -1074,6 +1076,9 @@ def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
     #    Ripeto finche' non ci sono piu' rami da potare (la potatura di un ramo
     #    puo' cambiare la densita' del ramo padre, che diventa piu' compatto).
     esclusi = set()
+    # per ogni target escluso, il ramo che lo ha fatto escludere: lunghezza,
+    # calore portato, densita' e altri target potati insieme
+    info_potatura = {}
     nodi_vivi = set(order)  # nodi ancora nell'albero
 
     def _sub_da_zero(u):
@@ -1108,12 +1113,17 @@ def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
             if dens < soglia_mwh_per_m:
                 # poto: rimuovo u e tutto il sotto-albero
                 stack = [u]
+                _nel_ramo = []
                 while stack:
                     x = stack.pop()
                     if x in target_set:
                         esclusi.add(x)
+                        _nel_ramo.append(x)
                     nodi_vivi.discard(x)
                     stack.extend([c for c in children[x] if c in nodi_vivi])
+                for x in _nel_ramo:
+                    info_potatura[x] = {"lunghezza_m": float(L_tot), "mwh": float(m_u),
+                                        "densita": float(dens), "nodi_ramo": list(_nel_ramo)}
                 potati = True
                 break  # ripeto il ciclo dall'inizio
         if not potati:
@@ -1134,7 +1144,7 @@ def steiner_con_potatura_densita(G, nodi_target, radice_nodo, mwh_per_target,
 
     lun_tot = float(sum(w for _, _, w in archi_finali))
     target_serviti = (target_set & keep)
-    return archi_finali, lun_tot, target_serviti, esclusi
+    return archi_finali, lun_tot, target_serviti, esclusi, info_potatura
 
 
 def archi_a_coords(archi_nodi, strade_data):
@@ -3992,7 +4002,7 @@ with tab_domanda:
                                & buildings["tipologia"].isin(selected_tip)].copy()
     _pub_candidati = _pub_candidati.sort_values("consumo_annuo_MWh", ascending=False)
     _pub_scelti = [e for e in _pub_candidati["edificio"]
-                   if st.session_state.get(f"dom_ed_{e}", True)]
+                   if st.session_state.get(f"dom_ed_{e}", e not in PUBBLICI_NON_SPUNTATI)]
     st.session_state["_dom_pub_scelti"] = _pub_scelti
 
     mask_building = (buildings["cluster"].isin(selected_clusters)
@@ -4261,7 +4271,7 @@ with tab_domanda:
                        "dal buffer sul tracciato pubblico (vedi *Ipotesi di tracciato* più sotto). "
                        "QM: sotto ~1,2 MWh/(m·a) la rete fatica a ripagarsi, sopra ~2,0 e buona.")
             cD1, cD2 = st.columns(2)
-            costo_m_rete = cD1.slider("Costo rete (\u20ac/m di trincea)", 200, 1500, 600, step=50,
+            costo_m_rete = cD1.slider("Costo rete (\u20ac/m di trincea)", 200, 1500, 350, step=50,
                                       key="dom_costo_rete")
             righe_d = []
             for _z in (sel_priv_zone or selected_clusters):
@@ -4353,7 +4363,8 @@ with tab_domanda:
                 _zona_breve = str(_r.cluster).split(" - ")[0] if _r.cluster else ""
                 _c.checkbox(
                     f"{_r.edificio} · {_r.consumo_annuo_MWh:,.0f} MWh".replace(",", "."),
-                    value=st.session_state.get(f"dom_ed_{_r.edificio}", True),
+                    value=st.session_state.get(f"dom_ed_{_r.edificio}",
+                                               _r.edificio not in PUBBLICI_NON_SPUNTATI),
                     key=f"dom_ed_{_r.edificio}",
                     help=f"{_r.tipologia} · {_zona_breve}")
 
@@ -4564,7 +4575,7 @@ with tab_domanda:
                     _lab = _obb["edificio"].iloc[i] if "edificio" in _obb.columns else f"edif {i}"
                     _label_per_target.setdefault(_n, []).append(str(_lab))
 
-                _archi_G, _len_pub_osm, _target_servi, _target_escl = \
+                _archi_G, _len_pub_osm, _target_servi, _target_escl, _info_pot = \
                     steiner_con_potatura_densita(_G, _target_nodi, _rad_nodo,
                                                   _mwh_per_target,
                                                   soglia_mwh_per_m=soglia_dens)
@@ -4605,10 +4616,42 @@ with tab_domanda:
                     elif _n in _target_escl:
                         # potato davvero dalla soglia di densita' lineare del ramo
                         _obb_servi_mask.append(False)
+                        _ip = _info_pot.get(_n, {})
+                        _L_r = float(_ip.get("lunghezza_m", 0.0))
+                        _m_r = float(_ip.get("mwh", _mwh))
+                        _d_r = float(_ip.get("densita", 0.0))
+                        # costo indicativo del solo ramo: diametro sulla potenza
+                        # che porta, scavo + tubazione come nel resto della rete
+                        _dT_e = max(T_mandata_ideale - T_ritorno_ideale, 1)
+                        _dn_r = dimensiona_dn(potenza_da_energia(_m_r, 1900.0), _dT_e, 1.0)[0]
+                        _c_r = _L_r * costo_condotta_eur_m(_dn_r, costo_m_tr)
+                        _crf_r = crf(float(st.session_state.get("eco_wacc", 4.0)) / 100.0,
+                                     int(st.session_state.get("eco_anni", 25)))
+                        _eur_mwh_r = _c_r * _crf_r / _m_r if _m_r > 0 else float("nan")
+                        _altri = sorted({_l for _nn in _ip.get("nodi_ramo", [])
+                                         for _l in _label_per_target.get(_nn, [])} - {str(_lab)})
+                        def _it(x, d=0):
+                            return (f"{x:,.{d}f}".replace(",", "@").replace(".", ",")
+                                    .replace("@", "."))
+                        _motivo = (
+                            f"Per raggiungerlo servono {_it(_L_r)} m di ramo che portano "
+                            f"{_it(_m_r)} MWh/a: {_it(_d_r, 2)} MWh/(m·a), sotto la soglia "
+                            f"di {_it(soglia_dens, 1)}. Il ramo (DN{_dn_r}) costerebbe circa "
+                            f"{_it(_c_r / 1000)} k€, cioè {_it(_eur_mwh_r)} €/MWh "
+                            f"di solo tubo sul calore che porta.")
+                        if _altri:
+                            _motivo += " Ramo condiviso con: " + ", ".join(_altri) + "."
+                        _obb_servi_mask.append(False)
                         _obb_esclusi_info.append({"edificio": _lab,
                                                   "tipo": _tipo,
                                                   "MWh/a": round(_mwh, 1),
-                                                  "motivo": "sotto soglia densità",
+                                                  "Ramo (m)": round(_L_r),
+                                                  "Calore del ramo (MWh/a)": round(_m_r, 1),
+                                                  "Densità ramo (MWh/(m·a))": round(_d_r, 2),
+                                                  "Costo ramo (k€)": round(_c_r / 1000),
+                                                  "Solo tubo (€/MWh)": (round(_eur_mwh_r)
+                                                                        if _m_r > 0 else None),
+                                                  "motivo": _motivo,
                                                   "lat": _lat_ed, "lon": _lon_ed})
                     else:
                         # NON raggiungibile sul grafo stradale (componente OSM
@@ -4879,9 +4922,24 @@ with tab_domanda:
                 )
                 with st.expander(f"📋 Dettaglio {len(_obb_esclusi_info)} edifici esclusi"):
                     _df_esc = pd.DataFrame(_obb_esclusi_info)
-                    _cols = [c for c in ["edificio", "tipo", "MWh/a", "motivo"]
+                    _cols = [c for c in ["edificio", "tipo", "MWh/a", "Ramo (m)",
+                                         "Calore del ramo (MWh/a)", "Densità ramo (MWh/(m·a))",
+                                         "Costo ramo (k€)", "Solo tubo (€/MWh)", "motivo"]
                              if c in _df_esc.columns]
-                    st.dataframe(_df_esc[_cols], width="stretch", hide_index=True)
+                    st.dataframe(_df_esc[_cols].rename(columns={
+                        "edificio": "Edificio", "tipo": "Tipo",
+                        "MWh/a": "Domanda (MWh/a)", "motivo": "Perché è escluso"}),
+                        width="stretch", hide_index=True)
+                    st.caption(
+                        "Il ramo è il tratto di tubo che servirebbe solo per quell'edificio "
+                        "(e per gli altri potati con lui), misurato dal punto in cui si "
+                        "stacca dalla rete. Il criterio è quello QM: se il ramo porta meno "
+                        "calore per metro della soglia, il tubo non si ripaga con la vendita "
+                        "del calore. 'Solo tubo' è il costo del ramo annualizzato (tasso e "
+                        "anni dell'Analisi economica) diviso il calore che porta: va "
+                        "confrontato col prezzo di vendita. Gli edifici esclusi non entrano "
+                        "né nella domanda del dimensionamento né nei ricavi, e la rete non "
+                        "si estende fin lì.")
 
             # --- nota tecnica: allacci lontani dalla viabilita' mappata ---
             if _uso_osm and _non_raggiunti:
@@ -5753,7 +5811,7 @@ with tab_dimensionamento:
             st.metric("Ritorno", f"{T_ritorno_ideale} °C")
             st.caption("Mandata e ritorno si impostano nella scheda **Domanda**, "
                        "in alto a sinistra: valgono per tutto lo studio.")
-            T_int = st.slider("Anello intermedio (°C)", 40, 60, 50, key="dim_tint",
+            T_int = st.slider("Anello intermedio (°C)", 40, 60, 45, key="dim_tint",
                               help="Livello da cui la HP alta T solleva fino alla mandata. "
                                    "Piu' e' alto, meno lavora la pompa ma meno scarto "
                                    "risulta utilizzabile. 45-50 °C e' l'ottimo tipico.")
@@ -7007,6 +7065,171 @@ with tab_dimensionamento:
     if _metodo_scarto_dim.startswith(("Scala exergetica", "Formula")):
         costo_calore_acq = _costo_scarto_ex
 
+    # ---------------------------------------------------------------------
+    # CALORE DI SCARTO NEI RISULTATI: PREZZO PAGATO E CONVENIENZA PER AZIENDA
+    # Per ogni azienda si confronta lo scenario attuale con lo stesso scenario
+    # senza quell'azienda (stesse macchine e accumuli, dispatch rifatto): la
+    # differenza di costo annuo dice se il suo calore, al prezzo pagato, fa
+    # risparmiare o no. Le simulazioni sono le stesse dell'Analisi economica e
+    # vengono condivise con la sua cache (stessa firma).
+    # ---------------------------------------------------------------------
+    _metodo_fisso = not _metodo_scarto_dim.startswith(("Scala exergetica", "Formula"))
+    _ss_r = st.session_state
+    _lung_add_r = _ss_r.get("_off_lunghezze_adduzione", {}) or {}
+    _schema_add_r = _ss_r.get("eco_schema_add", "dorsale")
+    _costo_m_add_r = float(_ss_r.get("eco_costo_add", 700))
+    _costo_he_r = float(_ss_r.get("eco_costo_he", 60))
+    _wacc_r = float(_ss_r.get("eco_wacc", 4.0)) / 100.0
+    _anni_r = int(_ss_r.get("eco_anni", 25))
+    _contr_r = float(_ss_r.get("eco_contributo", 40))
+    _om_rete_r = float(_ss_r.get("eco_om_rete", 0.75))
+    _om_r = float(_ss_r.get("eco_om", 2.0))
+    _fl_sel_r = _ss_r.get("_off_flussi", []) or []
+    _q_r = flussi[flussi["id_flusso"].isin(_fl_sel_r)]
+    _cq_r = pd.to_numeric(_q_r.get("costo_allacciamento_eur"), errors="coerce")
+    _he_per_az_r = (_q_r.assign(_he=_cq_r.fillna(
+        pd.to_numeric(_q_r["P_kW"], errors="coerce").fillna(0) * _costo_he_r))
+        .groupby("azienda")["_he"].sum().to_dict()) if not _q_r.empty else {}
+    _firma_c = (tuple(sorted(map(str, _fl_sel_r))), float(T_mandata_ideale),
+                float(T_ritorno_ideale), float(T_int), float(eta_hp),
+                float(V_hot), float(V_int), float(V_low), float(P_alta),
+                float(P_bassa), str(backup_tipo), float(P_bk), str(backup_cop),
+                float(antigelo), float(perd), bool(strat_on), bool(solare_on),
+                round(float(np.sum(solar_low)) if solare_on else 0.0, 3),
+                str(tipo_sorgente), str(resa_sorgente), str(costo_sorgente),
+                str(_psv_sel), float(_spread_ex), float(_eta_ex), float(_sconto_ex),
+                float(_fisso_ex), float(prezzo_el_eff), float(_ets2_ex), float(_cald_ex),
+                str(formula_scarto_da_sessione()),
+                round(float(np.sum(dom_arr)), 3), len(dom_arr))
+    _combs_r = []
+    if not off_all.empty and off_all["azienda"].nunique() <= 5:
+        _cache_r = _ss_r.get("_eco_combinazioni")
+        try:
+            if _cache_r and _cache_r[0] == _firma_c:
+                _combs_r = _cache_r[1]
+            else:
+                with st.spinner("Valuto il contributo di ciascuna azienda…"):
+                    _combs_r = valuta_combinazioni_aziende(
+                        off_all, idx_h, dom_arr, soil_temp_arr, float(T_mandata_ideale),
+                        float(T_ritorno_ideale), float(T_int), eta_hp, V_hot, V_int, V_low,
+                        P_alta, P_bassa, backup_tipo, P_bk, backup_cop, float(antigelo),
+                        perd, strat_on, (solar_low if solare_on else None),
+                        tipo_sorgente, resa_sorgente, costo_sorgente,
+                        _T0_ex, _pz_ex, _psv_ex, float(_spread_ex), float(_eta_ex),
+                        float(_sconto_ex), float(_fisso_ex), float(_ets2_ex), float(_cald_ex),
+                        formula_scarto_da_sessione())
+                _ss_r["_eco_combinazioni"] = (_firma_c, _combs_r)
+        except Exception:
+            _combs_r = []
+
+    def _pagato_combo(c):
+        """Calore di scarto pagato in una combinazione, col metodo scelto in Offerta."""
+        if _metodo_fisso:
+            return sum(float(m) * float(_prezzi_scarto.get(a, 0.0))
+                       for a, m in (c.get("MWh_ceduti") or {}).items())
+        return float(c["costo_scarto"])
+
+    def _voci_combo(c):
+        _az = list(c["aziende"])
+        _cap_all = (sum(_he_per_az_r.get(a, 0.0) for a in _az)
+                    + lunghezza_adduzioni(_az, _lung_add_r, _schema_add_r) * _costo_m_add_r)
+        _f_n = (1.0 - _contr_r / 100.0) * crf(_wacc_r, _anni_r)
+        return {
+            "energia": (c["costo_el"] + c["E_backup"] * opex_bk_mwh
+                        + c["capex_sorgente"] * (_f_n + _om_r / 100.0)),
+            "allaccio": _cap_all * (_f_n + _om_rete_r / 100.0),
+            "cap_allaccio": _cap_all,
+            "pagato": _pagato_combo(c),
+            "ore_nc": int(c["ore_non_cop"]),
+        }
+
+    _righe_conv = []
+    _set_att = frozenset(off_all["azienda"].unique()) if not off_all.empty else frozenset()
+    _c_att = next((c for c in _combs_r if frozenset(c["aziende"]) == _set_att), None)
+    if _c_att is not None:
+        _v_att = _voci_combo(_c_att)
+        for _a in sorted(_set_att):
+            _c_senza = next((c for c in _combs_r
+                             if frozenset(c["aziende"]) == _set_att - {_a}), None)
+            if _c_senza is None:
+                continue
+            _v_s = _voci_combo(_c_senza)
+            _mwh_a = float((_c_att.get("MWh_ceduti") or {}).get(_a, 0.0))
+            _pag_a = (_mwh_a * float(_prezzi_scarto.get(_a, 0.0)) if _metodo_fisso
+                      else float(_df_a_ex.loc[_df_a_ex["azienda"] == _a, "costo_eur"].sum())
+                      if not _df_a_ex.empty else 0.0)
+            _risp = _v_s["energia"] - _v_att["energia"]          # cosa fa risparmiare
+            _all_a = _v_att["allaccio"] - _v_s["allaccio"]        # quanto costa allacciarla
+            _dpag = _v_att["pagato"] - _v_s["pagato"]             # quanto si paga in piu'
+            _saldo = _risp - _all_a - _dpag
+            _p_max = ((_risp - _all_a - (_dpag - _pag_a)) / _mwh_a) if _mwh_a > 1e-6 else None
+            _ore_in_piu = _v_s["ore_nc"] - _v_att["ore_nc"]
+            if _ore_in_piu > 0:
+                _verd = f"indispensabile: senza, {_ore_in_piu} ore scoperte"
+            elif _saldo >= 0:
+                _verd = "conviene"
+            else:
+                _verd = "non conviene"
+            _righe_conv.append({
+                "Azienda": _a,
+                "Calore ceduto (MWh/a)": round(_mwh_a),
+                "Prezzo pagato (€/MWh)": round(_pag_a / _mwh_a, 1) if _mwh_a > 1e-6 else None,
+                "Pagato (k€/a)": round(_pag_a / 1000, 1),
+                "Allacciamento (k€)": round((_v_att["cap_allaccio"] - _v_s["cap_allaccio"]) / 1000),
+                "Allacciamento annuo (k€/a)": round(_all_a / 1000, 1),
+                "Risparmio su elettricità e sorgente (k€/a)": round(_risp / 1000, 1),
+                "Saldo per il TLR (k€/a)": round(_saldo / 1000, 1),
+                "Prezzo massimo sostenibile (€/MWh)": (round(_p_max, 1)
+                                                       if _p_max is not None else None),
+                "Esito": _verd})
+
+    with step4:
+        st.divider()
+        st.markdown("#### 🏭 Calore di scarto: prezzo pagato alle aziende e convenienza")
+        _met_lab = ("prezzo fisso per azienda (Offerta)" if _metodo_fisso
+                    else _metodo_scarto_dim)
+        st.caption(f"Metodo di prezzo: **{_met_lab}**. Per ogni azienda lo scenario viene "
+                   f"rifatto senza di lei, con le stesse macchine e gli stessi accumuli: la "
+                   f"differenza dice quanto il suo calore fa risparmiare su elettricità delle "
+                   f"pompe, combustibile e sorgente fredda, e lo si confronta con quanto costa "
+                   f"allacciarla e con quanto le si paga il calore.")
+        if not _righe_conv:
+            st.info("Nessuna azienda allacciata, oppure analisi non disponibile per questa "
+                    "configurazione.")
+        else:
+            _df_conv = pd.DataFrame(_righe_conv)
+            st.dataframe(_df_conv, width="stretch", hide_index=True)
+            _non = [r["Azienda"] for r in _righe_conv if r["Esito"] == "non conviene"]
+            _frasi = []
+            for r in _righe_conv:
+                _pm = r["Prezzo massimo sostenibile (€/MWh)"]
+                _pp = r["Prezzo pagato (€/MWh)"]
+                if _pm is None or _pp is None:
+                    continue
+                if _pm <= 0:
+                    _frasi.append(f"**{r['Azienda']}**: anche gratis il suo calore non "
+                                  f"ripaga l'allacciamento ({_pm:.0f} €/MWh)")
+                else:
+                    _frasi.append(f"**{r['Azienda']}**: si può pagare fino a "
+                                  f"**{_pm:.0f} €/MWh** (oggi {_pp:.0f})")
+            if _frasi:
+                st.markdown("Prezzo massimo che il TLR può pagare a ciascuna azienda "
+                            "restando in pari: " + " · ".join(_frasi) + ".")
+            if _non:
+                st.warning("Al prezzo attuale non conviene allacciare: **"
+                           + ", ".join(_non) + "**. Deseleziona i suoi flussi in Offerta, "
+                           "rinegozia il prezzo sotto il massimo sostenibile o riduci il "
+                           "costo dell'allacciamento.")
+            else:
+                st.success("Tutte le aziende allacciate convengono al prezzo attuale.")
+            st.caption(
+                "Prezzo massimo sostenibile = (risparmio − costo annuo dell'allacciamento) / "
+                "MWh ceduti: è il prezzo a cui il saldo si azzera. Il costo dell'allacciamento "
+                "comprende scambiatori, opere e quota di adduzione (schema, €/m e "
+                "contributo dall'Analisi economica), annualizzato e con la manutenzione. "
+                "Togliere un'azienda cambia anche il prezzo delle altre (la scala exergetica "
+                "ripartisce il valore fra chi cede), e il saldo ne tiene conto.")
+
     # CO2 evitata rispetto alla baseline gas.
     # Baseline: le utenze si scaldano da sole con caldaie a gas che producono
     # esattamente il calore VENDUTO alle utenze (E_venduto = dom_tot_utenze).
@@ -7195,14 +7418,14 @@ with step_el:
         with _i2:
             st.markdown("**\U0001F50B Fotovoltaico e accumulo**")
             _usa_pv = st.checkbox("Considera fotovoltaico", value=True, key="el_usa_pv")
-            _costo_kwp = st.slider("Costo del fotovoltaico (€/kWp)", 400, 2000, 900,
+            _costo_kwp = st.slider("Costo del fotovoltaico (€/kWp)", 400, 2000, 850,
                                    step=50, key="el_costo_kwp",
                                    help="Chiavi in mano. Impianti sopra i 500 kWp su "
                                         "copertura esistente stanno di norma fra 700 "
                                         "e 1.100 €/kWp.")
             _usa_batt = st.checkbox("Considera l'accumulo elettrochimico", value=True,
                                     key="el_usa_batt")
-            _costo_kwh_b = st.slider("Costo della batteria (€/kWh)", 100, 800, 350,
+            _costo_kwh_b = st.slider("Costo della batteria (€/kWh)", 100, 800, 300,
                                      step=25, key="el_costo_batt")
             _bos_pv = st.slider("Perdite di sistema (%)", 5, 25, 14, step=1,
                                 key="el_bos_pv",
