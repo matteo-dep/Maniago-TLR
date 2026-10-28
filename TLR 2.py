@@ -6162,9 +6162,11 @@ with tab_dimensionamento:
                      "e gli scenari restano confrontabili sulla sola parte termica.")
             if considera_el:
                 st.success("✅ **Incluso.** Il risultato di questo passo entra nei "
-                           "Risultati (passo 5), nel confronto scenari e nell'Analisi "
-                           "economica. Rilanciando *Dimensiona* nel passo 3 le taglie "
-                           "vengono ricercate con il prezzo effettivo dell'elettricità.")
+                           "Risultati (passo 5), negli scenari salvati e nell'Analisi "
+                           "economica. Le taglie termiche del passo 3 non cambiano: "
+                           "l'autoproduzione si dimensiona sui consumi delle pompe che "
+                           "ne risultano e si ricalcola da sola quando quei consumi "
+                           "cambiano.")
             else:
                 st.info("**Non incluso.** Le pompe di calore comprano tutta "
                         "l'elettricità dalla rete al prezzo del passo 2. Spunta la "
@@ -6201,22 +6203,22 @@ with tab_dimensionamento:
                      key="dim_btn_opt", width="stretch", type="primary",
                      help="Cerca potenze e volumi che rendono minimo il costo annuo di "
                           "centrale con gli stessi parametri dell'Analisi economica: WACC, "
-                          "orizzonte, contributo, manutenzione, prezzo effettivo "
-                          "dell'elettricita' e acquisto del calore di scarto."):
+                          "orizzonte, contributo, manutenzione e acquisto del calore di "
+                          "scarto. L'elettricita' si valuta al prezzo di rete del passo 2: "
+                          "l'autoproduzione (passo 4) si aggiunge dopo e non cambia le "
+                          "taglie termiche."):
             with st.spinner("Ricerca della configurazione a costo minimo..."):
                 # parametri economici: quelli impostati nell'Analisi economica
                 _eco_par = {"wacc": float(st.session_state.get("eco_wacc", 4.0)) / 100.0,
                             "anni": int(st.session_state.get("eco_anni", 25)),
                             "contributo_pct": float(st.session_state.get("eco_contributo", 40)),
                             "om_pct": float(st.session_state.get("eco_om", 2.0))}
-                # prezzo effettivo dell'elettricita' (come nei Risultati, passo 5)
+                # Le taglie termiche si cercano SEMPRE con il prezzo di rete del
+                # passo 2: il dimensionamento termico non dipende dall'autoproduzione.
+                # Prima, con l'autoproduzione inclusa, si usava il prezzo effettivo,
+                # che a sua volta dipende dai consumi delle pompe: le due
+                # ottimizzazioni si rincorrevano.
                 _pel_opt = float(prezzo_el)
-                if considera_el:
-                    _rel_o = st.session_state.get("_el_risultato") or {}
-                    if "acquisto_eur" in _rel_o and float(_rel_o.get("consumo_mwh", 0)) > 0:
-                        _pel_opt = ((float(_rel_o["acquisto_eur"])
-                                     - float(_rel_o.get("ricavo_eur", 0)))
-                                    / float(_rel_o["consumo_mwh"]))
                 # costo del calore di scarto, con il metodo scelto in Offerta
                 _met_o = serie_meteo_annua(pvgis)
                 _T0_o = (pd.Series(_met_o["T2m"].values, index=pd.to_datetime(_met_o["datetime"]))
@@ -7601,7 +7603,18 @@ with step_el:
                        f"**{_ibr_el_u.sum() * 1000:.0f} kWh/m² elettrici** e "
                        f"**{_ibr_th_u.sum() * 1000:.0f} kWh/m² termici** a {_tf_ibr} °C.")
 
-        if _lancia:
+        # Firma di cio' da cui dipende l'ottimo elettrico: consumi orari delle
+        # pompe e impostazioni di questo passo. Se cambia (nuove taglie termiche,
+        # nuovi costi del fotovoltaico...) l'ottimizzazione si rifa' da sola, cosi'
+        # il risultato non resta mai riferito a un dimensionamento precedente.
+        _firma_prove = (round(float(_cons_h.sum()), 1), int(len(_cons_h)),
+                        tuple(sorted((str(k), str(st.session_state.get(k)))
+                                     for k in st.session_state.keys()
+                                     if str(k).startswith("el_")
+                                     and not str(k).startswith("el_btn"))))
+        _da_rifare = (st.session_state.get("_el_prove") is not None
+                      and st.session_state.get("_el_prove_firma") != _firma_prove)
+        if _lancia or _da_rifare or st.session_state.get("_el_prove") is None:
             with st.spinner("Esploro le combinazioni..."):
                 _g_ibr = [0.0]
                 if _usa_ibr:
@@ -7616,6 +7629,7 @@ with step_el:
                 _prove = [_valuta_sistema(a, k, b)
                           for a in _g_ibr for k in _g_kwp for b in _g_batt]
             st.session_state["_el_prove"] = _prove
+            st.session_state["_el_prove_firma"] = _firma_prove
 
         _prove = st.session_state.get("_el_prove")
         if not _prove:
