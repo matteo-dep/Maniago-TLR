@@ -4666,7 +4666,6 @@ with tab_domanda:
                         _obb_servi_mask.append(True)
                     elif _n in _target_escl:
                         # potato davvero dalla soglia di densita' lineare del ramo
-                        _obb_servi_mask.append(False)
                         _ip = _info_pot.get(_n, {})
                         _L_r = float(_ip.get("lunghezza_m", 0.0))
                         _m_r = float(_ip.get("mwh", _mwh))
@@ -4860,16 +4859,16 @@ with tab_domanda:
                 if not _bmap_srv.empty:
                     fig_tr.add_trace(go.Scattermap(
                         lat=_bmap_srv["lat"], lon=_bmap_srv["lon"], mode="markers",
-                        name=f"Pubblici serviti ({len(_bmap_srv)})",
-                        marker=dict(size=10, color="#22C3DD"),
+                        name=f"🟢 Pubblici serviti ({len(_bmap_srv)})",
+                        marker=dict(size=13, color="#1FA34A"),
                         text=(_bmap_srv["edificio"] + "<br>"
                               + _bmap_srv["consumo_annuo_MWh"].round(0).astype(int).astype(str) + " MWh/a"),
                         hoverinfo="text"))
                 if not _bmap_esc.empty:
                     fig_tr.add_trace(go.Scattermap(
                         lat=_bmap_esc["lat"], lon=_bmap_esc["lon"], mode="markers",
-                        name=f"⛔ Pubblici esclusi dalla soglia ({len(_bmap_esc)})",
-                        marker=dict(size=12, color="#9AA0A6", opacity=0.6, symbol="cross"),
+                        name=f"❌ Pubblici esclusi ({len(_bmap_esc)})",
+                        marker=dict(size=15, color="#E53935", opacity=0.95, symbol="cross"),
                         text=(_bmap_esc["edificio"] + "<br>"
                               + _bmap_esc["consumo_annuo_MWh"].round(0).astype(int).astype(str)
                               + " MWh/a - fuori soglia densità"),
@@ -4900,7 +4899,7 @@ with tab_domanda:
                         fig_tr.add_trace(go.Scattermap(
                             lat=_ce["lat"], lon=_ce["lon"], mode="markers",
                             name=f"⛔ Condomini esclusi ({len(_ce)})",
-                            marker=dict(size=11, color="#9AA0A6", opacity=0.6, symbol="cross"),
+                            marker=dict(size=13, color="#E53935", opacity=0.9, symbol="cross"),
                             text=(_ce["denominazione"].fillna("Condominio").astype(str)
                                   + " · fuori soglia densità"),
                             hoverinfo="text"))
@@ -4909,7 +4908,7 @@ with tab_domanda:
                 fig_tr.add_trace(go.Scattermap(
                     lat=_priv_in["lat"], lon=_priv_in["lon"], mode="markers",
                     name=f"Privati agganciati ({len(_priv_in)})",
-                    marker=dict(size=5, color="#3FA34D", opacity=0.85),
+                    marker=dict(size=5, color="#5DADE2", opacity=0.85),
                     text=(_priv_in.get("nome", pd.Series([""] * len(_priv_in))).fillna("").astype(str)
                           + "<br>allaccio: " + _priv_in["dist_tubo_m"].round(0).astype(int).astype(str)
                           + " m di tubo · " + _priv_in["consumo_annuo_MWh"].round(1).astype(str) + " MWh/a"),
