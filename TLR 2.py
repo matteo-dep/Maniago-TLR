@@ -235,6 +235,47 @@ def _firma_el(r):
                  ("consumo_mwh", "acquisto_eur", "ricavo_eur", "capex_eur", "copertura_pct"))
 
 
+def tabella_elettricita(snap):
+    """Elettricita' delle pompe di calore: solo rete contro autoproduzione.
+
+    Ritorna (DataFrame, incluso). Le righe sono le stesse nel passo 5 del
+    Dimensionamento e nell'Analisi economica, cosi' i numeri coincidono.
+    """
+    def _it(x, d=0):
+        return f"{x:,.{d}f}".replace(",", "@").replace(".", ",").replace("@", ".")
+    inc = str(snap.get("autoproduzione_el", "no")) == "sì"
+    cons = float(snap.get("el_consumo_mwh", snap.get("E_elettrica", 0)) or 0)
+    p_r = float(snap.get("el_prezzo_rete", snap.get("prezzo_el", 0)) or 0)
+    solo = float(snap.get("el_costo_solo_rete_eur", cons * p_r) or 0)
+    acq = float(snap.get("el_acquisto_rete_eur", solo) or 0)
+    ric = float(snap.get("el_ricavo_immesso_eur", 0) or 0)
+    netto = acq - ric
+    capex = float(snap.get("capex_autoproduzione", 0) or 0)
+    righe = [
+        ("Consumo delle pompe di calore (MWh/a)", _it(cons), _it(cons)),
+        ("Prelevato dalla rete (MWh/a)", _it(cons),
+         _it(float(snap.get("el_da_rete_mwh", cons) or 0))),
+        ("Autoprodotto e autoconsumato (MWh/a)", "0",
+         _it(float(snap.get("el_autoconsumo_mwh", 0) or 0))),
+        ("Immesso in rete (MWh/a)", "0", _it(float(snap.get("el_immesso_mwh", 0) or 0))),
+        ("Costo acquisto dalla rete (€/a)", _it(solo), _it(acq)),
+        ("Ricavo energia immessa (€/a)", "0", ("−" + _it(ric)) if ric > 0.5 else "0"),
+        ("Costo netto dell'elettricità (€/a)", _it(solo), _it(netto)),
+        ("Prezzo medio effettivo (€/MWh)", _it(p_r, 1),
+         _it(netto / cons, 1) if cons > 0 else "—"),
+        ("Investimento in fotovoltaico, ibridi, batterie (€)", "0", _it(capex)),
+        ("Fotovoltaico / batteria / ibridi",
+         "—", f"{_it(float(snap.get('kwp_autoproduzione', 0) or 0))} kWp · "
+              f"{_it(float(snap.get('batteria_autoproduzione_mwh', 0) or 0), 1)} MWh · "
+              f"{_it(float(snap.get('ibridi_autoproduzione_m2', 0) or 0))} m²"),
+    ]
+    df = pd.DataFrame(righe, columns=["Voce", "Solo rete",
+                                      "Con autoproduzione" + (" ✅ in uso" if inc else "")])
+    if not inc:
+        df.columns = ["Voce", "Solo rete ✅ in uso", "Con autoproduzione (non inclusa)"]
+    return df, inc
+
+
 def carica_scenari_file(percorso=FILE_SCENARI):
     try:
         with open(percorso, "r", encoding="utf-8") as f:
@@ -5355,7 +5396,7 @@ with tab_offerta:
                                  "Prezzi fissi per azienda"],
             key="off_metodo_prezzo",
             help="Scala exergetica: quota del valore del calore venduto, in base alla "
-                 "qualita' (parametri in Dimensionamento, passo 5 · Risultati). Formula su PSV: "
+                 "qualita' (parametri in Dimensionamento, passo 6 · Risultati). Formula su PSV: "
                  "\u20ac/MWh ceduto = PSV del mese \u00d7 (a + b\u00b7w), con w peso exergetico "
                  "orario del flusso. Prezzi fissi: \u20ac/MWh costanti.")
         _psv_sel_off = st.selectbox(
@@ -5840,13 +5881,15 @@ with tab_dimensionamento:
     # sapendo cosa si sta decidendo invece di riempire moduli.
     # =========================================================================
     # step_el: passo 4 "Carico elettrico" (ex scheda separata); step4 resta il
-    # contenitore dei Risultati, che ora e' il passo 5
-    step1, step2, step3, step_el, step4 = st.tabs([
+    # contenitore dei Risultati, che ora e' il passo 6; step_dim e' il passo 5,
+    # dove si lancia il dimensionamento e si vede cosa entra nell'economia
+    step1, step2, step3, step_el, step_dim, step4 = st.tabs([
         "1 · Livelli termici",
         "2 · Tecnologie",
         "3 · Taglie e accumuli",
         "4 · Carico elettrico",
-        "5 · Risultati",
+        "5 · Dimensionamento",
+        "6 · Risultati",
     ])
 
     # ---------------------------------------------------------------- PASSO 1
@@ -5941,7 +5984,7 @@ with tab_dimensionamento:
                     help="Da dove la pompa a bassa temperatura preleva il calore "
                          "quando il calore di scarto non basta. La scelta pesa "
                          "molto su costi e ingombri: le opere sono confrontate "
-                         "nel passo 5 · Risultati, a valle del calcolo.")
+                         "nel passo 6 · Risultati, a valle del calcolo.")
                 _sp = SORGENTI_BASSA_T[tipo_sorgente]
                 if tipo_sorgente == "acqua di falda":
                     resa_sorgente = st.slider("Resa per pozzo (l/s)",
@@ -5988,7 +6031,7 @@ with tab_dimensionamento:
                     opex_bk_mwh = (prezzo_gas + _ets2_bk * EF_GAS_T_MWH_PCS) / rend_gas
                     st.caption(f"Comprende l'ETS2 a {_ets2_bk:.0f} €/t "
                                f"(+{_ets2_bk * EF_GAS_T_MWH_PCS:.1f} €/MWh di gas), impostato "
-                               f"nel riquadro della scala exergetica al passo 5.")
+                               f"nel riquadro della scala exergetica al passo 6.")
                 else:
                     rend_bio = st.slider("Rendimento caldaia (%)", 75, 92, 85,
                                          key="dim_rend_bio") / 100.0
@@ -6162,7 +6205,7 @@ with tab_dimensionamento:
                      "e gli scenari restano confrontabili sulla sola parte termica.")
             if considera_el:
                 st.success("✅ **Incluso.** Il risultato di questo passo entra nei "
-                           "Risultati (passo 5), negli scenari salvati e nell'Analisi "
+                           "Risultati (passo 6), negli scenari salvati e nell'Analisi "
                            "economica. Le taglie termiche del passo 3 non cambiano: "
                            "l'autoproduzione si dimensiona sui consumi delle pompe che "
                            "ne risultano e si ricalcola da sola quando quei consumi "
@@ -6183,9 +6226,10 @@ with tab_dimensionamento:
     # ---------------------------------------------------------------- PASSO 3
     with step3:
         st.markdown("#### Taglie delle macchine e volumi di accumulo")
-        st.caption("Prima si lascia che il programma cerchi la configurazione migliore, "
-                   "poi si può ritoccarla. I risultati nel passo 5 si aggiornano a ogni "
-                   "modifica, senza premere nulla.")
+        st.caption("Qui si fissano il tetto dei volumi e, se serve, si ritoccano a mano "
+                   "le taglie. La ricerca della configurazione a costo minimo si lancia "
+                   "nel passo **5 · Dimensionamento**; i Risultati (passo 6) si aggiornano "
+                   "a ogni modifica, senza premere nulla.")
 
         _d1, _d2 = st.columns([1, 1])
         with _d1:
@@ -6199,100 +6243,109 @@ with tab_dimensionamento:
             st.metric("Picco da coprire", f"{picco_kw:,.0f} kW".replace(",", "."),
                       help=f"contemporaneità QM applicata: {_f_sim:.2f}")
 
-        if st.button("⚙️ Dimensiona a costo minimo (obiettivo dell'Analisi economica)",
-                     key="dim_btn_opt", width="stretch", type="primary",
-                     help="Cerca potenze e volumi che rendono minimo il costo annuo di "
-                          "centrale con gli stessi parametri dell'Analisi economica: WACC, "
-                          "orizzonte, contributo, manutenzione e acquisto del calore di "
-                          "scarto. L'elettricita' si valuta al prezzo di rete del passo 2: "
-                          "l'autoproduzione (passo 4) si aggiunge dopo e non cambia le "
-                          "taglie termiche."):
-            with st.spinner("Ricerca della configurazione a costo minimo..."):
-                # parametri economici: quelli impostati nell'Analisi economica
-                _eco_par = {"wacc": float(st.session_state.get("eco_wacc", 4.0)) / 100.0,
-                            "anni": int(st.session_state.get("eco_anni", 25)),
-                            "contributo_pct": float(st.session_state.get("eco_contributo", 40)),
-                            "om_pct": float(st.session_state.get("eco_om", 2.0))}
-                # Le taglie termiche si cercano SEMPRE con il prezzo di rete del
-                # passo 2: il dimensionamento termico non dipende dall'autoproduzione.
-                # Prima, con l'autoproduzione inclusa, si usava il prezzo effettivo,
-                # che a sua volta dipende dai consumi delle pompe: le due
-                # ottimizzazioni si rincorrevano.
-                _pel_opt = float(prezzo_el)
-                # costo del calore di scarto, con il metodo scelto in Offerta
-                _met_o = serie_meteo_annua(pvgis)
-                _T0_o = (pd.Series(_met_o["T2m"].values, index=pd.to_datetime(_met_o["datetime"]))
-                         .reindex(idx_h).interpolate().bfill().ffill().values)
-                _pz_o, _ = carica_prezzi_elettrici()
-                _pz_o = pd.Series(_pz_o, index=HOURS_2024).reindex(idx_h).ffill().bfill().values
-                _pz_o = _pz_o * (_pel_opt / max(float(np.mean(_pz_o)), 1e-9))
-                _ss = st.session_state
-                _psv_o = PSV_SERIE_EUR_MWH.get(_ss.get("ex_psv_serie"),
-                                               list(PSV_SERIE_EUR_MWH.values())[-1])
-                _exergetico = str(_ss.get("off_metodo_prezzo",
-                                          "Scala exergetica")).startswith(("Scala", "Formula"))
-                _prezzi_fissi = _ss.get("_off_prezzi_scarto", {}) or {}
+        # Il pulsante e l'esito stanno nel passo 5: il codice resta qui perche'
+        # le taglie trovate devono essere scritte nei cursori qui sotto prima
+        # che vengano disegnati.
+        with step_dim:
+            st.markdown("#### ⚙️ Dimensionamento a costo minimo")
+            st.caption("Cerca le taglie termiche (pompe di calore e accumuli) che rendono "
+                       "minimo il costo annuo di centrale. Usa sempre il prezzo di rete "
+                       "dell'elettricità del passo 2: l'autoproduzione del passo 4 non "
+                       "cambia le taglie, si dimensiona dopo sui consumi che ne risultano.")
+            if st.button("⚙️ Dimensiona a costo minimo (obiettivo dell'Analisi economica)",
+                         key="dim_btn_opt", width="stretch", type="primary",
+                         help="Cerca potenze e volumi che rendono minimo il costo annuo di "
+                              "centrale con gli stessi parametri dell'Analisi economica: WACC, "
+                              "orizzonte, contributo, manutenzione e acquisto del calore di "
+                              "scarto. L'elettricita' si valuta al prezzo di rete del passo 2: "
+                              "l'autoproduzione (passo 4) si aggiunge dopo e non cambia le "
+                              "taglie termiche."):
+                with st.spinner("Ricerca della configurazione a costo minimo..."):
+                    # parametri economici: quelli impostati nell'Analisi economica
+                    _eco_par = {"wacc": float(st.session_state.get("eco_wacc", 4.0)) / 100.0,
+                                "anni": int(st.session_state.get("eco_anni", 25)),
+                                "contributo_pct": float(st.session_state.get("eco_contributo", 40)),
+                                "om_pct": float(st.session_state.get("eco_om", 2.0))}
+                    # Le taglie termiche si cercano SEMPRE con il prezzo di rete del
+                    # passo 2: il dimensionamento termico non dipende dall'autoproduzione.
+                    # Prima, con l'autoproduzione inclusa, si usava il prezzo effettivo,
+                    # che a sua volta dipende dai consumi delle pompe: le due
+                    # ottimizzazioni si rincorrevano.
+                    _pel_opt = float(prezzo_el)
+                    # costo del calore di scarto, con il metodo scelto in Offerta
+                    _met_o = serie_meteo_annua(pvgis)
+                    _T0_o = (pd.Series(_met_o["T2m"].values, index=pd.to_datetime(_met_o["datetime"]))
+                             .reindex(idx_h).interpolate().bfill().ffill().values)
+                    _pz_o, _ = carica_prezzi_elettrici()
+                    _pz_o = pd.Series(_pz_o, index=HOURS_2024).reindex(idx_h).ffill().bfill().values
+                    _pz_o = _pz_o * (_pel_opt / max(float(np.mean(_pz_o)), 1e-9))
+                    _ss = st.session_state
+                    _psv_o = PSV_SERIE_EUR_MWH.get(_ss.get("ex_psv_serie"),
+                                                   list(PSV_SERIE_EUR_MWH.values())[-1])
+                    _exergetico = str(_ss.get("off_metodo_prezzo",
+                                              "Scala exergetica")).startswith(("Scala", "Formula"))
+                    _prezzi_fissi = _ss.get("_off_prezzi_scarto", {}) or {}
 
-                def _costo_scarto_opt(r):
-                    if _exergetico:
-                        _m, _a, _i = prezzo_scarto_exergetico(
-                            off_all, idx_h, r, _T0_o, _pz_o, float(T_mandata_ideale),
-                            float(T_int), _psv_o, float(_ss.get("ex_spread", 50)),
-                            float(_ss.get("ex_eta", 0.90)),
-                            float(_ss.get("ex_sconto", 15)) / 100.0,
-                            float(_ss.get("ex_fisso", 0)), is_hp_par,
-                            float(_ss.get("ex_ets2", 85)), float(_ss.get("ex_caldaia", 0)),
-                            formula_scarto_da_sessione())
-                        return float(_a["costo_eur"].sum()) if not _a.empty else 0.0
-                    _u = utilizzo_per_azienda(off_all, idx_h, float(T_mandata_ideale),
-                                              float(T_int), r, dom_arr)
-                    if _u is None or _u.empty:
-                        return 0.0
-                    return float(sum(float(_prezzi_fissi.get(a, 0)) * float(e)
-                                     for a, e in zip(_u["azienda"], _u["utilizzata_mwh"])))
+                    def _costo_scarto_opt(r):
+                        if _exergetico:
+                            _m, _a, _i = prezzo_scarto_exergetico(
+                                off_all, idx_h, r, _T0_o, _pz_o, float(T_mandata_ideale),
+                                float(T_int), _psv_o, float(_ss.get("ex_spread", 50)),
+                                float(_ss.get("ex_eta", 0.90)),
+                                float(_ss.get("ex_sconto", 15)) / 100.0,
+                                float(_ss.get("ex_fisso", 0)), is_hp_par,
+                                float(_ss.get("ex_ets2", 85)), float(_ss.get("ex_caldaia", 0)),
+                                formula_scarto_da_sessione())
+                            return float(_a["costo_eur"].sum()) if not _a.empty else 0.0
+                        _u = utilizzo_per_azienda(off_all, idx_h, float(T_mandata_ideale),
+                                                  float(T_int), r, dom_arr)
+                        if _u is None or _u.empty:
+                            return 0.0
+                        return float(sum(float(_prezzi_fissi.get(a, 0)) * float(e)
+                                         for a, e in zip(_u["azienda"], _u["utilizzata_mwh"])))
 
-                best = ottimizza_economico(
-                    dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
-                    float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
-                    backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
-                    _pel_opt, costo_m3, capex_solare, perdita_func, float(antigelo),
-                    float(picco_kw), float(v_max_acc),
-                    {"tipo": tipo_sorgente, "resa": resa_sorgente, "costo": costo_sorgente},
-                    _eco_par, _costo_scarto_opt,
-                    q_int_bins=q_int_bins, bin_T_int=bin_T_int, stratificato=strat_on,
-                    solare_low=(solar_low if solare_on else None))
-            if best:
-                # arrotondamento per ECCESSO: al centinaio piu' vicino la taglia
-                # poteva restare qualche kW sotto il picco, lasciando scoperta
-                # l'ora di punta e facendo comparire un allarme fuorviante
-                st.session_state["dim_p_alta"] = int(np.ceil(best["P_alta"] / 100) * 100)
-                st.session_state["dim_p_bassa"] = int(np.ceil(best["P_bassa"] / 100) * 100)
-                st.session_state["dim_p_bk"] = int(np.ceil(best["P_bk"] / 100) * 100)
-                st.session_state["dim_v_hot"] = int(round(best["v_hot"] / 50) * 50)
-                st.session_state["dim_v_int"] = int(round(best["v_int"] / 50) * 50)
-                st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
-                st.session_state["_opt_casc"] = best
-                st.rerun()
+                    best = ottimizza_economico(
+                        dom_arr, q_hot_arr, q_int_arr, q_low_bins_eff, bin_T, soil_temp_arr,
+                        float(T_mandata_ideale), float(T_ritorno_ideale), float(T_int), 5, eta_hp,
+                        backup_tipo, capex_hp_kw, capex_kw_bk, opex_bk_mwh, backup_cop,
+                        _pel_opt, costo_m3, capex_solare, perdita_func, float(antigelo),
+                        float(picco_kw), float(v_max_acc),
+                        {"tipo": tipo_sorgente, "resa": resa_sorgente, "costo": costo_sorgente},
+                        _eco_par, _costo_scarto_opt,
+                        q_int_bins=q_int_bins, bin_T_int=bin_T_int, stratificato=strat_on,
+                        solare_low=(solar_low if solare_on else None))
+                if best:
+                    # arrotondamento per ECCESSO: al centinaio piu' vicino la taglia
+                    # poteva restare qualche kW sotto il picco, lasciando scoperta
+                    # l'ora di punta e facendo comparire un allarme fuorviante
+                    st.session_state["dim_p_alta"] = int(np.ceil(best["P_alta"] / 100) * 100)
+                    st.session_state["dim_p_bassa"] = int(np.ceil(best["P_bassa"] / 100) * 100)
+                    st.session_state["dim_p_bk"] = int(np.ceil(best["P_bk"] / 100) * 100)
+                    st.session_state["dim_v_hot"] = int(round(best["v_hot"] / 50) * 50)
+                    st.session_state["dim_v_int"] = int(round(best["v_int"] / 50) * 50)
+                    st.session_state["dim_v_low"] = int(round(best["v_low"] / 50) * 50)
+                    st.session_state["_opt_casc"] = best
+                    st.rerun()
 
-        _ores = st.session_state.get("_opt_casc")
-        if _ores:
-            _sg = [f"HP alta **{_ores['P_alta']:.0f} kW**"]
-            _sg.append(f"HP bassa **{_ores['P_bassa']:.0f} kW**" if is_hp_par
-                       else f"caldaia **{_ores['P_bk']:.0f} kW**")
-            _sg.append(f"accumuli **{_ores['v_hot']:.0f}+{_ores['v_int']:.0f}"
-                       f"+{_ores['v_low']:.0f} m³**")
-            if _ores.get("obiettivo") == "economico":
-                st.success(f"Configurazione a costo minimo · costo annuo di centrale "
-                           f"**{_ores['costo_annuo'] / 1000:,.0f} k€/a** "
-                           f"({_ores['lcoh']:.1f} €/MWh prodotto, comprende scarto e "
-                           f"manutenzione) · quota FER **{_ores['quota_fer']:.0f}%** — ".replace(",", ".")
-                           + " · ".join(_sg))
+            _ores = st.session_state.get("_opt_casc")
+            if _ores:
+                _sg = [f"HP alta **{_ores['P_alta']:.0f} kW**"]
+                _sg.append(f"HP bassa **{_ores['P_bassa']:.0f} kW**" if is_hp_par
+                           else f"caldaia **{_ores['P_bk']:.0f} kW**")
+                _sg.append(f"accumuli **{_ores['v_hot']:.0f}+{_ores['v_int']:.0f}"
+                           f"+{_ores['v_low']:.0f} m³**")
+                if _ores.get("obiettivo") == "economico":
+                    st.success(f"Configurazione a costo minimo · costo annuo di centrale "
+                               f"**{_ores['costo_annuo'] / 1000:,.0f} k€/a** "
+                               f"({_ores['lcoh']:.1f} €/MWh prodotto, comprende scarto e "
+                               f"manutenzione) · quota FER **{_ores['quota_fer']:.0f}%** — ".replace(",", ".")
+                               + " · ".join(_sg))
+                else:
+                    st.success(f"Configurazione a costo minimo · LCOH **{_ores['lcoh']:.1f} €/MWh** "
+                               f"· quota FER **{_ores['quota_fer']:.0f}%** — " + " · ".join(_sg))
             else:
-                st.success(f"Configurazione a costo minimo · LCOH **{_ores['lcoh']:.1f} €/MWh** "
-                           f"· quota FER **{_ores['quota_fer']:.0f}%** — " + " · ".join(_sg))
-        else:
-            st.info("Non ancora dimensionato: i valori qui sotto sono di primo tentativo. "
-                    "Premi **Dimensiona** per la configurazione a costo minimo.")
+                st.info("Non ancora dimensionato: i valori qui sotto sono di primo tentativo. "
+                        "Premi **Dimensiona** per la configurazione a costo minimo.")
 
         st.divider()
         st.markdown("##### Ritocca le taglie")
@@ -6415,6 +6468,28 @@ with tab_dimensionamento:
             prezzo_el_eff = prezzo_el * (1.0 - quota_autocons)
     opex_lordo = sim["E_el_tot"] * prezzo_el_eff + E_bk * opex_bk_mwh
     opex = opex_lordo - ricavo_pvt_el
+
+    # --- scomposizione esplicita dell'elettricita' delle pompe di calore ---
+    # Solo rete: tutto acquistato al prezzo del passo 2. Con autoproduzione:
+    # acquisti dalla rete ai prezzi orari e ricavo dell'eccedenza immessa, dal
+    # passo 4 (riportati al consumo attuale, che coincide dopo il riallineamento).
+    el_consumo_mwh = float(sim["E_el_tot"])
+    el_costo_solo_rete = el_consumo_mwh * float(prezzo_el)
+    _rel_x = (st.session_state.get("_el_risultato") or {}) if considera_el else {}
+    if considera_el and _rel_x and float(_rel_x.get("consumo_mwh", 0)) > 0:
+        _fx = el_consumo_mwh / float(_rel_x["consumo_mwh"])
+        el_acquisto_rete = float(_rel_x.get("acquisto_eur", 0.0)) * _fx
+        el_ricavo_immesso = float(_rel_x.get("ricavo_eur", 0.0)) * _fx
+        el_da_rete_mwh = float(_rel_x.get("prelevato_mwh", 0.0)) * _fx
+        el_autoconsumo_mwh = float(_rel_x.get("autoconsumo_mwh", 0.0)) * _fx
+        el_immesso_mwh = float(_rel_x.get("immesso_mwh", 0.0)) * _fx
+    else:
+        el_acquisto_rete = el_consumo_mwh * float(prezzo_el_eff)
+        el_ricavo_immesso = 0.0
+        el_da_rete_mwh = el_consumo_mwh
+        el_autoconsumo_mwh = 0.0
+        el_immesso_mwh = 0.0
+    costo_combustibile = float(E_bk * opex_bk_mwh)
     # l'investimento in autoproduzione si annualizza insieme alla centrale: il
     # risparmio sull'elettricita' e' gia' nell'opex, senza l'investimento il LCOH
     # degli scenari con fotovoltaico risultava troppo basso. Solo indicatore: i
@@ -7310,6 +7385,15 @@ with tab_dimensionamento:
         "autoproduzione_el": ("sì" if considera_el else "no"),
         "prezzo_el_effettivo": round(prezzo_el_eff),
         "capex_autoproduzione": round(capex_autoproduzione),
+        "el_consumo_mwh": round(el_consumo_mwh, 1),
+        "el_prezzo_rete": round(float(prezzo_el), 1),
+        "el_costo_solo_rete_eur": round(el_costo_solo_rete),
+        "el_da_rete_mwh": round(el_da_rete_mwh, 1),
+        "el_acquisto_rete_eur": round(el_acquisto_rete),
+        "el_autoconsumo_mwh": round(el_autoconsumo_mwh, 1),
+        "el_immesso_mwh": round(el_immesso_mwh, 1),
+        "el_ricavo_immesso_eur": round(el_ricavo_immesso),
+        "costo_combustibile_eur": round(costo_combustibile),
         "kwp_autoproduzione": round(kwp_autoprod),
         "batteria_autoproduzione_mwh": round(batt_autoprod, 1),
         "ibridi_autoproduzione_m2": round(ibr_autoprod),
@@ -7823,6 +7907,54 @@ with step_el:
 
 
 # =============================================================================
+# PASSO 5 · DIMENSIONAMENTO: cosa entra nell'Analisi economica e negli scenari
+# =============================================================================
+with step_dim:
+    _snap_d = st.session_state.get("_dim_snapshot")
+    if _snap_d:
+        st.divider()
+        st.markdown("#### 📋 Cosa entra nell'Analisi economica e negli scenari salvati")
+        _ores_d = st.session_state.get("_opt_casc") or {}
+        _man = bool(_ores_d) and (
+            int(_snap_d.get("P_alta_kw", 0)) != int(np.ceil(_ores_d.get("P_alta", 0) / 100) * 100)
+            or int(_snap_d.get("V_int", 0)) != int(round(_ores_d.get("v_int", 0) / 50) * 50))
+        _stato_t = ("dimensionate a costo minimo" if _ores_d and not _man
+                    else "ritoccate a mano nel passo 3" if _ores_d
+                    else "di primo tentativo: premi **Dimensiona** qui sopra")
+        st.markdown(
+            f"**Taglie termiche** ({_stato_t}): {_snap_d.get('tecnologie', '')} · accumuli "
+            f"{_snap_d.get('V_hot', 0)} + {_snap_d.get('V_int', 0)} + "
+            f"{_snap_d.get('V_low', 0)} m³ · CAPEX di centrale "
+            f"{float(_snap_d.get('capex_sistema', 0)) / 1e6:.2f} M€.")
+        _df_el_d, _inc_d = tabella_elettricita(_snap_d)
+        if _inc_d:
+            st.success("**Autoproduzione elettrica: INCLUSA.** Nell'Analisi economica "
+                       "l'elettricità delle pompe costa quanto nella colonna *Con "
+                       "autoproduzione* e l'investimento negli impianti si somma al CAPEX.")
+        else:
+            st.info("**Autoproduzione elettrica: NON inclusa.** Nell'Analisi economica "
+                    "l'elettricità delle pompe è tutta comprata dalla rete al prezzo del "
+                    "passo 2. Per includerla spunta la casella nel passo 4.")
+        st.dataframe(_df_el_d, width="stretch", hide_index=True)
+        with st.expander("Passaggi, in ordine", expanded=False):
+            st.markdown(
+                "1. **Livelli termici** e **Tecnologie** (passi 1-2): mandata, anello "
+                "intermedio, tipo di supporto, prezzo dell'elettricità di rete.\n"
+                "2. **Taglie e accumuli** (passo 3): tetto dei volumi; i ritocchi manuali "
+                "si fanno qui, dopo il dimensionamento.\n"
+                "3. **Carico elettrico** (passo 4): spunta la casella se vuoi includere "
+                "fotovoltaico, batterie o ibridi. L'ottimizzazione parte da sola e si "
+                "rifà quando cambiano i consumi delle pompe.\n"
+                "4. **Dimensionamento** (passo 5): premi *Dimensiona a costo minimo*. Le "
+                "taglie termiche non dipendono dall'autoproduzione, quindi l'ordine fra "
+                "i passi 4 e 5 non cambia il risultato.\n"
+                "5. **Risultati** (passo 6): bilancio, costi, calore di scarto.\n"
+                "6. **Analisi economica** e **Confronto scenari**: leggono sempre la "
+                "configurazione corrente, così come la vedi in questa tabella. Per "
+                "confrontarla con altre premi *Salva scenario* in fondo alla pagina.")
+
+
+# =============================================================================
 # TAB 5 - CONFRONTO SCENARI (P9: rimozione selettiva)
 # =============================================================================
 with tab_confronto:
@@ -8082,6 +8214,18 @@ with tab_economia:
                    f"prodotto in centrale **{_snap['carico_centrale_mwh']:,} MWh/a** "
                    f"(perdite di rete {_snap['perdite_rete_pct']:.1f} %)".replace(",", "."))
 
+        # --- elettricita' delle pompe: da dove arriva e quanto costa ---
+        _df_el_e, _inc_e = tabella_elettricita(_snap)
+        with st.expander("⚡ Elettricità delle pompe di calore: "
+                         + ("con autoproduzione (inclusa dal passo 4)" if _inc_e
+                            else "tutta dalla rete (autoproduzione non inclusa)"),
+                         expanded=True):
+            st.dataframe(_df_el_e, width="stretch", hide_index=True)
+            st.caption("Nei flussi di cassa entra la colonna segnata *in uso*. Per cambiare "
+                       "spunta o togli la casella nel passo 4 del Dimensionamento: questa "
+                       "scheda si aggiorna da sola. L'elettricità di pompaggio della rete "
+                       "è a parte e si valuta sempre al prezzo di rete.")
+
         ec1, ec2, ec3 = st.columns(3)
         with ec1:
             st.markdown("**Ricavi**")
@@ -8093,7 +8237,7 @@ with tab_economia:
                 horizontal=True, key="eco_origine_prezzo",
                 help="Target: costo del calore a gas per l'utente, (PSV mensile + spread) / "
                      "rendimento caldaia, meno lo sconto; parametri in Dimensionamento, "
-                     "passo 5, riquadro della scala exergetica.")
+                     "passo 6, riquadro della scala exergetica.")
             if _origine_prezzo == "Target: gas scontato" and _pt_snap:
                 prezzo_calore = round(float(_pt_snap), 1)
                 st.caption(f"Costo del calore a gas per l'utente "
@@ -8126,7 +8270,7 @@ with tab_economia:
             _costo_scarto_base = float(_snap.get("costo_calore_acquistato", 0))
             _metodo_eco = st.session_state.get("off_metodo_prezzo",
                                                "Scala exergetica (riferimento gas)")
-            _orig_eco = ("scala exergetica, parametri in *Dimensionamento* passo 5"
+            _orig_eco = ("scala exergetica, parametri in *Dimensionamento* passo 6"
                          if _metodo_eco.startswith("Scala")
                          else ("formula PSV \u00d7 (a + b\u00b7w) impostata in *Offerta*"
                                if _metodo_eco.startswith("Formula")
@@ -8702,15 +8846,29 @@ with tab_economia:
         st.plotly_chart(fig_cf, width="stretch")
 
         st.markdown("#### Struttura dei costi annui (anno 1)")
-        _voci_c = [("Energia (elettricità HP + combustibile)", opex_energia_0, COLOR_HP),
+        # elettricita' scomposta: comprata dalla rete, ricavo dell'immissione,
+        # combustibile; il resto (es. ricavo elettrico degli ibridi) a parte, cosi'
+        # la somma resta esattamente il costo energia usato nei flussi di cassa
+        _el_acq_e = float(_snap.get("el_acquisto_rete_eur", opex_energia_0))
+        _el_ric_e = float(_snap.get("el_ricavo_immesso_eur", 0.0))
+        _comb_e = float(_snap.get("costo_combustibile_eur", 0.0))
+        _altro_e = opex_energia_0 - (_el_acq_e - _el_ric_e + _comb_e)
+        _capex_ann_auto = _capex_autoprod * (1.0 - contributo_pct / 100.0) * _crf_eco
+        _voci_c = [("Elettricità pompe comprata dalla rete", _el_acq_e, COLOR_HP),
+                   ("Ricavo elettricità immessa in rete", -_el_ric_e, COLOR_SOLARE),
+                   ("Combustibile di backup", _comb_e, COLOR_BACKUP),
+                   ("Altre voci energia", _altro_e, "#7FB3D5"),
                    ("Acquisto calore di scarto", costo_scarto_0, COLOR_OFFERTA),
                    ("Pompaggio di rete", costo_pompaggio_0, "#4C6EF5"),
                    ("O&M impianti e rete", om_0, COLOR_ACCUMULO),
                    ("Personale e gestione", personale, "#F4A259"),
                    ("Assicurazioni e varie", assicuraz, "#9AA0A6"),
-                   ("CAPEX annualizzato", capex_netto * _crf_eco, "#5B8DEF")]
-        # nota: il CAPEX comprende centrale, rete e allacciamenti industriali
-        _voci_c = [(n, v, c) for n, v, c in _voci_c if v > 0]
+                   ("CAPEX annualizzato · centrale, rete, allacci",
+                    capex_netto * _crf_eco - _capex_ann_auto, "#5B8DEF"),
+                   ("CAPEX annualizzato · fotovoltaico, ibridi, batterie",
+                    _capex_ann_auto, "#9DB8F2")]
+        # le voci negative (ricavi) restano: riducono il costo pieno
+        _voci_c = [(n, v, c) for n, v, c in _voci_c if abs(v) > 0.5]
         # A barre e non a torta: ogni voce e' espressa anche in euro per MWh
         # venduto, cioe' nella stessa unita' del prezzo di vendita, cosi' si
         # legge subito quanto incide sul costo finale del calore.
