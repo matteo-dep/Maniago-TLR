@@ -138,3 +138,11 @@ Dal documento "Dettagli AI RTL Maniago rev.01":
    LCOH completo, incentivo necessario), ipotesi, investimento, conto dell'anno 1,
    ricavi mese per mese, struttura finanziaria (se attiva) e flussi di cassa anno
    per anno.
+7. **Analisi economica salvata con lo scenario**: *Salva scenario* nel Dimensionamento
+   memorizza anche l'analisi economica, con i parametri economici impostati in quel
+   momento. Se poi si cambiano i parametri economici, la si aggiorna dalla scheda
+   Analisi economica (*Salva questa analisi economica nello scenario salvato*).
+   Nella scheda Confronto scenari si scaricano i PDF, uno per scenario oppure tutti
+   gli scenari scelti in un unico file, con una tabella riassuntiva di VAN, TIR,
+   payback, margine, prezzo e LCOH completo. Gli scenari salvati prima di questa
+   versione vanno risalvati per avere l'analisi.

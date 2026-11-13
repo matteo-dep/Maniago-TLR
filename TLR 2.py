@@ -3482,21 +3482,35 @@ def _num_it(x, dec=0):
         return str(x)
 
 
-def genera_pdf_economia(d):
-    """Report PDF dell'analisi economica dello scenario aperto.
+def firma_snapshot(sn):
+    """Impronta dei dati tecnici di uno scenario: serve a verificare che
+    un'analisi economica si riferisca proprio a quello scenario."""
+    sn = sn or {}
+    return [str(sn.get("tecnologie", ""))] + [
+        round(float(sn.get(k, 0) or 0), 1) for k in
+        ("carico_utenze_mwh", "carico_centrale_mwh", "capex_sistema", "capex_rete",
+         "capex_autoproduzione", "costo_calore_acquistato", "opex_annuo")]
 
-    d e' un dizionario con: nome, scenario (snapshot), risultati, ipotesi,
-    capex, conto_anno1, ricavi_mese (DataFrame), flussi (DataFrame),
-    pf (dizionario o None). Ritorna i byte del PDF, oppure None se reportlab
-    non e' disponibile.
+
+def genera_pdf_economia(d):
+    """Report PDF dell'analisi economica di uno o piu' scenari.
+
+    d e' un dizionario (o una lista di dizionari, uno per scenario, ciascuno
+    su pagine proprie) con: nome, scenario (snapshot), risultati, ipotesi,
+    capex, conto_anno1, ricavi_mese e flussi (DataFrame o liste di record),
+    pf (lista o None). Ritorna i byte del PDF, oppure None se reportlab non
+    e' disponibile.
     """
+    elenco = d if isinstance(d, list) else [d]
+    if not elenco:
+        return None
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib import colors
         from reportlab.lib.units import mm
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.platypus import (SimpleDocTemplate, Table, TableStyle,
-                                        Paragraph, Spacer, KeepTogether)
+                                        Paragraph, Spacer, KeepTogether, PageBreak)
     except ImportError:
         return None
     import io
@@ -3507,7 +3521,8 @@ def genera_pdf_economia(d):
     doc = SimpleDocTemplate(buf, pagesize=A4,
                             leftMargin=16 * mm, rightMargin=16 * mm,
                             topMargin=14 * mm, bottomMargin=14 * mm,
-                            title=f"Analisi economica - {d['nome']}",
+                            title=("Analisi economica - " + elenco[0]["nome"]) if len(elenco) == 1
+                            else f"Analisi economica - {len(elenco)} scenari",
                             author="APE FVG - Interreg HEAT 35")
     ss = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=ss["Title"], fontSize=16, spaceAfter=2)
@@ -3544,82 +3559,96 @@ def genera_pdf_economia(d):
         t.setStyle(TableStyle(st_))
         return t
 
-    sn = d["scenario"]
-    el = [Paragraph("Maniago · rete di teleriscaldamento", h1),
-          Paragraph(f"Analisi economica — scenario <b>{escape(d['nome'])}</b> · "
-                    f"elaborato il {date.today():%d/%m/%Y} · progetto Interreg HEAT 35, APE FVG",
-                    sub),
-          Spacer(1, 6)]
+    def elementi(d):
+        """Pagine del report di un singolo scenario."""
+        sn = d.get("scenario") or {}
+        el = [Paragraph("Maniago · rete di teleriscaldamento", h1),
+              Paragraph(f"Analisi economica — scenario <b>{escape(d['nome'])}</b> · "
+                        f"analisi del {d.get('calcolata_il') or f'{date.today():%d/%m/%Y}'} · "
+                        f"progetto Interreg HEAT 35, APE FVG",
+                        sub),
+              Spacer(1, 6)]
 
-    # --- scenario ---
-    el.append(Paragraph("Scenario", sez))
-    righe = [["Scenario", d["nome"]],
-             ["Assetto impianto", sn.get("tecnologie", "")],
-             ["Utenze", str(sn.get("utenza", ""))],
-             ["Calore venduto", f"{_num_it(sn.get('carico_utenze_mwh'))} MWh/a"],
-             ["Calore prodotto in centrale", f"{_num_it(sn.get('carico_centrale_mwh'))} MWh/a "
-                                             f"(perdite di rete {_num_it(sn.get('perdite_rete_pct'), 1)} %)"],
-             ["Lunghezza rete", f"{_num_it(sn.get('lunghezza_rete_m'))} m"],
-             ["Calore di scarto utilizzato", f"{_num_it(sn.get('E_scarto_utilizzato'))} MWh/a"]]
-    if d.get("salvato_il"):
-        righe.append(["Scenario salvato il", d["salvato_il"]])
-    el.append(tabella(righe, [0.32 * larg, 0.68 * larg], intest=False, num_da=2))
+        # --- scenario ---
+        el.append(Paragraph("Scenario", sez))
+        righe = [["Scenario", d["nome"]],
+                 ["Assetto impianto", sn.get("tecnologie", "")],
+                 ["Utenze", str(sn.get("utenza", ""))],
+                 ["Calore venduto", f"{_num_it(sn.get('carico_utenze_mwh'))} MWh/a"],
+                 ["Calore prodotto in centrale", f"{_num_it(sn.get('carico_centrale_mwh'))} MWh/a "
+                                                 f"(perdite di rete {_num_it(sn.get('perdite_rete_pct'), 1)} %)"],
+                 ["Lunghezza rete", f"{_num_it(sn.get('lunghezza_rete_m'))} m"],
+                 ["Calore di scarto utilizzato", f"{_num_it(sn.get('E_scarto_utilizzato'))} MWh/a"]]
+        if d.get("salvato_il"):
+            righe.append(["Scenario salvato il", d["salvato_il"]])
+        el.append(tabella(righe, [0.32 * larg, 0.68 * larg], intest=False, num_da=2))
 
-    # --- risultati ---
-    el.append(Paragraph("Risultati", sez))
-    el.append(tabella([["Indicatore", "Valore"]] + d["risultati"],
-                      [0.62 * larg, 0.38 * larg]))
+        # --- risultati ---
+        el.append(Paragraph("Risultati", sez))
+        el.append(tabella([["Indicatore", "Valore"]] + d["risultati"],
+                          [0.62 * larg, 0.38 * larg]))
 
-    # --- ipotesi ---
-    el.append(Paragraph("Ipotesi", sez))
-    el.append(tabella([["Parametro", "Valore"]] + d["ipotesi"],
-                      [0.62 * larg, 0.38 * larg]))
+        # --- ipotesi ---
+        el.append(Paragraph("Ipotesi", sez))
+        el.append(tabella([["Parametro", "Valore"]] + d["ipotesi"],
+                          [0.62 * larg, 0.38 * larg]))
 
-    # --- CAPEX e conto dell'anno 1 ---
-    el.append(KeepTogether([Paragraph("Investimento", sez),
-                            tabella([["Voce", "€"]] + d["capex"],
-                                    [0.62 * larg, 0.38 * larg])]))
-    el.append(KeepTogether([Paragraph("Conto di gestione dell'anno 1", sez),
-                            tabella([["Voce", "€/a"]] + d["conto_anno1"],
-                                    [0.62 * larg, 0.38 * larg])]))
-
-    # --- ricavi mese per mese ---
-    rm = d.get("ricavi_mese")
-    if rm is not None and len(rm):
-        righe = [list(rm.columns)]
-        for _, r in rm.iterrows():
-            righe.append([r.iloc[0]] + [_num_it(v, 2 if "€/MWh" in c else 0)
-                                        for c, v in zip(rm.columns[1:], r.iloc[1:])])
-        righe.append(["Totale", _num_it(rm.iloc[:, 1].sum()), "", "", "",
-                      _num_it(rm.iloc[:, -1].sum())])
-        el.append(KeepTogether([Paragraph("Ricavi dal calore, mese per mese (anno 1)", sez),
-                                tabella(righe, [0.12 * larg] + [0.176 * larg] * 5)]))
-
-    # --- struttura finanziaria ---
-    if d.get("pf"):
-        el.append(KeepTogether([Paragraph("Struttura finanziaria (debito, ammortamenti, imposte)",
-                                          sez),
-                                tabella([["Indicatore", "Valore"]] + d["pf"],
+        # --- CAPEX e conto dell'anno 1 ---
+        el.append(KeepTogether([Paragraph("Investimento", sez),
+                                tabella([["Voce", "€"]] + d["capex"],
+                                        [0.62 * larg, 0.38 * larg])]))
+        el.append(KeepTogether([Paragraph("Conto di gestione dell'anno 1", sez),
+                                tabella([["Voce", "€/a"]] + d["conto_anno1"],
                                         [0.62 * larg, 0.38 * larg])]))
 
-    # --- flussi di cassa ---
-    fl = d.get("flussi")
-    if fl is not None and len(fl):
-        righe = [list(fl.columns)] + [[int(r.iloc[0])] + [_num_it(v) for v in r.iloc[1:]]
-                                      for _, r in fl.iterrows()]
-        w0 = 0.08 * larg
-        el.append(Paragraph("Flussi di cassa anno per anno (senza debito né imposte)", sez))
-        el.append(tabella(righe, [w0] + [(larg - w0) / (len(fl.columns) - 1)]
-                          * (len(fl.columns) - 1), num_da=1))
+        # --- ricavi mese per mese ---
+        rm = d.get("ricavi_mese")
+        if rm is not None and not isinstance(rm, pd.DataFrame):
+            rm = pd.DataFrame(rm)
+        if rm is not None and len(rm):
+            righe = [list(rm.columns)]
+            for _, r in rm.iterrows():
+                righe.append([r.iloc[0]] + [_num_it(v, 2 if "€/MWh" in c else 0)
+                                            for c, v in zip(rm.columns[1:], r.iloc[1:])])
+            righe.append(["Totale", _num_it(rm.iloc[:, 1].sum()), "", "", "",
+                          _num_it(rm.iloc[:, -1].sum())])
+            el.append(KeepTogether([Paragraph("Ricavi dal calore, mese per mese (anno 1)", sez),
+                                    tabella(righe, [0.12 * larg] + [0.176 * larg] * 5)]))
 
-    el.append(Spacer(1, 8))
-    el.append(Paragraph(
-        "Ricavi sul calore venduto alle utenze, costi di produzione sul calore prodotto in "
-        "centrale: la differenza sono le perdite di rete. Prezzo di vendita = PSV / peso del "
-        "PSV sull'imponibile / rendimento della caldaia × (1 − sconto). VAN e TIR sono "
-        "calcolati sui flussi senza debito né imposte, salvo la sezione Struttura finanziaria. "
-        "Il payback è semplice, non attualizzato. Strumento di supporto allo studio di "
-        "fattibilità: non sostituisce un progetto esecutivo.", note))
+        # --- struttura finanziaria ---
+        if d.get("pf"):
+            el.append(KeepTogether([Paragraph("Struttura finanziaria (debito, ammortamenti, imposte)",
+                                              sez),
+                                    tabella([["Indicatore", "Valore"]] + d["pf"],
+                                            [0.62 * larg, 0.38 * larg])]))
+
+        # --- flussi di cassa ---
+        fl = d.get("flussi")
+        if fl is not None and not isinstance(fl, pd.DataFrame):
+            fl = pd.DataFrame(fl)
+        if fl is not None and len(fl):
+            righe = [list(fl.columns)] + [[int(r.iloc[0])] + [_num_it(v) for v in r.iloc[1:]]
+                                          for _, r in fl.iterrows()]
+            w0 = 0.08 * larg
+            el.append(Paragraph("Flussi di cassa anno per anno (senza debito né imposte)", sez))
+            el.append(tabella(righe, [w0] + [(larg - w0) / (len(fl.columns) - 1)]
+                              * (len(fl.columns) - 1), num_da=1))
+
+        el.append(Spacer(1, 8))
+        el.append(Paragraph(
+            "Ricavi sul calore venduto alle utenze, costi di produzione sul calore prodotto in "
+            "centrale: la differenza sono le perdite di rete. Prezzo di vendita = PSV / peso del "
+            "PSV sull'imponibile / rendimento della caldaia × (1 − sconto). VAN e TIR sono "
+            "calcolati sui flussi senza debito né imposte, salvo la sezione Struttura finanziaria. "
+            "Il payback è semplice, non attualizzato. Strumento di supporto allo studio di "
+            "fattibilità: non sostituisce un progetto esecutivo.", note))
+        return el
+
+    el = []
+    for k, dd in enumerate(elenco):
+        if k:
+            el.append(PageBreak())
+        el += elementi(dd)
     doc.build(el)
     return buf.getvalue()
 
@@ -7764,7 +7793,10 @@ with tab_dimensionamento:
                    "nel passo *4 · Carico elettrico* prima di salvare lo scenario.")
     sc1, sc2 = st.columns([3, 1])
     _nome_def = f"{backup_tipo} · {T_mandata_ideale}/{T_ritorno_ideale}°C"
-    nome_scen = sc1.text_input("Nome dello scenario da salvare", value=_nome_def, key="dim_nome_scen")
+    nome_scen = sc1.text_input("Nome dello scenario da salvare", value=_nome_def, key="dim_nome_scen",
+                               help="Con lo scenario si salva anche la sua analisi economica, "
+                                    "con i parametri impostati ora nella scheda Analisi "
+                                    "economica: si scarica poi dalla scheda Confronto scenari.")
     if sc2.button("\U0001F4BE Salva scenario", width="stretch", key="dim_btn_salva"):
         if nome_scen.strip():
             from datetime import datetime as _dt
@@ -7772,6 +7804,10 @@ with tab_dimensionamento:
             # fotografia completa delle ipotesi, per la scheda PDF di confronto
             _snap_s["ipotesi"] = raccogli_ipotesi()
             _snap_s["salvato_il"] = _dt.now().strftime("%d/%m/%Y %H:%M")
+            # analisi economica dello stesso scenario, con i parametri economici attuali
+            _er = st.session_state.get("_eco_report")
+            if _er and _er.get("firma") == firma_snapshot(_snap_s):
+                _snap_s["economia"] = _er["dati"]
             st.session_state["_scenari"][nome_scen.strip()] = _snap_s
             _ok_f = salva_scenari_file(st.session_state["_scenari"])
             st.success(f"Scenario **{nome_scen.strip()}** salvato "
@@ -8336,6 +8372,62 @@ with tab_confronto:
         _scen = st.session_state.get("_scenari", {})
         if not _scen:
             st.stop()
+
+        # --- analisi economica degli scenari salvati ---
+        with st.expander("\U0001F4B6 Analisi economica degli scenari salvati (PDF)", expanded=True):
+            _con_eco = [n for n, s_ in _scen.items() if s_.get("economia")]
+            _senza_eco = [n for n in _scen if n not in _con_eco]
+            if _con_eco:
+                _sel_eco = st.multiselect("Scenari da includere", _con_eco, default=_con_eco,
+                                          key="conf_eco_sel")
+                _rep_l = [dict(_scen[n]["economia"], nome=n, scenario=_scen[n],
+                               salvato_il=_scen[n].get("salvato_il")) for n in _sel_eco]
+                if _rep_l:
+                    _kp = []
+                    for n in _sel_eco:
+                        _k = _scen[n]["economia"].get("kpi", {})
+                        _kp.append({
+                            "Scenario": n,
+                            "VAN (M€)": round(_k.get("van", float("nan")) / 1e6, 2),
+                            "TIR (%)": (round(_k["tir"] * 100, 1)
+                                        if _k.get("tir") is not None else None),
+                            "Payback (anni)": (round(_k["payback"], 1)
+                                               if _k.get("payback") is not None else None),
+                            "Margine anno 1 (k€/a)": round(_k.get("margine_anno1", 0) / 1000),
+                            "Prezzo di vendita (€/MWh)": round(_k.get("prezzo_vendita", 0), 2),
+                            "LCOH completo (€/MWh)": round(_k.get("lcoh_completo", 0), 1),
+                            "Analisi del": _scen[n]["economia"].get("calcolata_il", "")})
+                    st.dataframe(pd.DataFrame(_kp), width="stretch", hide_index=True)
+                    try:
+                        _pdf_tutti = genera_pdf_economia(_rep_l)
+                    except Exception as _e_pt:
+                        _pdf_tutti = None
+                        st.caption(f"PDF non disponibile: {type(_e_pt).__name__}")
+                    if _pdf_tutti:
+                        st.download_button(
+                            "\U0001F4C4 Scarica l'analisi economica degli scenari scelti (un PDF)",
+                            data=_pdf_tutti, file_name="maniago_tlr_economia_scenari.pdf",
+                            mime="application/pdf", key="conf_dl_eco_tutti")
+                    import re as _re_c
+                    _cols_d = st.columns(min(len(_rep_l), 3))
+                    for _k_i, _r in enumerate(_rep_l):
+                        try:
+                            _pdf_1 = genera_pdf_economia(_r)
+                        except Exception:
+                            _pdf_1 = None
+                        if _pdf_1:
+                            _nf_1 = _re_c.sub(r"[^A-Za-z0-9_-]+", "_", _r["nome"])[:60]
+                            _cols_d[_k_i % len(_cols_d)].download_button(
+                                f"\u2B07\ufe0f {_r['nome']}", data=_pdf_1,
+                                file_name=f"maniago_tlr_economia_{_nf_1}.pdf",
+                                mime="application/pdf", key=f"conf_dl_eco_{_k_i}",
+                                width="stretch")
+            if _senza_eco:
+                st.caption("Senza analisi economica (salvati prima di questa funzione o "
+                           "salvati senza aver aperto l'analisi): " + ", ".join(_senza_eco)
+                           + ". Per aggiungerla riapri lo scenario e risalvalo dal "
+                           "Dimensionamento, oppure usa *Salva questa analisi economica nello "
+                           "scenario salvato* nella scheda Analisi economica.")
 
         _misti = {s.get("autoproduzione_el", "no") for s in _scen.values()}
         if len(_misti) > 1:
@@ -9566,13 +9658,25 @@ with tab_economia:
                                             "Flusso netto (€)": flussi_cassa[0],
                                             "Cumulato (€)": flussi_cassa[0]}]), _fl_rep],
                             ignore_index=True)
+        # Dati del report in forma salvabile (JSON): restano in sessione e si
+        # agganciano allo scenario quando lo si salva dal Dimensionamento.
+        from datetime import datetime as _dt_eco
+        _dati_eco = {
+            "calcolata_il": _dt_eco.now().strftime("%d/%m/%Y %H:%M"),
+            "risultati": _ris, "ipotesi": _ip, "capex": _cap, "conto_anno1": _ca1,
+            "ricavi_mese": json.loads(_df_ric.to_json(orient="records")),
+            "flussi": json.loads(_fl_rep.to_json(orient="records")),
+            "pf": _pf_rep,
+            "kpi": {"van": float(_van), "tir": None if _tir is None else float(_tir),
+                    "payback": None if _pb is None else float(_pb),
+                    "margine_anno1": float(margine_0), "lcoh_completo": float(lcoh_completo),
+                    "prezzo_vendita": float(prezzo_calore), "capex_tot": float(capex_tot),
+                    "contributo": float(contributo)}}
+        st.session_state["_eco_report"] = {"firma": firma_snapshot(_snap), "dati": _dati_eco}
         try:
-            _pdf_eco = genera_pdf_economia({
-                "nome": _nome_rep.strip() or str(_snap.get("tecnologie", "")),
-                "salvato_il": _salv.get("salvato_il"),
-                "scenario": _snap, "risultati": _ris, "ipotesi": _ip,
-                "capex": _cap, "conto_anno1": _ca1, "ricavi_mese": _df_ric,
-                "flussi": _fl_rep, "pf": _pf_rep})
+            _pdf_eco = genera_pdf_economia(dict(
+                _dati_eco, nome=_nome_rep.strip() or str(_snap.get("tecnologie", "")),
+                salvato_il=_salv.get("salvato_il"), scenario=_snap))
         except Exception as _e_pdf:
             _pdf_eco = None
             st.caption(f"Report non disponibile: {type(_e_pdf).__name__}")
@@ -9583,7 +9687,20 @@ with tab_economia:
                                file_name=f"maniago_tlr_economia_{_nf}.pdf",
                                mime="application/pdf", key="eco_dl_pdf")
             if _salv:
-                st.caption(f"Collegato allo scenario salvato il {_salv.get('salvato_il', '')}.")
+                _stessi_dati = firma_snapshot(_salv) == firma_snapshot(_snap)
+                st.caption(f"Collegato allo scenario salvato il {_salv.get('salvato_il', '')}."
+                           + ("" if _stessi_dati else " Attenzione: i dati tecnici aperti ora "
+                              "sono diversi da quelli dello scenario salvato."))
+                if _stessi_dati and st.button(
+                        "\U0001F4BE Salva questa analisi economica nello scenario salvato",
+                        key="eco_salva_in_scen",
+                        help="Sostituisce l'analisi economica memorizzata nello scenario con "
+                             "quella calcolata ora: utile se hai cambiato i parametri "
+                             "economici dopo averlo salvato."):
+                    st.session_state["_scenari"][_nome_rep.strip()]["economia"] = _dati_eco
+                    salva_scenari_file(st.session_state["_scenari"])
+                    st.success("Analisi economica aggiornata nello scenario: si scarica anche "
+                               "dalla scheda Confronto scenari.")
             else:
                 st.caption("Nessuno scenario salvato con questo nome: il report si riferisce "
                            "alla configurazione aperta ora nel Dimensionamento.")
