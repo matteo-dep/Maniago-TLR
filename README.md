@@ -106,3 +106,35 @@ Se vuoi un solo branch pulito:
    Fratta, la Biblioteca e tutti i privati. Gli edifici si agganciano solo alla
    rete stradale principale, non a frammenti isolati (cortili, parcheggi).
 9. Colonna "Pozzi" del confronto sorgenti resa omogenea (errore Arrow).
+
+## Modifiche del 10/11/2026 (parte economico-finanziaria)
+
+Dal documento "Dettagli AI RTL Maniago rev.01":
+
+1. **PSV in ingresso** (Offerta, in €/Smc, default 0,80 €/Smc = 74,8 €/MWh): un solo
+   valore, uguale per tutti i mesi, con il link alla pagina ARERA del valore CMEM.
+   Vale per i ricavi e per l'acquisto del calore di scarto.
+2. **Prezzo di vendita del calore**: non è più un dato di ingresso. Vale
+   PSV / 0,68 / η × (1 − s): peso del PSV sull'imponibile (0,68), rendimento della
+   caldaia dell'utente (0,90) e sconto s (10–15 %, default 15 %) in Analisi
+   economica → Ricavi. Il ricavo annuo è la somma mensile del calore venduto per il
+   prezzo; la tabella mese per mese è nell'apposito riquadro.
+3. **Calore di scarto**: tolto il correttivo (×). Il costo è quello del metodo scelto
+   in Offerta (di default PSV × (a + b·w), a = 0,20, b = 0,15).
+4. **Assicurazioni e amministrazione** = % × CAPEX (IVA esclusa) + quota fissa
+   (default 0,2 % e 6.000 €/a); entra anche nella convenienza delle singole aziende.
+   Personale e gestione: default 0.
+5. **Pompaggio di rete calcolato** (Dimensionamento, passo 6): portata oraria dal
+   carico e dal ΔT di rete, prevalenza dal percorso più sfavorito del tracciato ×
+   perdita di carico specifica, più Δp di utenza e di centrale. Sostituisce il
+   valore fisso in kWh/MWh.
+
+## Modifiche del 13/11/2026
+
+6. **Report PDF dell'analisi economica**: in fondo alla scheda Analisi economica.
+   Si collega allo scenario per nome: di default quello dato nel Dimensionamento; se
+   esiste uno scenario salvato con quel nome ne riporta la data di salvataggio.
+   Contiene scenario, risultati (VAN con e senza contributo, TIR, payback, margine,
+   LCOH completo, incentivo necessario), ipotesi, investimento, conto dell'anno 1,
+   ricavi mese per mese, struttura finanziaria (se attiva) e flussi di cassa anno
+   per anno.
